@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 
 import authRoutes from './routes/auth.routes';
+import userRoutes from './routes/user.routes';
 import serviceRequestRoutes from './routes/serviceRequest.routes';
 import professionalRoutes from './routes/professional.routes';
 import paymentRoutes from './routes/payment.routes';
@@ -97,6 +98,7 @@ app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 // API
 app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
 app.use('/api/service-categories', categoryRoutes);
 app.use('/api/service-requests', serviceRequestRoutes);
 app.use('/api/professionals', professionalRoutes);
