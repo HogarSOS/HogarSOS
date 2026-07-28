@@ -1,0 +1,29 @@
+rules_version = '2';
+
+// Reglas de seguridad de Firestore para el chat de hogarSOS.
+// Solo el cliente y el profesional de UNA solicitud concreta pueden
+// leer/escribir sus mensajes — nunca un tercero, ni siquiera otro
+// cliente o profesional de la plataforma.
+//
+// Requiere que el backend, al aceptar una solicitud, escriba también
+// en Firestore (no solo en PostgreSQL) los IDs de cliente_id y
+// profesional_id en /service_requests/{id}, para que estas reglas
+// puedan comprobarlos. Pendiente de implementar esa sincronización
+// en serviceRequest.controller.ts (acceptServiceRequest).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /service_requests/{requestId} {
+      allow read: if request.auth != null &&
+        (request.auth.uid == resource.data.clienteFirebaseUid ||
+         request.auth.uid == resource.data.profesionalFirebaseUid);
+
+      match /messages/{messageId} {
+        allow read, create: if request.auth != null &&
+          (request.auth.uid == get(/databases/$(database)/documents/service_requests/$(requestId)).data.clienteFirebaseUid ||
+           request.auth.uid == get(/databases/$(database)/documents/service_requests/$(requestId)).data.profesionalFirebaseUid);
+        allow update, delete: if false; // los mensajes son inmutables
+      }
+    }
+  }
+}

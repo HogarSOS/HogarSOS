@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.local
+firebase-key.json
+firebase-key.json.json
+uploads/*
+!uploads/.gitkeep
+*.log
+.DS_Store
+
+# Copia anidada accidental (duplicado idéntico de este mismo proyecto,
+# incluido su propio .env) — nunca debe entrar al repo.
+/backend_wizard/
