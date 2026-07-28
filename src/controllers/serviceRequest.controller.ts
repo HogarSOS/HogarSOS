@@ -1,9 +1,11 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { firestore } from '../config/firebase';
 import { releasePayment } from '../services/payment.service';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
+import { enviarNotificacion, enviarNotificacionMasiva } from '../services/notification.service';
 
 const RADIO_BUSQUEDA_METROS = 15000; // 15 km, ajustable por categoría en el futuro
 
@@ -69,7 +71,45 @@ export async function createServiceRequest(req: Request, res: Response) {
     RETURNING id
   `;
 
+  // Aviso a los profesionales disponibles de esa categoría, cerca de la
+  // solicitud — "fire and forget", nunca debe bloquear ni fallar la
+  // creación de la solicitud en sí (ver notification.service.ts).
+  notificarProfesionalesCercanos(solicitud.id, categoryId, categoria.nombre, latitud, longitud).catch((e) =>
+    console.error('[createServiceRequest] Error al notificar profesionales cercanos:', e)
+  );
+
   return res.status(201).json({ id: solicitud.id, estado: 'pendiente' });
+}
+
+async function notificarProfesionalesCercanos(
+  solicitudId: string,
+  categoryId: number,
+  categoriaNombre: string,
+  latitud: number,
+  longitud: number
+) {
+  const verificacionFiltro = REQUIRE_PROFESSIONAL_VERIFICATION
+    ? Prisma.sql`AND p.estado_verificacion = 'aprobado'`
+    : Prisma.empty;
+
+  const profesionales = await prisma.$queryRaw<{ user_id: string }[]>`
+    SELECT DISTINCT p.user_id
+    FROM professionals p
+    JOIN professional_categories pc ON pc.professional_id = p.user_id
+    WHERE pc.category_id = ${categoryId}
+      AND p.disponible = true
+      AND p.ubicacion_actual IS NOT NULL
+      AND ST_DWithin(p.ubicacion_actual, ST_SetSRID(ST_MakePoint(${longitud}, ${latitud}), 4326)::geography, ${RADIO_BUSQUEDA_METROS})
+      ${verificacionFiltro}
+  `;
+
+  if (profesionales.length === 0) return;
+
+  await enviarNotificacionMasiva(
+    profesionales.map((p) => p.user_id),
+    { title: 'Nueva solicitud cerca de ti', body: `Alguien necesita ${categoriaNombre.toLowerCase()} cerca de tu ubicación` },
+    { tipo: 'nueva_solicitud', solicitudId }
+  );
 }
 
 export async function getServiceRequestById(req: Request, res: Response) {
@@ -222,6 +262,13 @@ export async function acceptServiceRequest(req: Request, res: Response) {
       console.error(`[acceptServiceRequest] Fallo al sincronizar Firestore para ${id}:`, firestoreErr);
     }
 
+    enviarNotificacion(solicitud.clienteId, {
+      title: 'Solicitud aceptada',
+      body: 'Un profesional ha aceptado tu solicitud',
+    }, { tipo: 'solicitud_aceptada', solicitudId: id }).catch((e) =>
+      console.error(`[acceptServiceRequest] Error al notificar al cliente de ${id}:`, e)
+    );
+
     return res.json(solicitud);
   } catch (err) {
     if (err instanceof Error && err.message === 'NOT_FOUND') {
@@ -277,6 +324,13 @@ export async function completeServiceRequest(req: Request, res: Response) {
     data: { estado: 'completada', precioFinal: parsed.data.precioFinal, completadaAt: new Date() },
   });
 
+  enviarNotificacion(solicitud.clienteId, {
+    title: 'Servicio completado',
+    body: '¿Qué tal fue? Cuéntaselo a otros valorando al profesional',
+  }, { tipo: 'solicitud_completada', solicitudId: id }).catch((e) =>
+    console.error(`[completeServiceRequest] Error al notificar al cliente de ${id}:`, e)
+  );
+
   try {
     const pagoLiberado = await releasePayment(id);
     return res.json({ solicitudId: id, estado: 'completada', pago: pagoLiberado });
@@ -291,6 +345,38 @@ export async function completeServiceRequest(req: Request, res: Response) {
       aviso: 'Servicio completado, pero la liberación del pago falló y se reintentará',
     });
   }
+}
+
+/**
+ * Lista los trabajos del profesional autenticado que ya aceptó y aún
+ * no ha completado — sin esto, en cuanto el profesional aceptaba una
+ * solicitud desaparecía de "cercanas" (correcto, ya no está pendiente)
+ * y no había forma de volver a verla, contactar al cliente o marcarla
+ * como terminada.
+ */
+export async function listMyAssignedRequests(req: Request, res: Response) {
+  const profesionalId = req.user!.userId;
+
+  const solicitudes = await prisma.serviceRequest.findMany({
+    where: { profesionalId, estado: { in: ['aceptada', 'en_progreso'] } },
+    include: { categoria: true, cliente: { select: { nombre: true, telefono: true } }, payment: true },
+    orderBy: { aceptadaAt: 'desc' },
+  });
+
+  return res.json({
+    solicitudes: solicitudes.map((s) => ({
+      id: s.id,
+      categoria: s.categoria.nombre,
+      descripcion: s.descripcion,
+      estado: s.estado,
+      direccionTexto: s.direccionTexto,
+      clienteNombre: s.cliente.nombre,
+      clienteTelefono: s.cliente.telefono,
+      precioEstimado: s.precioEstimado ? Number(s.precioEstimado) : null,
+      createdAt: s.createdAt,
+      tienePago: Boolean(s.payment),
+    })),
+  });
 }
 
 /**

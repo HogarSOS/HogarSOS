@@ -16,6 +16,7 @@ model User {
   nombre                   String
   role                     UserRole         @default(cliente)
   firebaseUid              String?          @unique @map("firebase_uid")
+  fcmToken                 String?          @map("fcm_token")
   activo                   Boolean          @default(true)
   createdAt                DateTime         @default(now()) @map("created_at")
   updatedAt                DateTime         @updatedAt @map("updated_at")
@@ -49,6 +50,7 @@ model Professional {
   valoracionMedia       Decimal                   @default(0.00) @map("valoracion_media")
   totalTrabajos         Int                       @default(0) @map("total_trabajos")
   disponible            Boolean                   @default(false)
+  modoDisponibilidad    ModoDisponibilidad        @default(horario_laboral) @map("modo_disponibilidad")
   stripeAccountId       String?                   @map("stripe_account_id")
   verificadoPor         String?                   @map("verificado_por")
   verificadoAt          DateTime?                 @map("verificado_at")
@@ -192,4 +194,14 @@ enum UrgenciaSolicitud {
   hoy
   manana
   fecha_especifica
+}
+
+// Modo de disponibilidad declarado por el profesional (no es lo mismo
+// que "disponible", que es si está aceptando trabajos AHORA MISMO).
+// Deliberadamente solo dos opciones en esta primera versión — sin
+// calendario ni horarios personalizados — pero como enum queda
+// preparado para añadir variantes futuras sin tocar el tipo de columna.
+enum ModoDisponibilidad {
+  horario_laboral
+  veinticuatro_horas
 }

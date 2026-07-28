@@ -151,6 +151,28 @@ export async function login(req: Request, res: Response) {
   });
 }
 
+const fcmTokenSchema = z.object({
+  fcmToken: z.string().min(1),
+});
+
+/**
+ * Guarda (o reemplaza) el token FCM del dispositivo actual. Se llama
+ * cada vez que la app arranca con sesión activa — no solo al hacer
+ * login — porque Firebase puede rotar el token del dispositivo en
+ * cualquier momento, y un token viejo sin actualizar es indistinguible
+ * de "no llegan notificaciones" para quien usa la app.
+ */
+export async function updateFcmToken(req: Request, res: Response) {
+  const userId = req.user!.userId;
+  const parsed = fcmTokenSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Falta fcmToken' });
+  }
+
+  await prisma.user.update({ where: { id: userId }, data: { fcmToken: parsed.data.fcmToken } });
+  return res.json({ success: true });
+}
+
 export async function refreshToken(req: Request, res: Response) {
   const parsed = refreshSchema.safeParse(req.body);
   if (!parsed.success) {

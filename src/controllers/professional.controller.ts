@@ -29,6 +29,7 @@ export async function getProfile(req: Request, res: Response) {
     valoracionMedia: Number(profesional.valoracionMedia),
     totalTrabajos: profesional.totalTrabajos,
     disponible: profesional.disponible,
+    modoDisponibilidad: profesional.modoDisponibilidad,
     descripcion: profesional.descripcion,
     fotoPerfilUrl: profesional.fotoPerfilUrl,
     categorias: profesional.categorias.map((c) => c.category.nombre),
@@ -38,6 +39,11 @@ export async function getProfile(req: Request, res: Response) {
 
 const availabilitySchema = z.object({
   disponible: z.boolean(),
+  // Modo declarado ("disponible en horario laboral" vs "servicio 24h"),
+  // independiente de `disponible` (si está aceptando trabajos ahora
+  // mismo). Opcional porque el toggle rápido de "en línea/fuera de
+  // línea" no siempre cambia el modo a la vez.
+  modoDisponibilidad: z.enum(['horario_laboral', 'veinticuatro_horas']).optional(),
   latitud: z.number().min(-90).max(90).optional(),
   longitud: z.number().min(-180).max(180).optional(),
 });
@@ -66,7 +72,7 @@ export async function updateAvailability(req: Request, res: Response) {
     return res.status(403).json({ error: 'No puedes ponerte disponible hasta ser verificado' });
   }
 
-  const { disponible, latitud, longitud } = parsed.data;
+  const { disponible, modoDisponibilidad, latitud, longitud } = parsed.data;
 
   if (latitud !== undefined && longitud !== undefined) {
     // ubicacion_actual es tipo geography — se actualiza con SQL nativo.
@@ -76,14 +82,18 @@ export async function updateAvailability(req: Request, res: Response) {
     await prisma.$executeRaw`
       UPDATE professionals
       SET disponible = ${disponible},
+          modo_disponibilidad = COALESCE(${modoDisponibilidad}::"ModoDisponibilidad", modo_disponibilidad),
           ubicacion_actual = ST_SetSRID(ST_MakePoint(${longitud}, ${latitud}), 4326)::geography
       WHERE user_id = ${userId}
     `;
   } else {
-    await prisma.professional.update({ where: { userId }, data: { disponible } });
+    await prisma.professional.update({
+      where: { userId },
+      data: { disponible, ...(modoDisponibilidad ? { modoDisponibilidad } : {}) },
+    });
   }
 
-  return res.json({ disponible });
+  return res.json({ disponible, modoDisponibilidad: modoDisponibilidad ?? profesional.modoDisponibilidad });
 }
 
 const updateProfileSchema = z.object({

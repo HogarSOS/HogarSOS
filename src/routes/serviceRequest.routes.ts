@@ -8,6 +8,7 @@ import {
   acceptServiceRequest,
   completeServiceRequest,
   listMyServiceRequests,
+  listMyAssignedRequests,
 } from '../controllers/serviceRequest.controller';
 
 const router = Router();
@@ -19,6 +20,7 @@ router.post('/', authMiddleware(['cliente']), asyncHandler(createServiceRequest)
 router.get('/mine', authMiddleware(['cliente']), asyncHandler(listMyServiceRequests));
 router.get('/:id', authMiddleware(), asyncHandler(getServiceRequestById));
 router.get('/nearby/list', authMiddleware(['profesional']), asyncHandler(listNearbyRequests));
+router.get('/assigned/mine', authMiddleware(['profesional']), asyncHandler(listMyAssignedRequests));
 router.patch('/:id/accept', authMiddleware(['profesional']), asyncHandler(acceptServiceRequest));
 router.patch('/:id/complete', authMiddleware(['profesional']), asyncHandler(completeServiceRequest));
 
