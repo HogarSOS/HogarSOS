@@ -14,8 +14,20 @@ services:
     runtime: node
     plan: free
     region: oregon
-    buildCommand: npm install && npx prisma generate && npm run build
-    startCommand: npx prisma migrate deploy && npm start
+    # NODE_ENV=production (más abajo) hace que `npm install` a secas
+    # omita devDependencies — y ahí viven typescript, los @types/* y el
+    # CLI de prisma, todos necesarios para compilar. `--include=dev`
+    # fuerza su instalación pase lo que pase.
+    #
+    # Las migraciones corren aquí, en el build, con el CLI de prisma
+    # todavía instalado — no en startCommand, porque `npm prune
+    # --omit=dev` al final se lo lleva (es una devDependency) y en
+    # startCommand ya no estaría disponible sin volver a descargarlo
+    # por red en cada arranque. `npm prune --omit=dev` al final deja
+    # el contenedor en producción sin herramientas de build que no
+    # necesita en runtime (typescript, @types/*, el propio prisma CLI).
+    buildCommand: npm install --include=dev && npx prisma generate && npm run build && npx prisma migrate deploy && npm prune --omit=dev
+    startCommand: npm start
     healthCheckPath: /health
     # El plan free de Render no admite discos persistentes: las fotos
     # subidas a /uploads (perfil, verificación) se pierden en cada
