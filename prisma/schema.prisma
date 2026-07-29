@@ -18,6 +18,8 @@ model User {
   firebaseUid              String?          @unique @map("firebase_uid")
   fcmToken                 String?          @map("fcm_token")
   fotoPerfilUrl            String?          @map("foto_perfil_url")
+  valoracionMedia          Decimal          @default(0.00) @map("valoracion_media")
+  totalValoraciones        Int              @default(0) @map("total_valoraciones")
   activo                   Boolean          @default(true)
   createdAt                DateTime         @default(now()) @map("created_at")
   updatedAt                DateTime         @updatedAt @map("updated_at")
@@ -98,7 +100,7 @@ model ServiceRequest {
   completadaAt   DateTime?                @map("completada_at")
   disputes       Dispute[]
   payment        Payment?
-  review         Review?
+  reviews        Review[]
   categoria      ServiceCategory          @relation(fields: [categoryId], references: [id])
   cliente        User                     @relation("ClienteRequests", fields: [clienteId], references: [id])
   profesional    Professional?            @relation(fields: [profesionalId], references: [userId])
@@ -123,9 +125,15 @@ model Payment {
   @@map("payments")
 }
 
+// Bidireccional: cliente -> profesional y profesional -> cliente son
+// dos filas independientes de la misma solicitud, una por cada
+// "autor". El único constraint que tiene sentido ya no es
+// serviceRequestId a secas (eso permitía solo UNA valoración total
+// por solicitud) sino (serviceRequestId, autorId): cada parte puede
+// valorar como mucho una vez, en su propio sentido.
 model Review {
   id               String         @id @default(uuid())
-  serviceRequestId String         @unique @map("service_request_id")
+  serviceRequestId String         @map("service_request_id")
   autorId          String         @map("autor_id")
   destinatarioId   String         @map("destinatario_id")
   puntuacion       Int
@@ -135,6 +143,7 @@ model Review {
   destinatario     User           @relation("DestinatarioReview", fields: [destinatarioId], references: [id])
   serviceRequest   ServiceRequest @relation(fields: [serviceRequestId], references: [id])
 
+  @@unique([serviceRequestId, autorId])
   @@map("reviews")
 }
 

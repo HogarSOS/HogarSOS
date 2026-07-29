@@ -118,7 +118,7 @@ export async function getServiceRequestById(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({
     where: { id },
-    include: { categoria: true, payment: true, review: true },
+    include: { categoria: true, payment: true, reviews: true },
   });
 
   if (!solicitud) {
@@ -153,9 +153,16 @@ export async function getServiceRequestById(req: Request, res: Response) {
           montoProfesional: Number(solicitud.payment.montoProfesional),
         }
       : null,
-    review: solicitud.review
-      ? { puntuacion: solicitud.review.puntuacion, comentario: solicitud.review.comentario }
-      : null,
+    // Array en vez de un único objeto: puede haber hasta dos
+    // (cliente->profesional y profesional->cliente). El frontend
+    // filtra por autorId == su propio usuario para saber "¿ya valoré
+    // yo?" sin que el backend tenga que adivinar desde qué lado se
+    // está pidiendo esto.
+    reviews: solicitud.reviews.map((r) => ({
+      autorId: r.autorId,
+      puntuacion: r.puntuacion,
+      comentario: r.comentario,
+    })),
   });
 }
 
@@ -209,6 +216,56 @@ export async function listNearbyRequests(req: Request, res: Response) {
   return res.json({ solicitudes });
 }
 
+/**
+ * Cancela una solicitud — solo el cliente que la creó, y solo mientras
+ * siga "pendiente" (ningún profesional la ha aceptado todavía). En
+ * cuanto pasa a "cancelada" deja automáticamente de aparecer en
+ * listNearbyRequests (que ya filtra por estado = 'pendiente'), así que
+ * no hace falta ninguna limpieza aparte para que desaparezca de la
+ * vista de los profesionales. Tampoco hay chat que limpiar: la
+ * sincronización a Firestore solo ocurre al aceptar (ver
+ * acceptServiceRequest), y una solicitud pendiente nunca llegó a eso.
+ *
+ * Misma protección de condición de carrera que aceptar: si un
+ * profesional la acepta justo en el instante en que el cliente
+ * cancela, gana quien complete la transacción primero — el otro
+ * recibe un 409 claro en vez de un estado inconsistente.
+ */
+export async function cancelServiceRequest(req: Request, res: Response) {
+  const { id } = req.params;
+  const clienteId = req.user!.userId;
+
+  try {
+    const actual = await prisma.serviceRequest.findUnique({ where: { id } });
+    if (!actual) throw new Error('NOT_FOUND');
+    if (actual.clienteId !== clienteId) throw new Error('NO_AUTORIZADO');
+
+    // La condición `estado: 'pendiente'` va en el propio UPDATE (igual
+    // que en acceptServiceRequest) para que la comprobación y la
+    // escritura sean una sola operación atómica — si un profesional
+    // acepta justo en este instante, esta llamada afecta 0 filas en vez
+    // de cancelar una solicitud que ya tiene profesional asignado.
+    const { count } = await prisma.serviceRequest.updateMany({
+      where: { id, clienteId, estado: 'pendiente' },
+      data: { estado: 'cancelada' },
+    });
+    if (count === 0) throw new Error('YA_NO_CANCELABLE');
+
+    return res.json({ id, estado: 'cancelada' });
+  } catch (err) {
+    if (err instanceof Error && err.message === 'NOT_FOUND') {
+      return res.status(404).json({ error: 'Solicitud no encontrada' });
+    }
+    if (err instanceof Error && err.message === 'NO_AUTORIZADO') {
+      return res.status(403).json({ error: 'Solo el cliente que creó esta solicitud puede cancelarla' });
+    }
+    if (err instanceof Error && err.message === 'YA_NO_CANCELABLE') {
+      return res.status(409).json({ error: 'Esta solicitud ya no se puede cancelar — un profesional ya la aceptó o ya se resolvió' });
+    }
+    throw err;
+  }
+}
+
 export async function acceptServiceRequest(req: Request, res: Response) {
   const { id } = req.params;
   const profesionalId = req.user!.userId;
@@ -221,20 +278,32 @@ export async function acceptServiceRequest(req: Request, res: Response) {
     return res.status(403).json({ error: 'No autorizado para aceptar solicitudes' });
   }
 
-  // Transacción para evitar condición de carrera: dos profesionales
-  // no pueden aceptar la misma solicitud a la vez.
+  // Update condicional atómico para evitar condición de carrera: la
+  // comprobación `estado: 'pendiente'` va dentro del propio UPDATE (no
+  // en un SELECT previo dentro de una transacción) para que Postgres la
+  // evalúe y aplique en una sola operación indivisible. Con el patrón
+  // anterior (SELECT para comprobar el estado, luego UPDATE por id) dos
+  // profesionales podían leer "pendiente" los dos antes de que
+  // cualquiera escribiera su cambio — ninguna de las dos lecturas veía
+  // el cambio de la otra hasta que esa transacción hacía commit — así
+  // que ambos recibían un 200 de "aceptada con éxito" aunque solo uno
+  // quedara realmente asignado en la base de datos, dejando la
+  // solicitud en un estado inconsistente entre cliente y profesional.
+  // `updateMany` con esta condición en el WHERE hace que solo la
+  // primera petición en llegar a la base de datos afecte alguna fila;
+  // la segunda afecta 0 filas y así lo puede detectar.
   try {
-    const solicitud = await prisma.$transaction(async (tx) => {
-      const actual = await tx.serviceRequest.findUnique({ where: { id } });
-
-      if (!actual) throw new Error('NOT_FOUND');
-      if (actual.estado !== 'pendiente') throw new Error('YA_NO_DISPONIBLE');
-
-      return tx.serviceRequest.update({
-        where: { id },
-        data: { profesionalId, estado: 'aceptada', aceptadaAt: new Date() },
-      });
+    const { count } = await prisma.serviceRequest.updateMany({
+      where: { id, estado: 'pendiente' },
+      data: { profesionalId, estado: 'aceptada', aceptadaAt: new Date() },
     });
+
+    if (count === 0) {
+      const existe = await prisma.serviceRequest.findUnique({ where: { id } });
+      throw new Error(existe ? 'YA_NO_DISPONIBLE' : 'NOT_FOUND');
+    }
+
+    const solicitud = await prisma.serviceRequest.findUniqueOrThrow({ where: { id } });
 
     // Sincroniza a Firestore los UIDs de Firebase de ambas partes, para
     // que firestore.rules pueda restringir el chat de esta solicitud
@@ -348,19 +417,26 @@ export async function completeServiceRequest(req: Request, res: Response) {
 }
 
 /**
- * Lista los trabajos del profesional autenticado que ya aceptó y aún
- * no ha completado — sin esto, en cuanto el profesional aceptaba una
- * solicitud desaparecía de "cercanas" (correcto, ya no está pendiente)
- * y no había forma de volver a verla, contactar al cliente o marcarla
- * como terminada.
+ * Lista los trabajos del profesional autenticado: en curso (aceptada/
+ * en_progreso) Y completados recientes — antes solo incluía los
+ * activos, así que en cuanto se completaba un trabajo desaparecía sin
+ * dejar forma de valorar al cliente. Se limita a los últimos 50
+ * completados para no cargar todo el historial de por vida en esta
+ * misma lista.
  */
 export async function listMyAssignedRequests(req: Request, res: Response) {
   const profesionalId = req.user!.userId;
 
   const solicitudes = await prisma.serviceRequest.findMany({
-    where: { profesionalId, estado: { in: ['aceptada', 'en_progreso'] } },
-    include: { categoria: true, cliente: { select: { nombre: true, telefono: true } }, payment: true },
+    where: { profesionalId, estado: { in: ['aceptada', 'en_progreso', 'completada'] } },
+    include: {
+      categoria: true,
+      cliente: { select: { nombre: true, telefono: true } },
+      payment: true,
+      reviews: true,
+    },
     orderBy: { aceptadaAt: 'desc' },
+    take: 50,
   });
 
   return res.json({
@@ -373,8 +449,10 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
       clienteNombre: s.cliente.nombre,
       clienteTelefono: s.cliente.telefono,
       precioEstimado: s.precioEstimado ? Number(s.precioEstimado) : null,
+      precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
       createdAt: s.createdAt,
       tienePago: Boolean(s.payment),
+      tieneValoracion: s.reviews.some((r) => r.autorId === profesionalId),
     })),
   });
 }
@@ -389,7 +467,7 @@ export async function listMyServiceRequests(req: Request, res: Response) {
 
   const solicitudes = await prisma.serviceRequest.findMany({
     where: { clienteId },
-    include: { categoria: true, payment: true, review: true },
+    include: { categoria: true, payment: true, reviews: true },
     orderBy: { createdAt: 'desc' },
     take: 50,
   });
@@ -405,7 +483,11 @@ export async function listMyServiceRequests(req: Request, res: Response) {
       precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
       createdAt: s.createdAt,
       tienePago: Boolean(s.payment),
-      tieneValoracion: Boolean(s.review),
+      // Antes era "¿existe ALGUNA valoración?" — con reviews
+      // bidireccionales eso ya no distingue si fue el cliente o el
+      // profesional quien la dejó. Ahora comprueba específicamente si
+      // el cliente (el dueño de esta lista) ya valoró.
+      tieneValoracion: s.reviews.some((r) => r.autorId === clienteId),
     })),
   });
 }

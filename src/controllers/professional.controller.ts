@@ -20,6 +20,16 @@ export async function getProfile(req: Request, res: Response) {
     return res.status(404).json({ error: 'Perfil de profesional no encontrado' });
   }
 
+  // Reviews recibidas — antes solo se veían desde el perfil PÚBLICO
+  // (getPublicProfile más abajo); el propio profesional no tenía
+  // ninguna forma de ver sus propias opiniones dentro de la app.
+  const reviews = await prisma.review.findMany({
+    where: { destinatarioId: userId },
+    include: { autor: { select: { nombre: true } } },
+    orderBy: { createdAt: 'desc' },
+    take: 50,
+  });
+
   return res.json({
     nombre: profesional.user.nombre,
     email: profesional.user.email,
@@ -32,8 +42,19 @@ export async function getProfile(req: Request, res: Response) {
     modoDisponibilidad: profesional.modoDisponibilidad,
     descripcion: profesional.descripcion,
     fotoPerfilUrl: profesional.fotoPerfilUrl,
+    // Sin esto, el propio profesional no tenía forma de saber si ya
+    // había enviado su documento de identidad o no — la app solo podía
+    // mostrarle "completa tu perfil" para siempre, aunque ya lo hubiera
+    // enviado y solo estuviera pendiente de que un admin lo revisara.
+    documentoIdentidadUrl: profesional.documentoIdentidadUrl || null,
     categorias: profesional.categorias.map((c) => c.category.nombre),
     cuentaStripeConfigurada: Boolean(profesional.stripeAccountId),
+    opiniones: reviews.map((r) => ({
+      autor: r.autor.nombre,
+      puntuacion: r.puntuacion,
+      comentario: r.comentario,
+      fecha: r.createdAt,
+    })),
   });
 }
 

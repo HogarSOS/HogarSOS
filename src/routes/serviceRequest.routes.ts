@@ -7,6 +7,7 @@ import {
   listNearbyRequests,
   acceptServiceRequest,
   completeServiceRequest,
+  cancelServiceRequest,
   listMyServiceRequests,
   listMyAssignedRequests,
 } from '../controllers/serviceRequest.controller';
@@ -23,5 +24,6 @@ router.get('/nearby/list', authMiddleware(['profesional']), asyncHandler(listNea
 router.get('/assigned/mine', authMiddleware(['profesional']), asyncHandler(listMyAssignedRequests));
 router.patch('/:id/accept', authMiddleware(['profesional']), asyncHandler(acceptServiceRequest));
 router.patch('/:id/complete', authMiddleware(['profesional']), asyncHandler(completeServiceRequest));
+router.patch('/:id/cancel', authMiddleware(['cliente']), asyncHandler(cancelServiceRequest));
 
 export default router;

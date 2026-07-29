@@ -18,7 +18,18 @@ service cloud.firestore {
          request.auth.uid == resource.data.profesionalFirebaseUid);
 
       match /messages/{messageId} {
-        allow read, create: if request.auth != null &&
+        allow read: if request.auth != null &&
+          (request.auth.uid == get(/databases/$(database)/documents/service_requests/$(requestId)).data.clienteFirebaseUid ||
+           request.auth.uid == get(/databases/$(database)/documents/service_requests/$(requestId)).data.profesionalFirebaseUid);
+        // autorId debe ser el propio UID de quien escribe: antes el
+        // cliente Flutter mandaba el id de Postgres (AppUser.id) como
+        // autorId, así que esta comprobación era imposible de aplicar
+        // sin romper el envío de mensajes. Ahora que el cliente manda
+        // el UID de Firebase real (ver chat_screen.dart), exigirlo
+        // aquí evita que un participante autorizado del chat pueda
+        // enviar mensajes suplantando al otro.
+        allow create: if request.auth != null &&
+          request.auth.uid == request.resource.data.autorId &&
           (request.auth.uid == get(/databases/$(database)/documents/service_requests/$(requestId)).data.clienteFirebaseUid ||
            request.auth.uid == get(/databases/$(database)/documents/service_requests/$(requestId)).data.profesionalFirebaseUid);
         allow update, delete: if false; // los mensajes son inmutables

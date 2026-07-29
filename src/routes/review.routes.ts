@@ -5,6 +5,6 @@ import { createReview } from '../controllers/review.controller';
 
 const router = Router();
 
-router.post('/', authMiddleware(['cliente']), asyncHandler(createReview));
+router.post('/', authMiddleware(['cliente', 'profesional']), asyncHandler(createReview));
 
 export default router;
