@@ -5,11 +5,10 @@ rules_version = '2';
 // leer/escribir sus mensajes — nunca un tercero, ni siquiera otro
 // cliente o profesional de la plataforma.
 //
-// Requiere que el backend, al aceptar una solicitud, escriba también
-// en Firestore (no solo en PostgreSQL) los IDs de cliente_id y
-// profesional_id en /service_requests/{id}, para que estas reglas
-// puedan comprobarlos. Pendiente de implementar esa sincronización
-// en serviceRequest.controller.ts (acceptServiceRequest).
+// acceptServiceRequest (serviceRequest.controller.ts) sincroniza los
+// UIDs de Firebase de ambas partes a /service_requests/{id} en el
+// momento de aceptar — es lo que estas reglas necesitan para
+// funcionar. Publicadas en el proyecto "hogarsos" el 2026-07-29.
 
 service cloud.firestore {
   match /databases/{database}/documents {
