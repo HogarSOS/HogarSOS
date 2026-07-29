@@ -32,6 +32,13 @@ process.on('uncaughtException', (err) => {
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+// Detrás del proxy de Render, sin esto Express ve todas las peticiones
+// como si vinieran de la IP interna del proxy en vez de la IP real del
+// cliente -- express-rate-limit (que usa req.ip) trataría entonces a
+// TODOS los usuarios como un único cliente, compartiendo un mismo
+// límite de 200 peticiones/15min entre todo el mundo.
+app.set('trust proxy', 1);
+
 // Seguridad
 app.use(
   helmet({
