@@ -75,15 +75,21 @@ export async function releasePayment(serviceRequestId: string) {
   }
 
   // 1. Capturar el cargo (el dinero pasa de "autorizado" a "cobrado de verdad")
-  await stripe.paymentIntents.capture(pago.stripePaymentIntentId);
+  const paymentIntentCapturado = await stripe.paymentIntents.capture(pago.stripePaymentIntentId);
 
   // 2. Transferir la parte del profesional a su cuenta Stripe Connect.
   //    La comisión se queda automáticamente en la cuenta de la plataforma.
+  //    source_transaction exige el ID del Charge (ch_...), no el del
+  //    PaymentIntent (pi_...) — son recursos distintos en la API de Stripe.
+  const chargeId = typeof paymentIntentCapturado.latest_charge === 'string'
+    ? paymentIntentCapturado.latest_charge
+    : paymentIntentCapturado.latest_charge?.id;
+
   const transfer = await stripe.transfers.create({
     amount: Math.round(Number(pago.montoProfesional) * 100),
     currency: 'eur',
     destination: solicitud.profesional.stripeAccountId,
-    source_transaction: pago.stripePaymentIntentId,
+    source_transaction: chargeId,
   });
 
   return prisma.payment.update({
