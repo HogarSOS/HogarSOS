@@ -1,13 +1,3 @@
-databases:
-  # Plan free: Render borra la base de datos automáticamente a los 30
-  # días de creada. Antes de esa fecha, o en cuanto haya datos reales
-  # que importe conservar, pasar a un plan de pago (Starter o
-  # superior) — Render lo permite sin volver a crear la base.
-  - name: hogarsos-db
-    plan: free
-    region: oregon
-    postgresMajorVersion: "16"
-
 services:
   - type: web
     name: hogarsos-backend
@@ -40,10 +30,12 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Apunta a la base de datos Supabase existente (no una nueva de
+      # Render) para conservar categorías y profesionales ya creados.
+      # Rellenar a mano en el dashboard con la misma DATABASE_URL del
+      # .env local.
       - key: DATABASE_URL
-        fromDatabase:
-          name: hogarsos-db
-          property: connectionString
+        sync: false
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_EXPIRES_IN
