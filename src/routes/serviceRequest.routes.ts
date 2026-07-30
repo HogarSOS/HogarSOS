@@ -5,7 +5,6 @@ import {
   createServiceRequest,
   getServiceRequestById,
   listNearbyRequests,
-  acceptServiceRequest,
   completeServiceRequest,
   cancelServiceRequest,
   deleteServiceRequest,
@@ -15,6 +14,8 @@ import {
   notifyChatMessage,
   markChatRead,
 } from '../controllers/serviceRequest.controller';
+import { createDispute } from '../controllers/dispute.controller';
+import { createPostulacion, listPostulaciones, selectPostulacion } from '../controllers/postulacion.controller';
 
 const router = Router();
 
@@ -26,12 +27,15 @@ router.get('/mine', authMiddleware(['cliente']), asyncHandler(listMyServiceReque
 router.get('/:id', authMiddleware(), asyncHandler(getServiceRequestById));
 router.get('/nearby/list', authMiddleware(['profesional']), asyncHandler(listNearbyRequests));
 router.get('/assigned/mine', authMiddleware(['profesional']), asyncHandler(listMyAssignedRequests));
-router.patch('/:id/accept', authMiddleware(['profesional']), asyncHandler(acceptServiceRequest));
 router.patch('/:id/complete', authMiddleware(['profesional']), asyncHandler(completeServiceRequest));
 router.patch('/:id/cancel', authMiddleware(['cliente']), asyncHandler(cancelServiceRequest));
 router.delete('/:id', authMiddleware(['cliente']), asyncHandler(deleteServiceRequest));
 router.post('/:id/sync-chat', authMiddleware(), asyncHandler(syncChat));
 router.post('/:id/notify-chat', authMiddleware(), asyncHandler(notifyChatMessage));
 router.post('/:id/mark-chat-read', authMiddleware(), asyncHandler(markChatRead));
+router.post('/:id/disputes', authMiddleware(['cliente', 'profesional']), asyncHandler(createDispute));
+router.post('/:id/postulaciones', authMiddleware(['profesional']), asyncHandler(createPostulacion));
+router.get('/:id/postulaciones', authMiddleware(['cliente']), asyncHandler(listPostulaciones));
+router.post('/:id/postulaciones/:postulacionId/seleccionar', authMiddleware(['cliente']), asyncHandler(selectPostulacion));
 
 export default router;

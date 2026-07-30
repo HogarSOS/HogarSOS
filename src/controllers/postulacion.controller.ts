@@ -1,0 +1,223 @@
+import { Request, Response } from 'express';
+import { z } from 'zod';
+import { prisma } from '../config/prisma';
+import { firestore } from '../config/firebase';
+import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
+import { enviarNotificacion, enviarNotificacionMasiva } from '../services/notification.service';
+import { razonBloqueoTexto } from '../utils/contactFilter';
+
+/**
+ * Copia deliberada de sincronizarChatFirestore en
+ * serviceRequest.controller.ts (no exportada de allí) — es un helper
+ * de 10 líneas, más simple duplicarlo aquí que acoplar los dos
+ * controladores solo para reutilizarlo.
+ */
+async function sincronizarChatFirestore(id: string, clienteId: string, profesionalId: string) {
+  const [cliente, profesional] = await Promise.all([
+    prisma.user.findUnique({ where: { id: clienteId } }),
+    prisma.user.findUnique({ where: { id: profesionalId } }),
+  ]);
+
+  await firestore.collection('service_requests').doc(id).set(
+    {
+      clienteFirebaseUid: cliente?.firebaseUid ?? null,
+      profesionalFirebaseUid: profesional?.firebaseUid ?? null,
+    },
+    { merge: true }
+  );
+}
+
+const createPostulacionSchema = z.object({
+  mensaje: z.string().trim().min(1).max(200),
+});
+
+/**
+ * Un profesional se postula a una solicitud "pendiente" — sustituye al
+ * antiguo "el primero que acepta gana". El mensaje pasa por el mismo
+ * filtro de contacto que el chat, pero aquí sí se puede validar en
+ * servidor porque este endpoint es nuestro, no Firestore.
+ */
+export async function createPostulacion(req: Request, res: Response) {
+  const { id } = req.params;
+  const profesionalId = req.user!.userId;
+
+  const datos = createPostulacionSchema.parse(req.body);
+  const bloqueo = razonBloqueoTexto(datos.mensaje);
+  if (bloqueo) {
+    return res.status(400).json({
+      error: 'Por seguridad, los datos de contacto solo podrán compartirse cuando el trabajo haya sido aceptado.',
+      motivo: bloqueo,
+    });
+  }
+
+  const profesional = await prisma.professional.findUnique({ where: { userId: profesionalId } });
+  if (
+    !profesional ||
+    (REQUIRE_PROFESSIONAL_VERIFICATION && profesional.estadoVerificacion !== 'aprobado')
+  ) {
+    return res.status(403).json({ error: 'No autorizado para postularte a solicitudes' });
+  }
+
+  const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
+  if (!solicitud) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (solicitud.estado !== 'pendiente') {
+    return res.status(409).json({ error: 'Esta solicitud ya no está disponible' });
+  }
+
+  try {
+    const postulacion = await prisma.postulacion.create({
+      data: { serviceRequestId: id, profesionalId, mensaje: datos.mensaje },
+    });
+
+    enviarNotificacion(solicitud.clienteId, {
+      title: 'Nuevo profesional interesado',
+      body: 'Un profesional se ha postulado a tu solicitud',
+    }, { tipo: 'nueva_postulacion', solicitudId: id }).catch((e) =>
+      console.error(`[createPostulacion] Error al notificar al cliente de ${id}:`, e)
+    );
+
+    return res.status(201).json({ id: postulacion.id, estado: postulacion.estado });
+  } catch (err: any) {
+    // Constraint único (serviceRequestId, profesionalId) — mismo
+    // patrón que el de Review, ver schema.prisma.
+    if (err?.code === 'P2002') {
+      return res.status(409).json({ error: 'Ya te has postulado a esta solicitud' });
+    }
+    throw err;
+  }
+}
+
+/**
+ * Lista las candidaturas pendientes de una solicitud — solo el cliente
+ * dueño. A propósito con ORDER BY random(): no se ordena por
+ * valoración para que los profesionales nuevos tengan las mismas
+ * oportunidades que los ya establecidos: se resuelve de nuevo en cada
+ * carga, así que el orden cambia entre refrescos.
+ *
+ * Nunca selecciona teléfono/email del profesional — antes de la
+ * contratación esos datos no deben llegar al cliente de ninguna forma.
+ */
+export async function listPostulaciones(req: Request, res: Response) {
+  const { id } = req.params;
+  const clienteId = req.user!.userId;
+
+  const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
+  if (!solicitud) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (solicitud.clienteId !== clienteId) {
+    return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
+  }
+
+  const postulaciones = await prisma.$queryRaw<
+    {
+      id: string;
+      profesional_id: string;
+      nombre: string;
+      foto_perfil_url: string | null;
+      valoracion_media: number;
+      total_valoraciones: number;
+      distancia_metros: number | null;
+      mensaje: string | null;
+      estado_verificacion: string;
+      created_at: Date;
+    }[]
+  >`
+    SELECT po.id, po.profesional_id, u.nombre, u.foto_perfil_url,
+           u.valoracion_media, u.total_valoraciones, po.mensaje, po.created_at,
+           p.estado_verificacion,
+           CASE WHEN p.ubicacion_actual IS NOT NULL
+                THEN ST_Distance(sr.ubicacion, p.ubicacion_actual)
+                ELSE NULL END AS distancia_metros
+    FROM postulaciones po
+    JOIN professionals p ON p.user_id = po.profesional_id
+    JOIN users u ON u.id = po.profesional_id
+    JOIN service_requests sr ON sr.id = po.service_request_id
+    WHERE po.service_request_id = ${id} AND po.estado = 'pendiente'
+    ORDER BY random()
+  `;
+
+  return res.json({ postulaciones });
+}
+
+/**
+ * El cliente elige un candidato entre las postulaciones pendientes —
+ * mismo patrón de updateMany atómico que el antiguo acceptServiceRequest
+ * (ver postulacion.controller.ts arriba y el comentario retirado de
+ * serviceRequest.controller.ts), pero disparado por la elección del
+ * cliente, no por el primer profesional que pulsa un botón.
+ */
+export async function selectPostulacion(req: Request, res: Response) {
+  const { id, postulacionId } = req.params;
+  const clienteId = req.user!.userId;
+
+  const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
+  if (!solicitud) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (solicitud.clienteId !== clienteId) {
+    return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
+  }
+
+  const postulacion = await prisma.postulacion.findUnique({ where: { id: postulacionId } });
+  if (!postulacion || postulacion.serviceRequestId !== id) {
+    return res.status(404).json({ error: 'Candidatura no encontrada' });
+  }
+
+  const otrasIds = await prisma.$transaction(async (tx) => {
+    const otras = await tx.postulacion.findMany({
+      where: { serviceRequestId: id, id: { not: postulacionId }, estado: 'pendiente' },
+      select: { profesionalId: true },
+    });
+
+    const { count } = await tx.serviceRequest.updateMany({
+      where: { id, estado: 'pendiente' },
+      data: { profesionalId: postulacion.profesionalId, estado: 'aceptada', aceptadaAt: new Date() },
+    });
+    if (count === 0) throw new Error('YA_NO_DISPONIBLE');
+
+    await tx.postulacion.update({
+      where: { id: postulacionId },
+      data: { estado: 'aceptada', resueltaAt: new Date() },
+    });
+    await tx.postulacion.updateMany({
+      where: { serviceRequestId: id, id: { not: postulacionId }, estado: 'pendiente' },
+      data: { estado: 'rechazada', resueltaAt: new Date() },
+    });
+
+    return otras.map((o) => o.profesionalId);
+  }).catch((err) => {
+    if (err instanceof Error && err.message === 'YA_NO_DISPONIBLE') return null;
+    throw err;
+  });
+
+  if (otrasIds === null) {
+    return res.status(409).json({ error: 'Esta solicitud ya no está disponible' });
+  }
+
+  try {
+    await sincronizarChatFirestore(id, clienteId, postulacion.profesionalId);
+  } catch (firestoreErr) {
+    console.error(`[selectPostulacion] Fallo al sincronizar Firestore para ${id}:`, firestoreErr);
+  }
+
+  enviarNotificacion(postulacion.profesionalId, {
+    title: '¡Te han elegido!',
+    body: 'El cliente ha seleccionado tu candidatura',
+  }, { tipo: 'postulacion_aceptada', solicitudId: id }).catch((e) =>
+    console.error(`[selectPostulacion] Error al notificar al elegido de ${id}:`, e)
+  );
+
+  if (otrasIds.length > 0) {
+    enviarNotificacionMasiva(otrasIds, {
+      title: 'Selección finalizada',
+      body: 'El cliente ha seleccionado a otro profesional. Gracias por tu interés.',
+    }, { tipo: 'postulacion_rechazada', solicitudId: id }).catch((e) =>
+      console.error(`[selectPostulacion] Error al notificar a los descartados de ${id}:`, e)
+    );
+  }
+
+  return res.json({ id, estado: 'aceptada', profesionalId: postulacion.profesionalId });
+}

@@ -29,7 +29,7 @@ jest.mock('../../services/notification.service', () => ({
 import { prisma } from '../../config/prisma';
 import { refundPayment } from '../../services/payment.service';
 import { enviarNotificacion } from '../../services/notification.service';
-import { cancelServiceRequest, acceptServiceRequest } from '../serviceRequest.controller';
+import { cancelServiceRequest } from '../serviceRequest.controller';
 
 const mockPrisma = prisma as any;
 const mockRefundPayment = refundPayment as jest.Mock;
@@ -163,47 +163,7 @@ describe('cancelServiceRequest', () => {
   });
 });
 
-describe('acceptServiceRequest — protección contra condición de carrera', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
-  /**
-   * La atomicidad de "aceptar" depende de que la comprobación
-   * `estado: 'pendiente'` viva DENTRO del propio updateMany (no en un
-   * SELECT previo) — si alguien lo "simplifica" a un find + update por
-   * id, dos profesionales podrían aceptar la misma solicitud a la vez.
-   * Este test no puede reproducir la carrera real (eso lo garantiza
-   * Postgres, no este código), pero sí detecta si alguien rompe la
-   * forma en que se pide esa garantía.
-   */
-  it('comprueba estado: "pendiente" dentro del propio updateMany, no en una lectura previa', async () => {
-    mockPrisma.professional.findUnique.mockResolvedValue({ estadoVerificacion: 'aprobado' });
-    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 1 });
-    mockPrisma.serviceRequest.findUniqueOrThrow.mockResolvedValue({
-      id: 'sr-1',
-      clienteId: 'cliente-1',
-      profesionalId: 'pro-1',
-      estado: 'aceptada',
-    });
-
-    await acceptServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), fakeRes());
-
-    expect(mockPrisma.serviceRequest.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({ id: 'sr-1', estado: 'pendiente' }),
-      })
-    );
-  });
-
-  it('devuelve 409 (no 500) si otro profesional ya la aceptó justo antes', async () => {
-    mockPrisma.professional.findUnique.mockResolvedValue({ estadoVerificacion: 'aprobado' });
-    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 0 });
-    mockPrisma.serviceRequest.findUnique.mockResolvedValue({ id: 'sr-1', estado: 'aceptada' });
-
-    const res = fakeRes();
-    await acceptServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-2'), res);
-
-    expect(res.status).toHaveBeenCalledWith(409);
-  });
-});
+// La protección contra condición de carrera al asignar un profesional
+// vive ahora en selectPostulacion (postulacion.controller.ts) — ver
+// postulacion.select.test.ts. acceptServiceRequest ("el primero que
+// acepta gana") se retiró junto con el resto de ese flujo.

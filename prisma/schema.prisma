@@ -65,6 +65,7 @@ model Professional {
   categorias            ProfessionalCategory[]
   user                  User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
   serviceRequests       ServiceRequest[]
+  postulaciones         Postulacion[]
 
   @@index([ubicacionActual], map: "idx_professionals_ubicacion_actual", type: Gist)
   @@map("professionals")
@@ -101,6 +102,7 @@ model ServiceRequest {
   disputes       Dispute[]
   payment        Payment?
   reviews        Review[]
+  postulaciones  Postulacion[]
   categoria      ServiceCategory          @relation(fields: [categoryId], references: [id])
   cliente        User                     @relation("ClienteRequests", fields: [clienteId], references: [id])
   profesional    Professional?            @relation(fields: [profesionalId], references: [userId])
@@ -148,18 +150,39 @@ model Review {
 }
 
 model Dispute {
-  id               String         @id @default(uuid())
-  serviceRequestId String         @map("service_request_id")
-  creadoPor        String         @map("creado_por")
+  id               String            @id @default(uuid())
+  serviceRequestId String            @map("service_request_id")
+  creadoPor        String            @map("creado_por")
   motivo           String
-  estado           String         @default("abierta")
-  resueltoPor      String?        @map("resuelto_por")
-  resolucionNotas  String?        @map("resolucion_notas")
-  createdAt        DateTime       @default(now()) @map("created_at")
-  resueltaAt       DateTime?      @map("resuelta_at")
-  serviceRequest   ServiceRequest @relation(fields: [serviceRequestId], references: [id])
+  motivoCategoria  MotivoReclamacion @default(otro) @map("motivo_categoria")
+  fotosUrls        String[]          @default([]) @map("fotos_urls")
+  estado           String            @default("abierta")
+  resueltoPor      String?           @map("resuelto_por")
+  resolucionNotas  String?           @map("resolucion_notas")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  resueltaAt       DateTime?         @map("resuelta_at")
+  serviceRequest   ServiceRequest    @relation(fields: [serviceRequestId], references: [id])
 
   @@map("disputes")
+}
+
+// Candidatura de un profesional a una solicitud "pendiente" — sustituye
+// al antiguo "el primero que acepta gana". Único por (solicitud,
+// profesional), mismo patrón que Review, para que no pueda postularse
+// dos veces a la misma solicitud.
+model Postulacion {
+  id               String            @id @default(uuid())
+  serviceRequestId String            @map("service_request_id")
+  profesionalId    String            @map("profesional_id")
+  mensaje          String?
+  estado           EstadoPostulacion @default(pendiente)
+  createdAt        DateTime          @default(now()) @map("created_at")
+  resueltaAt       DateTime?         @map("resuelta_at")
+  serviceRequest   ServiceRequest    @relation(fields: [serviceRequestId], references: [id])
+  profesional      Professional      @relation(fields: [profesionalId], references: [userId])
+
+  @@unique([serviceRequestId, profesionalId])
+  @@map("postulaciones")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
@@ -204,6 +227,24 @@ enum UrgenciaSolicitud {
   hoy
   manana
   fecha_especifica
+}
+
+enum EstadoPostulacion {
+  pendiente
+  aceptada
+  rechazada
+}
+
+// Motivos fijos de reclamación — lista cerrada a propósito (en vez de
+// texto libre) para que el panel de admin pueda filtrar/agrupar por
+// motivo real; la descripción libre va aparte, en Dispute.motivo.
+enum MotivoReclamacion {
+  profesional_no_presento
+  cliente_ausente
+  trabajo_cancelado
+  problema_pago
+  comportamiento_inapropiado
+  otro
 }
 
 // Modo de disponibilidad declarado por el profesional (no es lo mismo

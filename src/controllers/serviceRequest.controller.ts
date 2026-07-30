@@ -127,6 +127,7 @@ export async function getServiceRequestById(req: Request, res: Response) {
       // (ver ChatScreen en el frontend) no tenía forma de saber con
       // quién estaba hablando el cliente sin esto.
       profesional: { include: { user: { select: { nombre: true } } } },
+      _count: { select: { postulaciones: { where: { estado: 'pendiente' } } } },
     },
   });
 
@@ -155,6 +156,7 @@ export async function getServiceRequestById(req: Request, res: Response) {
     precioFinal: solicitud.precioFinal ? Number(solicitud.precioFinal) : null,
     estado: solicitud.estado,
     createdAt: solicitud.createdAt,
+    numCandidatos: solicitud._count.postulaciones,
     payment: solicitud.payment
       ? {
           estado: solicitud.payment.estado,
@@ -217,14 +219,17 @@ export async function listNearbyRequests(req: Request, res: Response) {
       urgencia: string;
       cliente_nombre: string;
       cliente_foto_url: string | null;
+      ya_postulado: boolean;
     }[]
   >`
     SELECT sr.id, sr.descripcion, sr.created_at, sr.urgencia,
            ST_Distance(sr.ubicacion, p.ubicacion_actual) AS distancia_metros,
-           u.nombre AS cliente_nombre, u.foto_perfil_url AS cliente_foto_url
+           u.nombre AS cliente_nombre, u.foto_perfil_url AS cliente_foto_url,
+           (po.id IS NOT NULL) AS ya_postulado
     FROM service_requests sr
     JOIN professionals p ON p.user_id = ${profesionalId}
     JOIN users u ON u.id = sr.cliente_id
+    LEFT JOIN postulaciones po ON po.service_request_id = sr.id AND po.profesional_id = ${profesionalId}
     WHERE sr.estado = 'pendiente'
       AND sr.category_id = ANY(${categoriaIds})
       AND p.ubicacion_actual IS NOT NULL
@@ -485,78 +490,11 @@ export async function markChatRead(req: Request, res: Response) {
   return res.json({ ok: true });
 }
 
-export async function acceptServiceRequest(req: Request, res: Response) {
-  const { id } = req.params;
-  const profesionalId = req.user!.userId;
-
-  const profesional = await prisma.professional.findUnique({ where: { userId: profesionalId } });
-  if (
-    !profesional ||
-    (REQUIRE_PROFESSIONAL_VERIFICATION && profesional.estadoVerificacion !== 'aprobado')
-  ) {
-    return res.status(403).json({ error: 'No autorizado para aceptar solicitudes' });
-  }
-
-  // Update condicional atómico para evitar condición de carrera: la
-  // comprobación `estado: 'pendiente'` va dentro del propio UPDATE (no
-  // en un SELECT previo dentro de una transacción) para que Postgres la
-  // evalúe y aplique en una sola operación indivisible. Con el patrón
-  // anterior (SELECT para comprobar el estado, luego UPDATE por id) dos
-  // profesionales podían leer "pendiente" los dos antes de que
-  // cualquiera escribiera su cambio — ninguna de las dos lecturas veía
-  // el cambio de la otra hasta que esa transacción hacía commit — así
-  // que ambos recibían un 200 de "aceptada con éxito" aunque solo uno
-  // quedara realmente asignado en la base de datos, dejando la
-  // solicitud en un estado inconsistente entre cliente y profesional.
-  // `updateMany` con esta condición en el WHERE hace que solo la
-  // primera petición en llegar a la base de datos afecte alguna fila;
-  // la segunda afecta 0 filas y así lo puede detectar.
-  try {
-    const { count } = await prisma.serviceRequest.updateMany({
-      where: { id, estado: 'pendiente' },
-      data: { profesionalId, estado: 'aceptada', aceptadaAt: new Date() },
-    });
-
-    if (count === 0) {
-      const existe = await prisma.serviceRequest.findUnique({ where: { id } });
-      throw new Error(existe ? 'YA_NO_DISPONIBLE' : 'NOT_FOUND');
-    }
-
-    const solicitud = await prisma.serviceRequest.findUniqueOrThrow({ where: { id } });
-
-    // En su propio try/catch a propósito: aceptar la solicitud ya quedó
-    // confirmado en Postgres arriba — si la sincronización a Firestore
-    // falla (credenciales de Firebase Admin mal configuradas, API de
-    // Firestore deshabilitada...), no debe convertir un "aceptado con
-    // éxito" en un 500 para el profesional. El chat de esa solicitud
-    // puede quedar sin sincronizar — para eso existe syncChatFirestore,
-    // que el frontend reintenta cada vez que se abre el chat (ver
-    // syncChat más abajo), así un fallo puntual aquí no dependa de que
-    // alguien reintente el aceptar entero a mano.
-    try {
-      await sincronizarChatFirestore(id, solicitud.clienteId, profesionalId);
-    } catch (firestoreErr) {
-      console.error(`[acceptServiceRequest] Fallo al sincronizar Firestore para ${id}:`, firestoreErr);
-    }
-
-    enviarNotificacion(solicitud.clienteId, {
-      title: 'Solicitud aceptada',
-      body: 'Un profesional ha aceptado tu solicitud',
-    }, { tipo: 'solicitud_aceptada', solicitudId: id }).catch((e) =>
-      console.error(`[acceptServiceRequest] Error al notificar al cliente de ${id}:`, e)
-    );
-
-    return res.json(solicitud);
-  } catch (err) {
-    if (err instanceof Error && err.message === 'NOT_FOUND') {
-      return res.status(404).json({ error: 'Solicitud no encontrada' });
-    }
-    if (err instanceof Error && err.message === 'YA_NO_DISPONIBLE') {
-      return res.status(409).json({ error: 'La solicitud ya no está disponible' });
-    }
-    throw err;
-  }
-}
+// acceptServiceRequest ("el primero que acepta gana") se retiró — ver
+// postulacion.controller.ts: selectPostulacion, que reutiliza el mismo
+// patrón de updateMany atómico pero disparado por la elección del
+// cliente entre varias candidaturas, no por el primer profesional que
+// pulsa un botón.
 
 const completeRequestSchema = z.object({
   precioFinal: z.number().positive(),

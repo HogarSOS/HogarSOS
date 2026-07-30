@@ -41,6 +41,17 @@ export async function createReview(req: Request, res: Response) {
     return res.status(409).json({ error: 'Solo se puede valorar un servicio ya completado' });
   }
 
+  // Defensa en profundidad: el bloqueo principal ya lo da el estado
+  // 'disputada' de arriba (createDispute lo pone así al abrir una
+  // reclamación), pero esto cubre el hueco si algún día esos dos
+  // campos llegaran a desincronizarse (p. ej. una resolución parcial).
+  const disputaAbierta = await prisma.dispute.findFirst({
+    where: { serviceRequestId, estado: 'abierta' },
+  });
+  if (disputaAbierta) {
+    return res.status(409).json({ error: 'Existe una reclamación abierta — no se puede valorar hasta que se resuelva' });
+  }
+
   let destinatarioId: string;
   if (solicitud.clienteId === autorId) {
     if (!solicitud.profesionalId) {
