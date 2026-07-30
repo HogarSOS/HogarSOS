@@ -79,6 +79,79 @@ router.get('/privacidad', (_req, res) => {
   );
 });
 
+/**
+ * Página de inicio pública en la raíz del dominio (hogarsos.es) — antes
+ * era el texto plano "hogarSOS API funcionando" (ver index.ts), nada
+ * presentable si alguien visita el dominio directamente. Sencilla a
+ * propósito: logo + qué es la app + enlaces legales, no una web de
+ * marketing elaborada. El icono SVG reproduce (simplificado) la misma
+ * geometría de HogarSosMark (lib/theme/brand_mark.dart): casa blanca +
+ * punto coral de acento sobre fondo con degradado de marca.
+ */
+export function paginaInicio(): string {
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>hogarSOS — Profesionales de confianza para tu hogar</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; color: #1a1a2e; }
+    .hero { text-align: center; padding: 64px 20px 48px; background: linear-gradient(160deg, #EEF0FD, #ffffff); }
+    .logo { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 28px; }
+    .logo span { font-size: 22px; font-weight: 800; }
+    .logo span b { color: #FF6A4D; }
+    h1 { font-size: 30px; max-width: 560px; margin: 0 auto 14px; line-height: 1.25; }
+    .hero p { font-size: 16px; color: #555; max-width: 460px; margin: 0 auto; line-height: 1.5; }
+    .features { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; max-width: 780px; margin: 48px auto; padding: 0 20px; }
+    .feature { flex: 1 1 200px; max-width: 230px; text-align: center; }
+    .feature h3 { font-size: 15px; margin: 0 0 6px; }
+    .feature p { font-size: 13.5px; color: #666; line-height: 1.5; margin: 0; }
+    footer { text-align: center; padding: 32px 20px 48px; font-size: 13px; color: #888; }
+    footer a { color: #3D4FE0; text-decoration: none; margin: 0 8px; }
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <div class="logo">
+      <svg viewBox="0 0 100 100" width="40" height="40" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#3D4FE0"/>
+            <stop offset="100%" stop-color="#2635A8"/>
+          </linearGradient>
+        </defs>
+        <rect width="100" height="100" rx="22" fill="url(#bg)"/>
+        <polygon points="50,20 80,52 20,52" fill="#fff"/>
+        <rect x="30" y="52" width="40" height="28" rx="6" fill="#fff"/>
+        <circle cx="74" cy="28" r="7" fill="#FF6A4D"/>
+      </svg>
+      <span>hogar<b>SOS</b></span>
+    </div>
+    <h1>Encuentra ayuda de confianza para tu hogar, cerca de ti</h1>
+    <p>hogarSOS conecta a personas que necesitan un servicio a domicilio con profesionales verificados de su zona — electricidad, fontanería, limpieza y mucho más.</p>
+  </div>
+  <div class="features">
+    <div class="feature">
+      <h3>Profesionales verificados</h3>
+      <p>Cada profesional pasa por un proceso de verificación de identidad antes de poder operar en la plataforma.</p>
+    </div>
+    <div class="feature">
+      <h3>Pago seguro</h3>
+      <p>El pago se autoriza al aceptar el trabajo y solo se cobra cuando el servicio queda completado.</p>
+    </div>
+    <div class="feature">
+      <h3>Cerca de ti</h3>
+      <p>Encuentra a alguien disponible cerca de tu ubicación, sin llamadas ni esperas.</p>
+    </div>
+  </div>
+  <footer>
+    hogarSOS · <a href="/privacidad">Política de privacidad</a> · <a href="/terminos">Términos de servicio</a>
+  </footer>
+</body>
+</html>`;
+}
+
 router.get('/terminos', (_req, res) => {
   res.send(
     pagina('Términos de servicio', [

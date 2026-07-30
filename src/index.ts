@@ -14,7 +14,7 @@ import adminRoutes from './routes/admin.routes';
 import categoryRoutes from './routes/category.routes';
 import reviewRoutes from './routes/review.routes';
 import uploadRoutes from './routes/upload.routes';
-import legalRoutes from './routes/legal.routes';
+import legalRoutes, { paginaInicio } from './routes/legal.routes';
 import { stripeWebhook } from './controllers/payment.controller';
 import { asyncHandler } from './utils/asyncHandler';
 
@@ -86,9 +86,10 @@ app.use(
   })
 );
 
-// Ruta principal
+// Ruta principal — página de inicio pública de hogarsos.es, no solo un
+// texto plano (ver paginaInicio en legal.routes.ts).
 app.get('/', (_req, res) => {
-  res.status(200).send('hogarSOS API funcionando');
+  res.status(200).send(paginaInicio());
 });
 
 // Health Check
