@@ -118,7 +118,15 @@ export async function getServiceRequestById(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({
     where: { id },
-    include: { categoria: true, payment: true, reviews: true },
+    include: {
+      categoria: true,
+      payment: true,
+      reviews: true,
+      // Nombre del profesional asignado — el chat de esta solicitud
+      // (ver ChatScreen en el frontend) no tenía forma de saber con
+      // quién estaba hablando el cliente sin esto.
+      profesional: { include: { user: { select: { nombre: true } } } },
+    },
   });
 
   if (!solicitud) {
@@ -137,6 +145,7 @@ export async function getServiceRequestById(req: Request, res: Response) {
     id: solicitud.id,
     categoria: solicitud.categoria.nombre,
     descripcion: solicitud.descripcion,
+    profesionalNombre: solicitud.profesional?.user.nombre ?? null,
     fotosUrls: solicitud.fotosUrls,
     direccionTexto: solicitud.direccionTexto,
     urgencia: solicitud.urgencia,
@@ -509,7 +518,12 @@ export async function listMyServiceRequests(req: Request, res: Response) {
 
   const solicitudes = await prisma.serviceRequest.findMany({
     where: { clienteId },
-    include: { categoria: true, payment: true, reviews: true },
+    include: {
+      categoria: true,
+      payment: true,
+      reviews: true,
+      profesional: { include: { user: { select: { nombre: true } } } },
+    },
     orderBy: { createdAt: 'desc' },
     take: 50,
   });
@@ -519,6 +533,7 @@ export async function listMyServiceRequests(req: Request, res: Response) {
       id: s.id,
       categoria: s.categoria.nombre,
       descripcion: s.descripcion,
+      profesionalNombre: s.profesional?.user.nombre ?? null,
       estado: s.estado,
       urgencia: s.urgencia,
       precioEstimado: s.precioEstimado ? Number(s.precioEstimado) : null,
