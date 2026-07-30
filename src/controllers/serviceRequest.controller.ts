@@ -209,12 +209,22 @@ export async function listNearbyRequests(req: Request, res: Response) {
   // user_id es `text` en la BD (sin @db.Uuid) — sin cast a ::uuid aquí,
   // igual que en professional.controller.ts (ver comentario allí).
   const solicitudes = await prisma.$queryRaw<
-    { id: string; descripcion: string; distancia_metros: number; created_at: Date; urgencia: string }[]
+    {
+      id: string;
+      descripcion: string;
+      distancia_metros: number;
+      created_at: Date;
+      urgencia: string;
+      cliente_nombre: string;
+      cliente_foto_url: string | null;
+    }[]
   >`
     SELECT sr.id, sr.descripcion, sr.created_at, sr.urgencia,
-           ST_Distance(sr.ubicacion, p.ubicacion_actual) AS distancia_metros
+           ST_Distance(sr.ubicacion, p.ubicacion_actual) AS distancia_metros,
+           u.nombre AS cliente_nombre, u.foto_perfil_url AS cliente_foto_url
     FROM service_requests sr
     JOIN professionals p ON p.user_id = ${profesionalId}
+    JOIN users u ON u.id = sr.cliente_id
     WHERE sr.estado = 'pendiente'
       AND sr.category_id = ANY(${categoriaIds})
       AND p.ubicacion_actual IS NOT NULL
@@ -298,6 +308,33 @@ export async function cancelServiceRequest(req: Request, res: Response) {
     }
     throw err;
   }
+}
+
+/**
+ * Borra definitivamente una solicitud del historial del cliente —
+ * distinto de cancelar (que solo cambia el estado). Solo se permite
+ * cuando ningún profesional llegó a aceptarla (profesionalId nulo) y
+ * sigue en "pendiente" o "cancelada": en ese caso nunca pudo haber
+ * pago retenido ni chat real, así que no hay nada que limpiar aparte
+ * ni ningún historial de la otra parte que se pierda al borrarla.
+ */
+export async function deleteServiceRequest(req: Request, res: Response) {
+  const { id } = req.params;
+  const clienteId = req.user!.userId;
+
+  const actual = await prisma.serviceRequest.findUnique({ where: { id } });
+  if (!actual) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (actual.clienteId !== clienteId) {
+    return res.status(403).json({ error: 'Solo el cliente que creó esta solicitud puede borrarla' });
+  }
+  if (actual.profesionalId !== null || !['pendiente', 'cancelada'].includes(actual.estado)) {
+    return res.status(409).json({ error: 'Solo se pueden borrar solicitudes que nadie llegó a aceptar' });
+  }
+
+  await prisma.serviceRequest.delete({ where: { id } });
+  return res.status(204).send();
 }
 
 /**
@@ -606,7 +643,7 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
     where: { profesionalId, estado: { in: ['aceptada', 'en_progreso', 'completada'] } },
     include: {
       categoria: true,
-      cliente: { select: { nombre: true, telefono: true } },
+      cliente: { select: { nombre: true, telefono: true, fotoPerfilUrl: true } },
       payment: true,
       reviews: true,
     },
@@ -623,6 +660,7 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
       direccionTexto: s.direccionTexto,
       clienteNombre: s.cliente.nombre,
       clienteTelefono: s.cliente.telefono,
+      clienteFotoUrl: s.cliente.fotoPerfilUrl,
       precioEstimado: s.precioEstimado ? Number(s.precioEstimado) : null,
       precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
       createdAt: s.createdAt,

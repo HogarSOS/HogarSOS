@@ -8,6 +8,7 @@ import {
   acceptServiceRequest,
   completeServiceRequest,
   cancelServiceRequest,
+  deleteServiceRequest,
   listMyServiceRequests,
   listMyAssignedRequests,
   syncChat,
@@ -28,6 +29,7 @@ router.get('/assigned/mine', authMiddleware(['profesional']), asyncHandler(listM
 router.patch('/:id/accept', authMiddleware(['profesional']), asyncHandler(acceptServiceRequest));
 router.patch('/:id/complete', authMiddleware(['profesional']), asyncHandler(completeServiceRequest));
 router.patch('/:id/cancel', authMiddleware(['cliente']), asyncHandler(cancelServiceRequest));
+router.delete('/:id', authMiddleware(['cliente']), asyncHandler(deleteServiceRequest));
 router.post('/:id/sync-chat', authMiddleware(), asyncHandler(syncChat));
 router.post('/:id/notify-chat', authMiddleware(), asyncHandler(notifyChatMessage));
 router.post('/:id/mark-chat-read', authMiddleware(), asyncHandler(markChatRead));
