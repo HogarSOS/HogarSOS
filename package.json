@@ -10,7 +10,8 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "lint": "eslint src --ext .ts",
-    "prisma:seed": "ts-node prisma/seed.ts"
+    "prisma:seed": "ts-node prisma/seed.ts",
+    "test": "jest"
   },
   "prisma": {
     "seed": "ts-node prisma/seed.ts"
@@ -31,11 +32,14 @@
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
+    "@types/jest": "^30.0.0",
     "@types/jsonwebtoken": "^9.0.6",
     "@types/multer": "^1.4.11",
     "@types/node": "^20.12.12",
     "eslint": "^8.57.0",
+    "jest": "^30.4.2",
     "prisma": "^5.22.0",
+    "ts-jest": "^29.4.12",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.4.5"
