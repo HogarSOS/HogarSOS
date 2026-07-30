@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
+import admin from 'firebase-admin';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { firestore } from '../config/firebase';
@@ -385,6 +386,42 @@ export async function notifyChatMessage(req: Request, res: Response) {
   ).catch((e) => console.error(`[notifyChatMessage] Error al notificar mensaje de chat en ${id}:`, e));
 
   return res.json({ notificado: true });
+}
+
+/**
+ * Marca el chat de esta solicitud como leído por quien llama (cliente o
+ * profesional). Escribe en el propio documento de la solicitud en
+ * Firestore (service_requests/{id}), no en el mensaje — el cliente
+ * Flutter no tiene permiso de ESCRITURA sobre ese documento (las reglas
+ * de Firestore desplegadas solo le dan `allow read`, ver
+ * backend_wizard/firestore.rules), así que esto tiene que pasar por el
+ * Admin SDK del backend. El frontend sí puede LEER ese mismo documento
+ * en tiempo real, así que estos campos sirven tanto para el indicador
+ * de "mensaje nuevo" en las listas de conversaciones como para el
+ * check de "leído" dentro del propio chat.
+ */
+export async function markChatRead(req: Request, res: Response) {
+  const { id } = req.params;
+  const userId = req.user!.userId;
+
+  const solicitud = await prisma.serviceRequest.findUnique({
+    where: { id },
+    select: { clienteId: true, profesionalId: true },
+  });
+  if (!solicitud) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (solicitud.clienteId !== userId && solicitud.profesionalId !== userId) {
+    return res.status(403).json({ error: 'No participas en esta solicitud' });
+  }
+
+  const campo = solicitud.clienteId === userId ? 'lastReadCliente' : 'lastReadProfesional';
+  await firestore
+    .collection('service_requests')
+    .doc(id)
+    .set({ [campo]: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+
+  return res.json({ ok: true });
 }
 
 export async function acceptServiceRequest(req: Request, res: Response) {

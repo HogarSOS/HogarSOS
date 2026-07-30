@@ -39,6 +39,7 @@ const CATEGORIAS = [
   'Piscinas',
   'Control de plagas',
   'Veterinaria a domicilio',
+  'Técnico de telefonía',
 ];
 
 async function main() {
