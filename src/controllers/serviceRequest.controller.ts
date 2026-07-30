@@ -8,7 +8,7 @@ import { releasePayment, refundPayment } from '../services/payment.service';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
 import { enviarNotificacion, enviarNotificacionMasiva } from '../services/notification.service';
 
-const RADIO_BUSQUEDA_METROS = 15000; // 15 km, ajustable por categoría en el futuro
+const RADIO_BUSQUEDA_METROS = 50000; // 50 km, ajustable por categoría en el futuro
 
 const createRequestSchema = z.object({
   categoryId: z.number().int(),
