@@ -4,7 +4,7 @@ import admin from 'firebase-admin';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { firestore } from '../config/firebase';
-import { releasePayment } from '../services/payment.service';
+import { releasePayment, refundPayment } from '../services/payment.service';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
 import { enviarNotificacion, enviarNotificacionMasiva } from '../services/notification.service';
 
@@ -227,19 +227,26 @@ export async function listNearbyRequests(req: Request, res: Response) {
 }
 
 /**
- * Cancela una solicitud — solo el cliente que la creó, y solo mientras
- * siga "pendiente" (ningún profesional la ha aceptado todavía). En
- * cuanto pasa a "cancelada" deja automáticamente de aparecer en
- * listNearbyRequests (que ya filtra por estado = 'pendiente'), así que
- * no hace falta ninguna limpieza aparte para que desaparezca de la
- * vista de los profesionales. Tampoco hay chat que limpiar: la
- * sincronización a Firestore solo ocurre al aceptar (ver
- * acceptServiceRequest), y una solicitud pendiente nunca llegó a eso.
+ * Cancela una solicitud — solo el cliente que la creó, mientras siga
+ * "pendiente" O "aceptada" (una vez "en_progreso"/completada ya no se
+ * puede echar atrás). Se permite cancelar ya aceptada a propósito: el
+ * profesional puede aceptar y mandar como primer mensaje del chat
+ * cuándo puede ir (ver home_profesional_screen.dart) — si esa
+ * disponibilidad no le sirve al cliente, necesita una forma real de
+ * decir que no en vez de quedarse con un profesional asignado que no
+ * puede venir cuando hace falta.
  *
- * Misma protección de condición de carrera que aceptar: si un
- * profesional la acepta justo en el instante en que el cliente
- * cancela, gana quien complete la transacción primero — el otro
- * recibe un 409 claro en vez de un estado inconsistente.
+ * Al cancelar una que ya estaba "aceptada" deja de aparecer como
+ * trabajo asignado para ese profesional (listMyAssignedRequests filtra
+ * por estado), así que no hace falta limpieza aparte tampoco ahí — pero
+ * si el cliente ya había autorizado el pago (createEscrowPaymentIntent,
+ * posterior a aceptar) hay que liberar esa retención en Stripe, o el
+ * dinero se queda inmovilizado sin que nadie lo reciba nunca.
+ *
+ * Misma protección de condición de carrera que aceptar: la comprobación
+ * de estado va dentro del propio UPDATE — si el profesional completa el
+ * servicio justo en el instante en que el cliente cancela, gana quien
+ * complete la transacción primero.
  */
 export async function cancelServiceRequest(req: Request, res: Response) {
   const { id } = req.params;
@@ -250,16 +257,33 @@ export async function cancelServiceRequest(req: Request, res: Response) {
     if (!actual) throw new Error('NOT_FOUND');
     if (actual.clienteId !== clienteId) throw new Error('NO_AUTORIZADO');
 
-    // La condición `estado: 'pendiente'` va en el propio UPDATE (igual
-    // que en acceptServiceRequest) para que la comprobación y la
-    // escritura sean una sola operación atómica — si un profesional
-    // acepta justo en este instante, esta llamada afecta 0 filas en vez
-    // de cancelar una solicitud que ya tiene profesional asignado.
     const { count } = await prisma.serviceRequest.updateMany({
-      where: { id, clienteId, estado: 'pendiente' },
+      where: { id, clienteId, estado: { in: ['pendiente', 'aceptada'] } },
       data: { estado: 'cancelada' },
     });
     if (count === 0) throw new Error('YA_NO_CANCELABLE');
+
+    // En su propio try/catch, igual que la sincronización de Firestore
+    // al aceptar: cancelar ya quedó confirmado en Postgres arriba, un
+    // fallo aquí (o que directamente no hubiera pago que reembolsar
+    // porque se canceló mientras seguía "pendiente") no debe convertir
+    // una cancelación válida en un error para el cliente.
+    try {
+      await refundPayment(id);
+    } catch (e) {
+      if (e instanceof Error && e.message !== 'PAGO_NO_ENCONTRADO') {
+        console.error(`[cancelServiceRequest] Error al reembolsar el pago de ${id}:`, e);
+      }
+    }
+
+    if (actual.profesionalId) {
+      enviarNotificacion(actual.profesionalId, {
+        title: 'Solicitud cancelada',
+        body: 'El cliente ha cancelado un trabajo que tenías asignado',
+      }, { tipo: 'solicitud_cancelada', solicitudId: id }).catch((e) =>
+        console.error(`[cancelServiceRequest] Error al notificar al profesional de ${id}:`, e)
+      );
+    }
 
     return res.json({ id, estado: 'cancelada' });
   } catch (err) {
@@ -270,7 +294,7 @@ export async function cancelServiceRequest(req: Request, res: Response) {
       return res.status(403).json({ error: 'Solo el cliente que creó esta solicitud puede cancelarla' });
     }
     if (err instanceof Error && err.message === 'YA_NO_CANCELABLE') {
-      return res.status(409).json({ error: 'Esta solicitud ya no se puede cancelar — un profesional ya la aceptó o ya se resolvió' });
+      return res.status(409).json({ error: 'Esta solicitud ya no se puede cancelar — el profesional ya empezó o ya se resolvió' });
     }
     throw err;
   }
