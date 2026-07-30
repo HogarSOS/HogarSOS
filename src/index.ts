@@ -14,6 +14,7 @@ import adminRoutes from './routes/admin.routes';
 import categoryRoutes from './routes/category.routes';
 import reviewRoutes from './routes/review.routes';
 import uploadRoutes from './routes/upload.routes';
+import legalRoutes from './routes/legal.routes';
 import { stripeWebhook } from './controllers/payment.controller';
 import { asyncHandler } from './utils/asyncHandler';
 
@@ -102,6 +103,11 @@ app.get('/health', (_req, res) => {
 // Fotos subidas por los clientes (ver upload.controller.ts) — servidas
 // como archivos estáticos directamente.
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+
+// Páginas legales públicas — en la raíz (no bajo /api) para que la URL
+// final sea hogarsos.es/privacidad, la que se pone en las fichas de
+// Google Play / App Store, no algo bajo la ruta de la API.
+app.use('/', legalRoutes);
 
 // API
 app.use('/api/auth', authRoutes);
