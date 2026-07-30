@@ -328,6 +328,65 @@ export async function syncChat(req: Request, res: Response) {
   return res.json({ sincronizado: true });
 }
 
+const chatNotifySchema = z.object({
+  texto: z.string().min(1),
+});
+
+/**
+ * El chat en sí vive 100% en Firestore, sin pasar por este backend (ver
+ * chat_service.dart) — así que un mensaje nuevo nunca generaba
+ * notificación push, aunque el resto del pipeline de FCM funcionara
+ * bien: el backend simplemente no se enteraba de que se había enviado.
+ * El frontend llama a este endpoint justo después de escribir el
+ * mensaje en Firestore (fire-and-forget, no bloquea el envío) para que
+ * el backend dispare el push al otro participante de la solicitud.
+ */
+export async function notifyChatMessage(req: Request, res: Response) {
+  const { id } = req.params;
+  const userId = req.user!.userId;
+
+  const parsed = chatNotifySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Falta el texto del mensaje' });
+  }
+
+  const solicitud = await prisma.serviceRequest.findUnique({
+    where: { id },
+    select: {
+      clienteId: true,
+      profesionalId: true,
+      cliente: { select: { nombre: true } },
+      profesional: { select: { user: { select: { nombre: true } } } },
+    },
+  });
+  if (!solicitud) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (solicitud.clienteId !== userId && solicitud.profesionalId !== userId) {
+    return res.status(403).json({ error: 'No participas en esta solicitud' });
+  }
+
+  const esCliente = solicitud.clienteId === userId;
+  const destinatarioId = esCliente ? solicitud.profesionalId : solicitud.clienteId;
+  if (!destinatarioId) {
+    // Solicitud sin profesional asignado todavía — no hay a quién avisar.
+    return res.json({ notificado: false });
+  }
+
+  const remitenteNombre = (esCliente ? solicitud.cliente.nombre : solicitud.profesional?.user.nombre) ?? 'Alguien';
+  // El título de la notificación es el nombre de quien escribe (no
+  // "Nuevo mensaje" genérico) para que se vea igual que cualquier app de
+  // mensajería normal — el cuerpo es el mensaje en sí, recortado por si
+  // alguien manda un texto larguísimo.
+  enviarNotificacion(
+    destinatarioId,
+    { title: remitenteNombre, body: parsed.data.texto.slice(0, 150) },
+    { tipo: 'chat_mensaje', solicitudId: id }
+  ).catch((e) => console.error(`[notifyChatMessage] Error al notificar mensaje de chat en ${id}:`, e));
+
+  return res.json({ notificado: true });
+}
+
 export async function acceptServiceRequest(req: Request, res: Response) {
   const { id } = req.params;
   const profesionalId = req.user!.userId;

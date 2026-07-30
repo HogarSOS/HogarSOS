@@ -11,6 +11,7 @@ import {
   listMyServiceRequests,
   listMyAssignedRequests,
   syncChat,
+  notifyChatMessage,
 } from '../controllers/serviceRequest.controller';
 
 const router = Router();
@@ -27,5 +28,6 @@ router.patch('/:id/accept', authMiddleware(['profesional']), asyncHandler(accept
 router.patch('/:id/complete', authMiddleware(['profesional']), asyncHandler(completeServiceRequest));
 router.patch('/:id/cancel', authMiddleware(['cliente']), asyncHandler(cancelServiceRequest));
 router.post('/:id/sync-chat', authMiddleware(), asyncHandler(syncChat));
+router.post('/:id/notify-chat', authMiddleware(), asyncHandler(notifyChatMessage));
 
 export default router;
