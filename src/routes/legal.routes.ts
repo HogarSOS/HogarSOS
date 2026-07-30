@@ -127,7 +127,11 @@ export function paginaInicio(): string {
     'hogarSOS conecta a personas que necesitan un servicio a domicilio con profesionales verificados de su zona — electricidad, fontanería, limpieza y mucho más.',
     '/'
   )}
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,500,1,0" rel="stylesheet">
   <style>
+    .material-symbols-outlined { font-family: 'Material Symbols Outlined'; font-size: 26px; line-height: 1; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; color: #1a1a2e; }
     .hero { text-align: center; padding: 64px 20px 48px; background: linear-gradient(160deg, #EEF0FD, #ffffff); }
     .logo { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 28px; }
@@ -139,6 +143,13 @@ export function paginaInicio(): string {
     .feature { flex: 1 1 200px; max-width: 230px; text-align: center; }
     .feature h3 { font-size: 15px; margin: 0 0 6px; }
     .feature p { font-size: 13.5px; color: #666; line-height: 1.5; margin: 0; }
+    .categorias { padding: 8px 20px 48px; }
+    .categorias h2 { text-align: center; font-size: 22px; margin: 0 0 8px; }
+    .categorias > p { text-align: center; font-size: 14px; color: #777; margin: 0 0 32px; }
+    .categoria-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 20px; max-width: 780px; margin: 0 auto; }
+    .categoria-item { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; }
+    .categoria-icon { width: 56px; height: 56px; border-radius: 16px; display: flex; align-items: center; justify-content: center; }
+    .categoria-item span.label { font-size: 12.5px; font-weight: 600; color: #333; }
     .como-funciona { background: #F7F8FD; padding: 48px 20px; }
     .como-funciona h2 { text-align: center; font-size: 22px; margin: 0 0 36px; }
     .pasos { display: flex; flex-wrap: wrap; justify-content: center; gap: 28px; max-width: 820px; margin: 0 auto; }
@@ -184,6 +195,33 @@ export function paginaInicio(): string {
     <div class="feature">
       <h3>Cerca de ti</h3>
       <p>Encuentra a alguien disponible cerca de tu ubicación, sin llamadas ni esperas.</p>
+    </div>
+  </div>
+  <div class="categorias">
+    <h2>Todo lo que puedes pedir</h2>
+    <p>Y muchos oficios más, disponibles desde la app.</p>
+    <div class="categoria-grid">
+      ${[
+        ['bolt', '#F5A623', 'Electricista'],
+        ['plumbing', '#2E90FA', 'Fontanero'],
+        ['format_paint', '#7A5AF8', 'Pintor'],
+        ['key', '#4C5FD5', 'Cerrajería'],
+        ['ac_unit', '#39C0F2', 'Aire acondicionado'],
+        ['auto_awesome', '#12B3A8', 'Limpieza'],
+        ['handyman', '#F76B1C', 'Manitas'],
+        ['foundation', '#64748B', 'Albañilería'],
+        ['grass', '#3FB950', 'Jardinería'],
+      ]
+        .map(
+          ([icono, color, nombre]) => `
+      <div class="categoria-item">
+        <div class="categoria-icon" style="background:${color}22">
+          <span class="material-symbols-outlined" style="color:${color}">${icono}</span>
+        </div>
+        <span class="label">${nombre}</span>
+      </div>`
+        )
+        .join('')}
     </div>
   </div>
   <div class="como-funciona">
