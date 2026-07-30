@@ -266,6 +266,59 @@ export async function cancelServiceRequest(req: Request, res: Response) {
   }
 }
 
+/**
+ * Escribe (o reescribe) en Firestore los UIDs de Firebase del cliente y
+ * el profesional de una solicitud — es lo que firestore.rules necesita
+ * para autorizar el chat de esa solicitud concreta. Idempotente: se
+ * puede llamar tantas veces como haga falta sin efectos secundarios,
+ * a propósito, para poder reintentarla desde `syncChat` si el intento
+ * original (dentro de acceptServiceRequest) falló en su momento.
+ */
+async function sincronizarChatFirestore(id: string, clienteId: string, profesionalId: string) {
+  const [cliente, profesional] = await Promise.all([
+    prisma.user.findUnique({ where: { id: clienteId } }),
+    prisma.user.findUnique({ where: { id: profesionalId } }),
+  ]);
+
+  await firestore.collection('service_requests').doc(id).set(
+    {
+      clienteFirebaseUid: cliente?.firebaseUid ?? null,
+      profesionalFirebaseUid: profesional?.firebaseUid ?? null,
+    },
+    { merge: true }
+  );
+}
+
+/**
+ * Re-sincroniza el chat de una solicitud ya aceptada. Existe porque la
+ * sincronización automática al aceptar (dentro de acceptServiceRequest)
+ * puede fallar en silencio (ver el try/catch de ahí) — sin este
+ * endpoint, una solicitud que cayó en ese caso se quedaba con el chat
+ * roto para siempre, sin ninguna forma de recuperarlo salvo tocar la
+ * base de datos a mano. El frontend lo llama cada vez que se abre una
+ * pantalla de chat, antes de suscribirse a los mensajes — si ya estaba
+ * sincronizado, esto no cambia nada (mismo resultado, misma escritura).
+ */
+export async function syncChat(req: Request, res: Response) {
+  const { id } = req.params;
+  const userId = req.user!.userId;
+
+  const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
+  if (!solicitud) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (solicitud.clienteId !== userId && solicitud.profesionalId !== userId) {
+    return res.status(403).json({ error: 'No participas en esta solicitud' });
+  }
+  if (!solicitud.profesionalId) {
+    return res.status(409).json({ error: 'Esta solicitud todavía no tiene profesional asignado' });
+  }
+
+  await sincronizarChatFirestore(id, solicitud.clienteId, solicitud.profesionalId);
+
+  return res.json({ sincronizado: true });
+}
+
 export async function acceptServiceRequest(req: Request, res: Response) {
   const { id } = req.params;
   const profesionalId = req.user!.userId;
@@ -305,28 +358,17 @@ export async function acceptServiceRequest(req: Request, res: Response) {
 
     const solicitud = await prisma.serviceRequest.findUniqueOrThrow({ where: { id } });
 
-    // Sincroniza a Firestore los UIDs de Firebase de ambas partes, para
-    // que firestore.rules pueda restringir el chat de esta solicitud
-    // solo al cliente y al profesional asignado (ver backend/firestore.rules).
-    //
-    // Aparte, en su propio try/catch a propósito: aceptar la solicitud ya
-    // quedó confirmado en Postgres arriba — si esto falla (p. ej. la API
-    // de Firestore deshabilitada en el proyecto), no debe convertir un
-    // "aceptado con éxito" en un 500 para el profesional. El chat de esa
-    // solicitud puede quedar sin sincronizar, pero la aceptación es real.
+    // En su propio try/catch a propósito: aceptar la solicitud ya quedó
+    // confirmado en Postgres arriba — si la sincronización a Firestore
+    // falla (credenciales de Firebase Admin mal configuradas, API de
+    // Firestore deshabilitada...), no debe convertir un "aceptado con
+    // éxito" en un 500 para el profesional. El chat de esa solicitud
+    // puede quedar sin sincronizar — para eso existe syncChatFirestore,
+    // que el frontend reintenta cada vez que se abre el chat (ver
+    // syncChat más abajo), así un fallo puntual aquí no dependa de que
+    // alguien reintente el aceptar entero a mano.
     try {
-      const [cliente, profesional] = await Promise.all([
-        prisma.user.findUnique({ where: { id: solicitud.clienteId } }),
-        prisma.user.findUnique({ where: { id: profesionalId } }),
-      ]);
-
-      await firestore.collection('service_requests').doc(id).set(
-        {
-          clienteFirebaseUid: cliente?.firebaseUid ?? null,
-          profesionalFirebaseUid: profesional?.firebaseUid ?? null,
-        },
-        { merge: true }
-      );
+      await sincronizarChatFirestore(id, solicitud.clienteId, profesionalId);
     } catch (firestoreErr) {
       console.error(`[acceptServiceRequest] Fallo al sincronizar Firestore para ${id}:`, firestoreErr);
     }
