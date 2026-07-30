@@ -579,6 +579,10 @@ export async function completeServiceRequest(req: Request, res: Response) {
     // gestiona/reintenta aparte para no bloquear al profesional por un
     // fallo puntual de Stripe. Un admin puede revisar pagos en estado
     // "retenido" con solicitud "completada" como cola de reintento.
+    // Loguear el error real es justo lo que faltaba en el bug del
+    // Sprint 3 (el catch lo silenciaba del todo, sin ninguna pista de
+    // qué había fallado en Stripe hasta que se investigó a mano).
+    console.error(`[completeServiceRequest] Error al liberar el pago de ${id}:`, err);
     return res.status(202).json({
       solicitudId: id,
       estado: 'completada',

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      # Solo genera el cliente a partir del schema — no necesita una
+      # base de datos real conectada, así que no hace falta ningún
+      # secreto de CI para este paso ni para lint/build/test de abajo
+      # (Stripe/Firebase/Prisma van simulados en los tests).
+      - run: npx prisma generate
+
+      - run: npm run lint
+
+      - run: npm run build
+
+      - run: npm test

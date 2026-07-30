@@ -8,6 +8,10 @@ interface JwtPayload {
 }
 
 declare global {
+  // Namespace obligatorio aquí: es la única forma que ofrece TypeScript
+  // de aumentar los tipos ambient de un módulo de terceros (Express) —
+  // no hay equivalente en sintaxis de módulos ES2015 para esto.
+  // eslint-disable-next-line @typescript-eslint/no-namespace
   namespace Express {
     interface Request {
       user?: JwtPayload;

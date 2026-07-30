@@ -65,8 +65,11 @@ function credencialFirebase(): admin.ServiceAccount {
     };
   }
 
-  // Desarrollo local: cae al JSON local si no hay ninguna env var.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  // Desarrollo local: cae al JSON local si no hay ninguna env var. Tiene
+  // que ser require() dinámico (no un import estático) porque este
+  // archivo no existe en producción — un import de nivel de módulo
+  // rompería el build ahí aunque esta rama nunca se ejecute.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   return require('../../firebase-key.json') as admin.ServiceAccount;
 }
 
