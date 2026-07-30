@@ -11,7 +11,37 @@ import { Router } from 'express';
  */
 const router = Router();
 
-function pagina(titulo: string, secciones: { titulo: string; texto: string }[]): string {
+const SITIO_URL = 'https://hogarsos.es';
+
+/**
+ * <head> compartido entre todas las páginas públicas: favicon, meta
+ * descripción (SEO) y Open Graph/Twitter Card (para que compartir el
+ * enlace en WhatsApp, Twitter, etc. muestre una tarjeta con imagen en
+ * vez de un enlace pelado). og-image.png y favicon.png son el mismo
+ * icono de marca ya generado para iOS (ver frontend_wizard/ios/.../
+ * AppIcon.appiconset), copiado a public/ — una sola fuente de verdad
+ * para el icono, sin generar uno nuevo aparte.
+ */
+function cabeza(titulo: string, descripcion: string, ruta: string): string {
+  return `
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${titulo}</title>
+  <meta name="description" content="${descripcion}">
+  <link rel="icon" type="image/png" href="/public/favicon.png">
+  <link rel="apple-touch-icon" href="/public/favicon.png">
+  <meta property="og:title" content="${titulo}">
+  <meta property="og:description" content="${descripcion}">
+  <meta property="og:image" content="${SITIO_URL}/public/og-image.png">
+  <meta property="og:url" content="${SITIO_URL}${ruta}">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="${titulo}">
+  <meta name="twitter:description" content="${descripcion}">
+  <meta name="twitter:image" content="${SITIO_URL}/public/og-image.png">`;
+}
+
+function pagina(titulo: string, secciones: { titulo: string; texto: string }[], ruta: string): string {
   const cuerpo = secciones
     .map(
       (s) => `
@@ -25,9 +55,7 @@ function pagina(titulo: string, secciones: { titulo: string; texto: string }[]):
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${titulo} — hogarSOS</title>
+  ${cabeza(`${titulo} — hogarSOS`, `${titulo} de hogarSOS, la app que conecta clientes con profesionales de servicios a domicilio.`, ruta)}
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; color: #1a1a2e; line-height: 1.6; }
     h1 { color: #3D4FE0; font-size: 26px; }
@@ -35,9 +63,11 @@ function pagina(titulo: string, secciones: { titulo: string; texto: string }[]):
     p { font-size: 15px; color: #333; }
     a { color: #3D4FE0; }
     header { border-bottom: 1px solid #e5e5f0; padding-bottom: 16px; margin-bottom: 24px; }
+    .volver { display: inline-block; margin-bottom: 20px; font-size: 14px; text-decoration: none; }
   </style>
 </head>
 <body>
+  <a class="volver" href="/">← Volver al inicio</a>
   <header><h1>${titulo}</h1></header>
   ${cuerpo}
 </body>
@@ -75,7 +105,7 @@ router.get('/privacidad', (_req, res) => {
         titulo: '7. Cambios en esta política',
         texto: 'Si actualizamos esta política de forma relevante, te lo notificaremos dentro de la app antes de que entre en vigor.',
       },
-    ])
+    ], '/privacidad')
   );
 });
 
@@ -92,9 +122,11 @@ export function paginaInicio(): string {
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hogarSOS — Profesionales de confianza para tu hogar</title>
+  ${cabeza(
+    'hogarSOS — Profesionales de confianza para tu hogar',
+    'hogarSOS conecta a personas que necesitan un servicio a domicilio con profesionales verificados de su zona — electricidad, fontanería, limpieza y mucho más.',
+    '/'
+  )}
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; color: #1a1a2e; }
     .hero { text-align: center; padding: 64px 20px 48px; background: linear-gradient(160deg, #EEF0FD, #ffffff); }
@@ -107,7 +139,16 @@ export function paginaInicio(): string {
     .feature { flex: 1 1 200px; max-width: 230px; text-align: center; }
     .feature h3 { font-size: 15px; margin: 0 0 6px; }
     .feature p { font-size: 13.5px; color: #666; line-height: 1.5; margin: 0; }
-    footer { text-align: center; padding: 32px 20px 48px; font-size: 13px; color: #888; }
+    .como-funciona { background: #F7F8FD; padding: 48px 20px; }
+    .como-funciona h2 { text-align: center; font-size: 22px; margin: 0 0 36px; }
+    .pasos { display: flex; flex-wrap: wrap; justify-content: center; gap: 28px; max-width: 820px; margin: 0 auto; }
+    .paso { flex: 1 1 220px; max-width: 250px; text-align: center; }
+    .paso .num { width: 32px; height: 32px; line-height: 32px; border-radius: 50%; background: #3D4FE0; color: #fff; font-weight: 700; font-size: 14px; margin: 0 auto 12px; }
+    .paso h3 { font-size: 14.5px; margin: 0 0 6px; }
+    .paso p { font-size: 13px; color: #666; line-height: 1.5; margin: 0; }
+    .beta { text-align: center; padding: 40px 20px; }
+    .beta p { font-size: 13.5px; color: #888; max-width: 420px; margin: 0 auto; }
+    footer { text-align: center; padding: 16px 20px 48px; font-size: 13px; color: #888; }
     footer a { color: #3D4FE0; text-decoration: none; margin: 0 8px; }
   </style>
 </head>
@@ -144,6 +185,29 @@ export function paginaInicio(): string {
       <h3>Cerca de ti</h3>
       <p>Encuentra a alguien disponible cerca de tu ubicación, sin llamadas ni esperas.</p>
     </div>
+  </div>
+  <div class="como-funciona">
+    <h2>Cómo funciona</h2>
+    <div class="pasos">
+      <div class="paso">
+        <div class="num">1</div>
+        <h3>Cuenta qué necesitas</h3>
+        <p>Describe el problema y tu ubicación en menos de un minuto.</p>
+      </div>
+      <div class="paso">
+        <div class="num">2</div>
+        <h3>Un profesional lo acepta</h3>
+        <p>Un profesional verificado cerca de ti acepta el trabajo y os ponéis en contacto por chat.</p>
+      </div>
+      <div class="paso">
+        <div class="num">3</div>
+        <h3>Paga solo al terminar</h3>
+        <p>El pago se autoriza al aceptar, pero no se cobra hasta que el servicio queda completado.</p>
+      </div>
+    </div>
+  </div>
+  <div class="beta">
+    <p>hogarSOS está actualmente en fase beta. Si quieres ser de los primeros en probarlo, escríbenos.</p>
   </div>
   <footer>
     hogarSOS · <a href="/privacidad">Política de privacidad</a> · <a href="/terminos">Términos de servicio</a>
@@ -191,7 +255,22 @@ router.get('/terminos', (_req, res) => {
         titulo: '9. Ley aplicable',
         texto: 'Estos términos se rigen por la legislación española.',
       },
-    ])
+    ], '/terminos')
+  );
+});
+
+router.get('/robots.txt', (_req, res) => {
+  res.type('text/plain').send(`User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${SITIO_URL}/sitemap.xml`);
+});
+
+router.get('/sitemap.xml', (_req, res) => {
+  res.type('application/xml').send(
+    `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>${SITIO_URL}/</loc></url>
+  <url><loc>${SITIO_URL}/privacidad</loc></url>
+  <url><loc>${SITIO_URL}/terminos</loc></url>
+</urlset>`
   );
 });
 

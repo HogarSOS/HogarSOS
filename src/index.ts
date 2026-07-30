@@ -105,6 +105,12 @@ app.get('/health', (_req, res) => {
 // como archivos estáticos directamente.
 app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
+// Favicon + imagen de vista previa (og-image) de la página web pública
+// — mismo patrón que /uploads: process.cwd() y no __dirname, porque
+// tsc no copia public/ a dist/ y en producción el proceso arranca
+// desde la raíz del repo.
+app.use('/public', express.static(path.join(process.cwd(), 'public')));
+
 // Páginas legales públicas — en la raíz (no bajo /api) para que la URL
 // final sea hogarsos.es/privacidad, la que se pone en las fichas de
 // Google Play / App Store, no algo bajo la ruta de la API.
