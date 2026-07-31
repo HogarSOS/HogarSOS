@@ -126,7 +126,7 @@ export async function listPostulaciones(req: Request, res: Response) {
     }[]
   >`
     SELECT po.id, po.profesional_id, u.nombre, u.foto_perfil_url,
-           u.valoracion_media, u.total_valoraciones, po.mensaje, po.created_at,
+           u.valoracion_media::double precision AS valoracion_media, u.total_valoraciones, po.mensaje, po.created_at,
            p.estado_verificacion,
            CASE WHEN p.ubicacion_actual IS NOT NULL
                 THEN ST_Distance(sr.ubicacion, p.ubicacion_actual)
