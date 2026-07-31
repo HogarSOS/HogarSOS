@@ -9,6 +9,7 @@ import {
   responderCierreHoras,
   cancelServiceRequest,
   deleteServiceRequest,
+  archiveServiceRequest,
   listMyServiceRequests,
   listMyAssignedRequests,
   syncChat,
@@ -34,6 +35,7 @@ router.patch('/:id/complete', authMiddleware(['profesional']), asyncHandler(comp
 router.post('/:id/cierre-horas/:cierreId/responder', authMiddleware(['cliente']), asyncHandler(responderCierreHoras));
 router.patch('/:id/cancel', authMiddleware(['cliente']), asyncHandler(cancelServiceRequest));
 router.delete('/:id', authMiddleware(['cliente']), asyncHandler(deleteServiceRequest));
+router.patch('/:id/archive', authMiddleware(['cliente', 'profesional']), asyncHandler(archiveServiceRequest));
 router.post('/:id/sync-chat', authMiddleware(), asyncHandler(syncChat));
 router.post('/:id/notify-chat', authMiddleware(), asyncHandler(notifyChatMessage));
 router.post('/:id/mark-chat-read', authMiddleware(), asyncHandler(markChatRead));

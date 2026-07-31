@@ -99,6 +99,11 @@ model ServiceRequest {
   createdAt      DateTime                 @default(now()) @map("created_at")
   aceptadaAt     DateTime?                @map("aceptada_at")
   completadaAt   DateTime?                @map("completada_at")
+  // Ocultar de la lista de cada parte sin borrar nada (pagos/chat/
+  // reviews se conservan) — independientes porque cliente y profesional
+  // pueden querer "limpiar" su propia lista en momentos distintos.
+  archivadoCliente     Boolean            @default(false) @map("archivado_cliente")
+  archivadoProfesional Boolean            @default(false) @map("archivado_profesional")
   disputes       Dispute[]
   pagos          Payment[]
   reviews        Review[]

@@ -462,6 +462,39 @@ export async function deleteServiceRequest(req: Request, res: Response) {
 }
 
 /**
+ * Quita una solicitud terminada de la lista de quien la pide, sin
+ * borrar nada — a diferencia de deleteServiceRequest (arriba), que solo
+ * vale para solicitudes que nadie llegó a aceptar. Aquí sí hubo
+ * profesional de por medio (pago, chat, valoraciones posibles), así que
+ * en vez de borrar se marca "archivado" para esa parte y listMy* la
+ * deja de devolver — el historial sigue intacto en la base de datos por
+ * si hace falta consultarlo (disputas, contabilidad), la otra parte
+ * sigue viéndola en su propia lista hasta que también la archive.
+ */
+export async function archiveServiceRequest(req: Request, res: Response) {
+  const { id } = req.params;
+  const userId = req.user!.userId;
+
+  const actual = await prisma.serviceRequest.findUnique({ where: { id } });
+  if (!actual) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (!['completada', 'cancelada'].includes(actual.estado)) {
+    return res.status(409).json({ error: 'Solo se pueden archivar solicitudes completadas o canceladas' });
+  }
+
+  if (actual.clienteId === userId) {
+    await prisma.serviceRequest.update({ where: { id }, data: { archivadoCliente: true } });
+    return res.status(204).send();
+  }
+  if (actual.profesionalId === userId) {
+    await prisma.serviceRequest.update({ where: { id }, data: { archivadoProfesional: true } });
+    return res.status(204).send();
+  }
+  return res.status(403).json({ error: 'No participas en esta solicitud' });
+}
+
+/**
  * Escribe (o reescribe) en Firestore los UIDs de Firebase del cliente y
  * el profesional de una solicitud — es lo que firestore.rules necesita
  * para autorizar el chat de esa solicitud concreta. Idempotente: se
@@ -842,7 +875,7 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
   const profesionalId = req.user!.userId;
 
   const solicitudes = await prisma.serviceRequest.findMany({
-    where: { profesionalId, estado: { in: ['aceptada', 'en_progreso', 'completada'] } },
+    where: { profesionalId, estado: { in: ['aceptada', 'en_progreso', 'completada'] }, archivadoProfesional: false },
     include: {
       categoria: true,
       cliente: { select: { nombre: true, telefono: true, fotoPerfilUrl: true } },
@@ -894,7 +927,7 @@ export async function listMyServiceRequests(req: Request, res: Response) {
   const clienteId = req.user!.userId;
 
   const solicitudes = await prisma.serviceRequest.findMany({
-    where: { clienteId },
+    where: { clienteId, archivadoCliente: false },
     include: {
       categoria: true,
       pagos: true,
