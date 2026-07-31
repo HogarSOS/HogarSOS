@@ -4,7 +4,7 @@ import admin from 'firebase-admin';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { firestore } from '../config/firebase';
-import { releasePayment, refundPayment } from '../services/payment.service';
+import { releasePayments, refundPayment } from '../services/payment.service';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
 import { enviarNotificacion, enviarNotificacionMasiva } from '../services/notification.service';
 
@@ -38,6 +38,90 @@ function serializarPresupuesto(p: {
     estado: p.estado,
     createdAt: p.createdAt,
   };
+}
+
+/** Misma idea que serializarPresupuesto, para la última Ampliacion de un presupuesto (cualquier estado). */
+function serializarAmpliacion(a: {
+  id: string;
+  horasAdicionales: Prisma.Decimal;
+  mensaje: string | null;
+  estado: string;
+  createdAt: Date;
+} | undefined) {
+  if (!a) return null;
+  return {
+    id: a.id,
+    horasAdicionales: Number(a.horasAdicionales),
+    mensaje: a.mensaje,
+    estado: a.estado,
+    createdAt: a.createdAt,
+  };
+}
+
+/** Misma idea, para el último CierreHoras de una solicitud (cualquier estado). */
+function serializarCierreHoras(c: {
+  id: string;
+  horasReales: Prisma.Decimal;
+  estado: string;
+  createdAt: Date;
+} | undefined) {
+  if (!c) return null;
+  return { id: c.id, horasReales: Number(c.horasReales), estado: c.estado, createdAt: c.createdAt };
+}
+
+/**
+ * `Payment` ya no es 1:1 con la solicitud (puede haber una autorización
+ * inicial + una por cada ampliación aceptada) — esto reduce todas las
+ * filas a un único resumen para que el frontend siga viendo un solo
+ * "estado de pago", sin tener que enterarse de cuántas autorizaciones
+ * hay por debajo. `estado`: "retenido" si queda alguna sin capturar,
+ * si no "liberado" si se liberó alguna, si no el resto de casos.
+ */
+export function agregarPagos(
+  pagos: { estado: string; montoTotal: Prisma.Decimal; comisionPlataforma: Prisma.Decimal; montoProfesional: Prisma.Decimal }[]
+) {
+  if (pagos.length === 0) return null;
+
+  const estado = pagos.some((p) => p.estado === 'retenido')
+    ? 'retenido'
+    : pagos.some((p) => p.estado === 'liberado')
+      ? 'liberado'
+      : pagos.some((p) => p.estado === 'fallido')
+        ? 'fallido'
+        : 'reembolsado';
+
+  const relevantes = pagos.filter((p) => p.estado === 'retenido' || p.estado === 'liberado');
+  const sumar = (clave: 'montoTotal' | 'comisionPlataforma' | 'montoProfesional') =>
+    Number(relevantes.reduce((acc, p) => acc + Number(p[clave]), 0).toFixed(2));
+
+  return {
+    estado,
+    montoTotal: sumar('montoTotal'),
+    comisionPlataforma: sumar('comisionPlataforma'),
+    montoProfesional: sumar('montoProfesional'),
+  };
+}
+
+/**
+ * true si hay algo aceptado (el presupuesto inicial, o una ampliación)
+ * que todavía no tiene su autorización de Stripe correspondiente — es
+ * la señal que necesita el frontend para mostrar el botón "Autorizar
+ * pago", sea la primera vez o tras una ampliación, sin tener que
+ * distinguir los dos casos por su cuenta.
+ */
+function calcularPagoPendienteDeAutorizar(
+  presupuesto: { id: string; estado: string } | undefined,
+  ampliacion: { id: string; estado: string } | undefined,
+  pagos: { presupuestoId: string; ampliacionId: string | null }[]
+): boolean {
+  if (!presupuesto || presupuesto.estado !== 'aceptado') return false;
+  const tienePagoInicial = pagos.some((p) => p.presupuestoId === presupuesto.id && !p.ampliacionId);
+  if (!tienePagoInicial) return true;
+  if (ampliacion && ampliacion.estado === 'aceptado') {
+    const tienePagoAmpliacion = pagos.some((p) => p.ampliacionId === ampliacion.id);
+    if (!tienePagoAmpliacion) return true;
+  }
+  return false;
 }
 
 const createRequestSchema = z.object({
@@ -149,14 +233,19 @@ export async function getServiceRequestById(req: Request, res: Response) {
     where: { id },
     include: {
       categoria: true,
-      payment: true,
+      pagos: true,
       reviews: true,
       // Nombre del profesional asignado — el chat de esta solicitud
       // (ver ChatScreen en el frontend) no tenía forma de saber con
       // quién estaba hablando el cliente sin esto.
       profesional: { include: { user: { select: { nombre: true } } } },
       _count: { select: { postulaciones: { where: { estado: 'pendiente' } } } },
-      presupuestos: { orderBy: { createdAt: 'desc' }, take: 1 },
+      presupuestos: {
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        include: { ampliaciones: { orderBy: { createdAt: 'desc' }, take: 1 } },
+      },
+      cierresHoras: { orderBy: { createdAt: 'desc' }, take: 1 },
     },
   });
 
@@ -172,6 +261,9 @@ export async function getServiceRequestById(req: Request, res: Response) {
     return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
   }
 
+  const presupuesto = solicitud.presupuestos[0];
+  const ampliacion = presupuesto?.ampliaciones[0];
+
   return res.json({
     id: solicitud.id,
     categoria: solicitud.categoria.nombre,
@@ -185,15 +277,11 @@ export async function getServiceRequestById(req: Request, res: Response) {
     estado: solicitud.estado,
     createdAt: solicitud.createdAt,
     numCandidatos: solicitud._count.postulaciones,
-    presupuesto: serializarPresupuesto(solicitud.presupuestos[0]),
-    payment: solicitud.payment
-      ? {
-          estado: solicitud.payment.estado,
-          montoTotal: Number(solicitud.payment.montoTotal),
-          comisionPlataforma: Number(solicitud.payment.comisionPlataforma),
-          montoProfesional: Number(solicitud.payment.montoProfesional),
-        }
-      : null,
+    presupuesto: serializarPresupuesto(presupuesto),
+    ampliacion: serializarAmpliacion(ampliacion),
+    cierreHoras: serializarCierreHoras(solicitud.cierresHoras[0]),
+    pagoPendienteDeAutorizar: calcularPagoPendienteDeAutorizar(presupuesto, ampliacion, solicitud.pagos),
+    payment: agregarPagos(solicitud.pagos),
     // Array en vez de un único objeto: puede haber hasta dos
     // (cliente->profesional y profesional->cliente). El frontend
     // filtra por autorId == su propio usuario para saber "¿ya valoré
@@ -533,14 +621,14 @@ const completeRequestSchema = z.object({
 });
 
 /**
- * Marca la solicitud como completada y libera el pago retenido:
- * captura el cargo en Stripe y transfiere al profesional (menos comisión).
- * El pago debe existir ya en estado "retenido" — se crea antes, cuando
- * el cliente autoriza el cargo (ver payment.controller.ts). El importe
- * final sale siempre del presupuesto aceptado, nunca de un número que
- * el profesional escriba a mano: si es "cerrado" es el monto fijo, si
- * es "por_horas" es tarifaHora × horas reales (capado al techo ya
- * autorizado — superarlo requiere una ampliación, ver Fase 2 del plan).
+ * "Cerrado": completa y libera el pago en el mismo paso, igual que en
+ * la Fase 1 — el importe ya está acordado de antemano, no hay nada
+ * que confirmar. "Por_horas": el profesional NO completa directamente
+ * aquí — declara las horas reales y se crea un CierreHoras pendiente;
+ * la solicitud sigue "aceptada" hasta que el cliente lo confirma (ver
+ * responderCierreHoras, más abajo), que es cuando de verdad se libera
+ * el pago. Así nunca se libera dinero solo porque el profesional lo
+ * declare — el cliente tiene que estar de acuerdo con las horas.
  */
 export async function completeServiceRequest(req: Request, res: Response) {
   const { id } = req.params;
@@ -566,7 +654,7 @@ export async function completeServiceRequest(req: Request, res: Response) {
     return res.status(409).json({ error: 'La solicitud no está en un estado válido para completarse' });
   }
 
-  const pagoExistente = await prisma.payment.findUnique({ where: { serviceRequestId: id } });
+  const pagoExistente = await prisma.payment.findFirst({ where: { serviceRequestId: id, estado: 'retenido' } });
   if (!pagoExistente) {
     return res.status(409).json({
       error: 'El cliente aún no ha autorizado el pago de este servicio',
@@ -578,23 +666,36 @@ export async function completeServiceRequest(req: Request, res: Response) {
     return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud' });
   }
 
-  let precioFinal: number;
-  if (presupuesto.tipo === 'cerrado') {
-    precioFinal = Number(presupuesto.monto);
-  } else {
+  if (presupuesto.tipo === 'por_horas') {
     if (!parsed.data.horasReales) {
       return res.status(400).json({ error: 'Indica las horas reales trabajadas' });
     }
-    const tarifaHora = Number(presupuesto.tarifaHora);
-    const horasEstimadas = Number(presupuesto.horasEstimadas);
-    if (parsed.data.horasReales > horasEstimadas) {
-      console.warn(
-        `[completeServiceRequest] ${id}: horas reales (${parsed.data.horasReales}) superan las ` +
-          `estimadas (${horasEstimadas}) — capado al techo ya autorizado en Stripe`
-      );
+
+    const yaPendiente = await prisma.cierreHoras.findFirst({ where: { serviceRequestId: id, estado: 'pendiente' } });
+    if (yaPendiente) {
+      return res.status(409).json({ error: 'Ya hay un cierre pendiente de confirmación del cliente' });
     }
-    precioFinal = tarifaHora * Math.min(parsed.data.horasReales, horasEstimadas);
+
+    const cierre = await prisma.cierreHoras.create({
+      data: { serviceRequestId: id, horasReales: parsed.data.horasReales },
+    });
+
+    enviarNotificacion(solicitud.clienteId, {
+      title: 'El profesional ha terminado el trabajo',
+      body: 'Confirma las horas trabajadas para liberar el pago',
+    }, { tipo: 'cierre_horas_pendiente', solicitudId: id }).catch((e) =>
+      console.error(`[completeServiceRequest] Error al notificar al cliente de ${id}:`, e)
+    );
+
+    return res.status(202).json({
+      solicitudId: id,
+      estado: solicitud.estado,
+      cierreHorasId: cierre.id,
+      pendienteConfirmacion: true,
+    });
   }
+
+  const precioFinal = Number(presupuesto.monto);
 
   await prisma.serviceRequest.update({
     where: { id },
@@ -609,7 +710,7 @@ export async function completeServiceRequest(req: Request, res: Response) {
   );
 
   try {
-    const pagoLiberado = await releasePayment(id);
+    const pagoLiberado = await releasePayments(id, precioFinal);
     return res.json({ solicitudId: id, estado: 'completada', pago: pagoLiberado });
   } catch (err) {
     // El servicio queda marcado como completado igualmente; el pago se
@@ -624,6 +725,105 @@ export async function completeServiceRequest(req: Request, res: Response) {
       solicitudId: id,
       estado: 'completada',
       aviso: 'Servicio completado, pero la liberación del pago falló y se reintentará',
+    });
+  }
+}
+
+const responderCierreHorasSchema = z.object({
+  accion: z.enum(['aceptar', 'rechazar']),
+});
+
+/**
+ * El cliente confirma (o rechaza) las horas reales que declaró el
+ * profesional en un trabajo "por_horas". Aceptar es lo que de verdad
+ * completa la solicitud y libera el pago — antes de esto, el trabajo
+ * sigue "aceptada" aunque el profesional ya haya terminado. Rechazar
+ * no dispara ninguna renegociación automática: queda para resolverse
+ * por chat o, si no hay acuerdo, con una reclamación (createDispute,
+ * ya existente) — no se construye un mecanismo nuevo para este caso.
+ */
+export async function responderCierreHoras(req: Request, res: Response) {
+  const { id, cierreId } = req.params;
+  const clienteId = req.user!.userId;
+
+  const parsed = responderCierreHorasSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Falta indicar si aceptas o rechazas las horas declaradas' });
+  }
+
+  const solicitud = await prisma.serviceRequest.findUnique({
+    where: { id },
+    include: { presupuestos: { where: { estado: 'aceptado' }, orderBy: { createdAt: 'desc' }, take: 1 } },
+  });
+  if (!solicitud) {
+    return res.status(404).json({ error: 'Solicitud no encontrada' });
+  }
+  if (solicitud.clienteId !== clienteId) {
+    return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
+  }
+
+  const cierre = await prisma.cierreHoras.findUnique({ where: { id: cierreId } });
+  if (!cierre || cierre.serviceRequestId !== id) {
+    return res.status(404).json({ error: 'Cierre no encontrado' });
+  }
+
+  if (parsed.data.accion === 'rechazar') {
+    const { count } = await prisma.cierreHoras.updateMany({
+      where: { id: cierreId, estado: 'pendiente' },
+      data: { estado: 'rechazado', resueltaAt: new Date() },
+    });
+    if (count === 0) {
+      return res.status(409).json({ error: 'Este cierre ya no está pendiente de respuesta' });
+    }
+    if (solicitud.profesionalId) {
+      enviarNotificacion(solicitud.profesionalId, {
+        title: 'El cliente no está de acuerdo con las horas',
+        body: 'Habladlo por chat, o el cliente puede abrir una reclamación si no llegáis a un acuerdo',
+      }, { tipo: 'cierre_horas_rechazado', solicitudId: id }).catch((e) =>
+        console.error(`[responderCierreHoras] Error al notificar al profesional de ${id}:`, e)
+      );
+    }
+    return res.json({ id: cierreId, estado: 'rechazado' });
+  }
+
+  const presupuesto = solicitud.presupuestos[0];
+  if (!presupuesto) {
+    return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud' });
+  }
+
+  const { count } = await prisma.cierreHoras.updateMany({
+    where: { id: cierreId, estado: 'pendiente' },
+    data: { estado: 'aceptado', resueltaAt: new Date() },
+  });
+  if (count === 0) {
+    return res.status(409).json({ error: 'Este cierre ya no está pendiente de respuesta' });
+  }
+
+  const precioFinal = Number(presupuesto.tarifaHora) * Number(cierre.horasReales);
+
+  await prisma.serviceRequest.update({
+    where: { id },
+    data: { estado: 'completada', precioFinal, completadaAt: new Date() },
+  });
+
+  if (solicitud.profesionalId) {
+    enviarNotificacion(solicitud.profesionalId, {
+      title: 'Horas confirmadas',
+      body: 'El cliente ha confirmado las horas trabajadas — el pago ya se ha liberado',
+    }, { tipo: 'cierre_horas_aceptado', solicitudId: id }).catch((e) =>
+      console.error(`[responderCierreHoras] Error al notificar al profesional de ${id}:`, e)
+    );
+  }
+
+  try {
+    const pagoLiberado = await releasePayments(id, precioFinal);
+    return res.json({ id: cierreId, estado: 'aceptado', pago: pagoLiberado });
+  } catch (err) {
+    console.error(`[responderCierreHoras] Error al liberar el pago de ${id}:`, err);
+    return res.status(202).json({
+      id: cierreId,
+      estado: 'aceptado',
+      aviso: 'Horas confirmadas, pero la liberación del pago falló y se reintentará',
     });
   }
 }
@@ -644,30 +844,41 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
     include: {
       categoria: true,
       cliente: { select: { nombre: true, telefono: true, fotoPerfilUrl: true } },
-      payment: true,
+      pagos: true,
       reviews: true,
-      presupuestos: { orderBy: { createdAt: 'desc' }, take: 1 },
+      presupuestos: {
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        include: { ampliaciones: { orderBy: { createdAt: 'desc' }, take: 1 } },
+      },
+      cierresHoras: { orderBy: { createdAt: 'desc' }, take: 1 },
     },
     orderBy: { aceptadaAt: 'desc' },
     take: 50,
   });
 
   return res.json({
-    solicitudes: solicitudes.map((s) => ({
-      id: s.id,
-      categoria: s.categoria.nombre,
-      descripcion: s.descripcion,
-      estado: s.estado,
-      direccionTexto: s.direccionTexto,
-      clienteNombre: s.cliente.nombre,
-      clienteTelefono: s.cliente.telefono,
-      clienteFotoUrl: s.cliente.fotoPerfilUrl,
-      precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
-      presupuesto: serializarPresupuesto(s.presupuestos[0]),
-      createdAt: s.createdAt,
-      tienePago: Boolean(s.payment),
-      tieneValoracion: s.reviews.some((r) => r.autorId === profesionalId),
-    })),
+    solicitudes: solicitudes.map((s) => {
+      const presupuesto = s.presupuestos[0];
+      const ampliacion = presupuesto?.ampliaciones[0];
+      return {
+        id: s.id,
+        categoria: s.categoria.nombre,
+        descripcion: s.descripcion,
+        estado: s.estado,
+        direccionTexto: s.direccionTexto,
+        clienteNombre: s.cliente.nombre,
+        clienteTelefono: s.cliente.telefono,
+        clienteFotoUrl: s.cliente.fotoPerfilUrl,
+        precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
+        presupuesto: serializarPresupuesto(presupuesto),
+        ampliacion: serializarAmpliacion(ampliacion),
+        cierreHoras: serializarCierreHoras(s.cierresHoras[0]),
+        createdAt: s.createdAt,
+        tienePago: s.pagos.length > 0,
+        tieneValoracion: s.reviews.some((r) => r.autorId === profesionalId),
+      };
+    }),
   });
 }
 
@@ -683,7 +894,7 @@ export async function listMyServiceRequests(req: Request, res: Response) {
     where: { clienteId },
     include: {
       categoria: true,
-      payment: true,
+      pagos: true,
       reviews: true,
       profesional: { include: { user: { select: { nombre: true } } } },
     },
@@ -701,7 +912,7 @@ export async function listMyServiceRequests(req: Request, res: Response) {
       urgencia: s.urgencia,
       precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
       createdAt: s.createdAt,
-      tienePago: Boolean(s.payment),
+      tienePago: s.pagos.length > 0,
       // Antes era "¿existe ALGUNA valoración?" — con reviews
       // bidireccionales eso ya no distingue si fue el cliente o el
       // profesional quien la dejó. Ahora comprueba específicamente si

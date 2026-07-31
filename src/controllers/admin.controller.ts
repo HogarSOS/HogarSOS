@@ -1,7 +1,8 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
-import { refundPayment, releasePayment } from '../services/payment.service';
+import { refundPayment, releasePayments } from '../services/payment.service';
+import { agregarPagos } from './serviceRequest.controller';
 
 export async function listPendingVerifications(req: Request, res: Response) {
   const pendientes = await prisma.professional.findMany({
@@ -81,7 +82,7 @@ export async function listDisputes(req: Request, res: Response) {
     where: estadoFiltro ? { estado: estadoFiltro } : { estado: { in: ['abierta', 'en_revision'] } },
     include: {
       serviceRequest: {
-        include: { categoria: true, payment: true, cliente: { select: { nombre: true } } },
+        include: { categoria: true, pagos: true, cliente: { select: { nombre: true } } },
       },
     },
     orderBy: { createdAt: 'asc' },
@@ -91,20 +92,16 @@ export async function listDisputes(req: Request, res: Response) {
   // como string si no se convierte explícitamente — mismo patrón que en
   // el resto del backend. Hoy el frontend no lee estos campos (ver
   // admin_models.dart), pero se corrige igualmente para no dejarlo como
-  // una bomba de relojería para cuando se amplíe el panel.
+  // una bomba de relojería para cuando se amplíe el panel. `payment`
+  // ahora es un resumen agregado (puede haber más de una autorización
+  // por solicitud — inicial + ampliaciones), mismo helper que usa
+  // getServiceRequestById.
   return res.json(
     disputas.map((d) => ({
       ...d,
       serviceRequest: {
         ...d.serviceRequest,
-        payment: d.serviceRequest.payment
-          ? {
-              ...d.serviceRequest.payment,
-              montoTotal: Number(d.serviceRequest.payment.montoTotal),
-              comisionPlataforma: Number(d.serviceRequest.payment.comisionPlataforma),
-              montoProfesional: Number(d.serviceRequest.payment.montoProfesional),
-            }
-          : null,
+        payment: agregarPagos(d.serviceRequest.pagos),
       },
     }))
   );
@@ -148,7 +145,14 @@ export async function resolveDispute(req: Request, res: Response) {
         data: { estado: 'cancelada' },
       });
     } else {
-      await releasePayment(disputa.serviceRequestId);
+      // A favor del profesional: se libera TODO lo retenido (inicial +
+      // cualquier ampliación), no un importe parcial — el admin está
+      // fallando a favor del importe completo ya autorizado.
+      const retenidos = await prisma.payment.findMany({
+        where: { serviceRequestId: disputa.serviceRequestId, estado: 'retenido' },
+      });
+      const importeFinal = retenidos.reduce((acc, p) => acc + Number(p.montoTotal), 0);
+      await releasePayments(disputa.serviceRequestId, importeFinal);
       await prisma.serviceRequest.update({
         where: { id: disputa.serviceRequestId },
         data: { estado: 'completada' },

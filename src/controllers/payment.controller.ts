@@ -9,11 +9,14 @@ const createIntentSchema = z.object({
 });
 
 /**
- * El cliente llama a esto tras seleccionar profesional (o justo antes
- * de que empiece el trabajo). Autoriza el cargo en la tarjeta sin
- * capturarlo todavía — el dinero queda retenido hasta que el servicio
- * se complete. Devuelve el client_secret para que la app Flutter
- * confirme el pago con el SDK de Stripe (Payment Sheet).
+ * El cliente llama a esto para autorizar un cargo — puede ser la
+ * autorización inicial (tras aceptar el presupuesto) o una autorización
+ * adicional (tras aceptar una ampliación de horas): el endpoint decide
+ * cuál toca según lo que quede pendiente de autorizar, así el frontend
+ * llama siempre al mismo sitio (mismo PagoScreen) en los dos casos.
+ * Autoriza el cargo en la tarjeta sin capturarlo todavía — el dinero
+ * queda retenido hasta que el trabajo se cierra. Devuelve el
+ * client_secret para que la app confirme con el Payment Sheet de Stripe.
  */
 export async function createPaymentIntent(req: Request, res: Response) {
   const parsed = createIntentSchema.safeParse(req.body);
@@ -27,8 +30,13 @@ export async function createPaymentIntent(req: Request, res: Response) {
   const solicitud = await prisma.serviceRequest.findUnique({
     where: { id: serviceRequestId },
     include: {
-      payment: true,
-      presupuestos: { where: { estado: 'aceptado' }, orderBy: { createdAt: 'desc' }, take: 1 },
+      pagos: true,
+      presupuestos: {
+        where: { estado: 'aceptado' },
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        include: { ampliaciones: { where: { estado: 'aceptado' }, orderBy: { createdAt: 'asc' } } },
+      },
     },
   });
 
@@ -38,24 +46,39 @@ export async function createPaymentIntent(req: Request, res: Response) {
   if (solicitud.clienteId !== clienteId) {
     return res.status(403).json({ error: 'No eres el cliente de esta solicitud' });
   }
-  if (solicitud.estado !== 'aceptada') {
+  if (solicitud.estado !== 'aceptada' && solicitud.estado !== 'en_progreso') {
     return res.status(409).json({ error: 'La solicitud debe estar aceptada por un profesional antes de pagar' });
   }
-  if (solicitud.payment) {
-    return res.status(409).json({ error: 'Ya existe un pago para esta solicitud' });
-  }
-  const presupuestoAceptado = solicitud.presupuestos[0];
-  if (!presupuestoAceptado) {
+  const presupuesto = solicitud.presupuestos[0];
+  if (!presupuesto) {
     return res.status(409).json({ error: 'Todavía no hay un presupuesto aceptado para esta solicitud' });
   }
 
-  const montoTotal =
-    presupuestoAceptado.tipo === 'cerrado'
-      ? Number(presupuestoAceptado.monto)
-      : Number(presupuestoAceptado.tarifaHora) * Number(presupuestoAceptado.horasEstimadas);
+  const pagoInicial = solicitud.pagos.find((p) => p.presupuestoId === presupuesto.id && !p.ampliacionId);
+
+  let montoTotal: number;
+  let ampliacionId: string | undefined;
+
+  if (!pagoInicial) {
+    montoTotal =
+      presupuesto.tipo === 'cerrado'
+        ? Number(presupuesto.monto)
+        : Number(presupuesto.tarifaHora) * Number(presupuesto.horasEstimadas);
+  } else {
+    const ampliacionSinAutorizar = presupuesto.ampliaciones.find(
+      (a) => !solicitud.pagos.some((p) => p.ampliacionId === a.id)
+    );
+    if (!ampliacionSinAutorizar) {
+      return res.status(409).json({ error: 'No hay nada pendiente de autorizar para esta solicitud' });
+    }
+    ampliacionId = ampliacionSinAutorizar.id;
+    montoTotal = Number(ampliacionSinAutorizar.horasAdicionales) * Number(presupuesto.tarifaHora);
+  }
 
   const { pago, clientSecret } = await createEscrowPaymentIntent({
     serviceRequestId,
+    presupuestoId: presupuesto.id,
+    ampliacionId,
     montoTotal,
   });
 

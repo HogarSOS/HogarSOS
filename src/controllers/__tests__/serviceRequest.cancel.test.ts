@@ -18,7 +18,7 @@ jest.mock('../../config/firebase', () => ({
 
 jest.mock('../../services/payment.service', () => ({
   refundPayment: jest.fn(),
-  releasePayment: jest.fn(),
+  releasePayments: jest.fn(),
 }));
 
 jest.mock('../../services/notification.service', () => ({

@@ -100,10 +100,11 @@ model ServiceRequest {
   aceptadaAt     DateTime?                @map("aceptada_at")
   completadaAt   DateTime?                @map("completada_at")
   disputes       Dispute[]
-  payment        Payment?
+  pagos          Payment[]
   reviews        Review[]
   postulaciones  Postulacion[]
   presupuestos   Presupuesto[]
+  cierresHoras   CierreHoras[]
   categoria      ServiceCategory          @relation(fields: [categoryId], references: [id])
   cliente        User                     @relation("ClienteRequests", fields: [clienteId], references: [id])
   profesional    Professional?            @relation(fields: [profesionalId], references: [userId])
@@ -112,9 +113,16 @@ model ServiceRequest {
   @@map("service_requests")
 }
 
+// Ya no es 1:1 con ServiceRequest (sin @unique en serviceRequestId):
+// puede haber varias filas — la autorización inicial (ampliacionId
+// null) más una por cada ampliación de horas aceptada. presupuestoId
+// deja rastro de a qué presupuesto pertenece cada autorización, para
+// poder sumarlas todas al calcular cuánto hay realmente retenido.
 model Payment {
   id                    String         @id @default(uuid())
-  serviceRequestId      String         @unique @map("service_request_id")
+  serviceRequestId      String         @map("service_request_id")
+  presupuestoId         String         @map("presupuesto_id")
+  ampliacionId          String?        @map("ampliacion_id")
   montoTotal            Decimal        @map("monto_total")
   comisionPlataforma    Decimal        @map("comision_plataforma")
   montoProfesional      Decimal        @map("monto_profesional")
@@ -124,7 +132,10 @@ model Payment {
   createdAt             DateTime       @default(now()) @map("created_at")
   liberadoAt            DateTime?      @map("liberado_at")
   serviceRequest        ServiceRequest @relation(fields: [serviceRequestId], references: [id])
+  presupuesto           Presupuesto    @relation(fields: [presupuestoId], references: [id])
+  ampliacion            Ampliacion?    @relation(fields: [ampliacionId], references: [id])
 
+  @@index([serviceRequestId])
   @@map("payments")
 }
 
@@ -208,9 +219,53 @@ model Presupuesto {
   resueltaAt       DateTime?         @map("resuelta_at")
   serviceRequest   ServiceRequest    @relation(fields: [serviceRequestId], references: [id])
   profesional      Professional      @relation(fields: [profesionalId], references: [userId])
+  ampliaciones     Ampliacion[]
+  pagos            Payment[]
 
   @@index([serviceRequestId, estado])
   @@map("presupuestos")
+}
+
+// Petición del profesional para sumar más horas a un presupuesto
+// "por_horas" ya aceptado, cuando el trabajo se alarga más de lo
+// previsto — nunca se cobra el exceso fuera de la app. Mismo patrón
+// pendiente/aceptado/rechazado que Presupuesto (reutiliza el mismo
+// enum). Al aceptar, se autoriza una autorización de Stripe NUEVA por
+// el importe adicional exacto (ver Payment.ampliacionId) — no se
+// modifica la autorización original, así funciona igual en cualquier
+// tarjeta/banco sin depender de la autorización incremental nativa de
+// Stripe, que no todas las tarjetas europeas soportan de forma fiable.
+model Ampliacion {
+  id               String            @id @default(uuid())
+  presupuestoId    String            @map("presupuesto_id")
+  horasAdicionales Decimal           @map("horas_adicionales")
+  mensaje          String?
+  estado           EstadoPresupuesto @default(pendiente)
+  createdAt        DateTime          @default(now()) @map("created_at")
+  resueltaAt       DateTime?         @map("resuelta_at")
+  presupuesto      Presupuesto       @relation(fields: [presupuestoId], references: [id])
+  pagos            Payment[]
+
+  @@map("ampliaciones")
+}
+
+// Cierre de un trabajo "por_horas": el profesional declara las horas
+// reales, pero el pago no se libera hasta que el cliente lo confirma
+// (mismo patrón pendiente/aceptado/rechazado). Si el cliente no está
+// de acuerdo, no hay renegociación automática aquí — se resuelve por
+// chat o, si no hay acuerdo, con una reclamación (createDispute, ya
+// existente). Los trabajos "cerrado" no pasan por esta tabla — se
+// completan y liberan directo, como en la Fase 1.
+model CierreHoras {
+  id               String            @id @default(uuid())
+  serviceRequestId String            @map("service_request_id")
+  horasReales      Decimal           @map("horas_reales")
+  estado           EstadoPresupuesto @default(pendiente)
+  createdAt        DateTime          @default(now()) @map("created_at")
+  resueltaAt       DateTime?         @map("resuelta_at")
+  serviceRequest   ServiceRequest    @relation(fields: [serviceRequestId], references: [id])
+
+  @@map("cierres_horas")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.

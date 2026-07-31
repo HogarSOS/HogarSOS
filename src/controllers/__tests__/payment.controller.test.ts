@@ -30,6 +30,23 @@ function fakeReq(userId: string, body: Record<string, unknown>): Request {
 
 const SR_ID = '11111111-1111-1111-1111-111111111111';
 
+function solicitud(overrides: {
+  clienteId?: string;
+  estado?: string;
+  pagos?: Record<string, unknown>[];
+  presupuesto?: Record<string, unknown> | null;
+  ampliaciones?: Record<string, unknown>[];
+}) {
+  const presupuesto = overrides.presupuesto === undefined ? { id: 'pres-1', tipo: 'cerrado', monto: 180 } : overrides.presupuesto;
+  return {
+    id: SR_ID,
+    clienteId: overrides.clienteId ?? 'cliente-1',
+    estado: overrides.estado ?? 'aceptada',
+    pagos: overrides.pagos ?? [],
+    presupuestos: presupuesto ? [{ ...presupuesto, ampliaciones: overrides.ampliaciones ?? [] }] : [],
+  };
+}
+
 describe('createPaymentIntent', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -39,49 +56,33 @@ describe('createPaymentIntent', () => {
     });
   });
 
-  it('usa el monto del presupuesto cerrado aceptado', async () => {
-    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
-      id: SR_ID,
-      clienteId: 'cliente-1',
-      estado: 'aceptada',
-      payment: null,
-      presupuestos: [{ tipo: 'cerrado', monto: 180 }],
-    });
+  it('usa el monto del presupuesto cerrado aceptado (autorización inicial)', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(
+      solicitud({ presupuesto: { id: 'pres-1', tipo: 'cerrado', monto: 180 } })
+    );
 
     const res = fakeRes();
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
 
     expect(mockCreateEscrow).toHaveBeenCalledWith(
-      expect.objectContaining({ serviceRequestId: SR_ID, montoTotal: 180 })
+      expect.objectContaining({ serviceRequestId: SR_ID, presupuestoId: 'pres-1', montoTotal: 180, ampliacionId: undefined })
     );
     expect(res.status).toHaveBeenCalledWith(201);
   });
 
   it('usa tarifaHora * horasEstimadas para un presupuesto por horas aceptado', async () => {
-    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
-      id: SR_ID,
-      clienteId: 'cliente-1',
-      estado: 'aceptada',
-      payment: null,
-      presupuestos: [{ tipo: 'por_horas', tarifaHora: 25, horasEstimadas: 4 }],
-    });
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(
+      solicitud({ presupuesto: { id: 'pres-1', tipo: 'por_horas', tarifaHora: 25, horasEstimadas: 4 } })
+    );
 
     const res = fakeRes();
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
 
-    expect(mockCreateEscrow).toHaveBeenCalledWith(
-      expect.objectContaining({ montoTotal: 100 })
-    );
+    expect(mockCreateEscrow).toHaveBeenCalledWith(expect.objectContaining({ montoTotal: 100 }));
   });
 
   it('devuelve 409 si no hay ningún presupuesto aceptado', async () => {
-    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
-      id: SR_ID,
-      clienteId: 'cliente-1',
-      estado: 'aceptada',
-      payment: null,
-      presupuestos: [],
-    });
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitud({ presupuesto: null }));
 
     const res = fakeRes();
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
@@ -100,13 +101,7 @@ describe('createPaymentIntent', () => {
   });
 
   it('devuelve 403 si no es el cliente de la solicitud', async () => {
-    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
-      id: SR_ID,
-      clienteId: 'otro-cliente',
-      estado: 'aceptada',
-      payment: null,
-      presupuestos: [{ tipo: 'cerrado', monto: 100 }],
-    });
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitud({ clienteId: 'otro-cliente' }));
 
     const res = fakeRes();
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
@@ -114,14 +109,8 @@ describe('createPaymentIntent', () => {
     expect(res.status).toHaveBeenCalledWith(403);
   });
 
-  it('devuelve 409 si la solicitud no está aceptada', async () => {
-    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
-      id: SR_ID,
-      clienteId: 'cliente-1',
-      estado: 'pendiente',
-      payment: null,
-      presupuestos: [{ tipo: 'cerrado', monto: 100 }],
-    });
+  it('devuelve 409 si la solicitud no está aceptada ni en progreso', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitud({ estado: 'pendiente' }));
 
     const res = fakeRes();
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
@@ -129,18 +118,52 @@ describe('createPaymentIntent', () => {
     expect(res.status).toHaveBeenCalledWith(409);
   });
 
-  it('devuelve 409 si ya existe un pago', async () => {
-    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
-      id: SR_ID,
-      clienteId: 'cliente-1',
-      estado: 'aceptada',
-      payment: { id: 'pago-existente' },
-      presupuestos: [{ tipo: 'cerrado', monto: 100 }],
-    });
+  it('devuelve 409 si ya hay pago inicial y no hay ninguna ampliación aceptada sin autorizar', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(
+      solicitud({ pagos: [{ presupuestoId: 'pres-1', ampliacionId: null }] })
+    );
 
     const res = fakeRes();
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
 
     expect(res.status).toHaveBeenCalledWith(409);
+    expect(mockCreateEscrow).not.toHaveBeenCalled();
+  });
+
+  it('autoriza el importe de una ampliación aceptada cuando ya existe la autorización inicial', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(
+      solicitud({
+        presupuesto: { id: 'pres-1', tipo: 'por_horas', tarifaHora: 25, horasEstimadas: 4 },
+        pagos: [{ presupuestoId: 'pres-1', ampliacionId: null }],
+        ampliaciones: [{ id: 'ampl-1', horasAdicionales: 2 }],
+      })
+    );
+
+    const res = fakeRes();
+    await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
+
+    expect(mockCreateEscrow).toHaveBeenCalledWith(
+      expect.objectContaining({ presupuestoId: 'pres-1', ampliacionId: 'ampl-1', montoTotal: 50 })
+    );
+    expect(res.status).toHaveBeenCalledWith(201);
+  });
+
+  it('devuelve 409 si la ampliación aceptada ya tiene su propia autorización', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(
+      solicitud({
+        presupuesto: { id: 'pres-1', tipo: 'por_horas', tarifaHora: 25, horasEstimadas: 4 },
+        pagos: [
+          { presupuestoId: 'pres-1', ampliacionId: null },
+          { presupuestoId: 'pres-1', ampliacionId: 'ampl-1' },
+        ],
+        ampliaciones: [{ id: 'ampl-1', horasAdicionales: 2 }],
+      })
+    );
+
+    const res = fakeRes();
+    await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(mockCreateEscrow).not.toHaveBeenCalled();
   });
 });

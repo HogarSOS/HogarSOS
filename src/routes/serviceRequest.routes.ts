@@ -6,6 +6,7 @@ import {
   getServiceRequestById,
   listNearbyRequests,
   completeServiceRequest,
+  responderCierreHoras,
   cancelServiceRequest,
   deleteServiceRequest,
   listMyServiceRequests,
@@ -17,6 +18,7 @@ import {
 import { createDispute } from '../controllers/dispute.controller';
 import { createPostulacion, listPostulaciones, selectPostulacion } from '../controllers/postulacion.controller';
 import { createPresupuesto, responderPresupuesto } from '../controllers/presupuesto.controller';
+import { crearAmpliacion, responderAmpliacion } from '../controllers/ampliacion.controller';
 
 const router = Router();
 
@@ -29,6 +31,7 @@ router.get('/:id', authMiddleware(), asyncHandler(getServiceRequestById));
 router.get('/nearby/list', authMiddleware(['profesional']), asyncHandler(listNearbyRequests));
 router.get('/assigned/mine', authMiddleware(['profesional']), asyncHandler(listMyAssignedRequests));
 router.patch('/:id/complete', authMiddleware(['profesional']), asyncHandler(completeServiceRequest));
+router.post('/:id/cierre-horas/:cierreId/responder', authMiddleware(['cliente']), asyncHandler(responderCierreHoras));
 router.patch('/:id/cancel', authMiddleware(['cliente']), asyncHandler(cancelServiceRequest));
 router.delete('/:id', authMiddleware(['cliente']), asyncHandler(deleteServiceRequest));
 router.post('/:id/sync-chat', authMiddleware(), asyncHandler(syncChat));
@@ -40,5 +43,7 @@ router.get('/:id/postulaciones', authMiddleware(['cliente']), asyncHandler(listP
 router.post('/:id/postulaciones/:postulacionId/seleccionar', authMiddleware(['cliente']), asyncHandler(selectPostulacion));
 router.post('/:id/presupuesto', authMiddleware(['profesional']), asyncHandler(createPresupuesto));
 router.post('/:id/presupuesto/:presupuestoId/responder', authMiddleware(['cliente']), asyncHandler(responderPresupuesto));
+router.post('/:id/ampliacion', authMiddleware(['profesional']), asyncHandler(crearAmpliacion));
+router.post('/:id/ampliacion/:ampliacionId/responder', authMiddleware(['cliente']), asyncHandler(responderAmpliacion));
 
 export default router;
