@@ -50,6 +50,14 @@ export async function createEscrowPaymentIntent(params: {
     amount: Math.round(montoTotal * 100), // Stripe trabaja en céntimos
     currency: 'eur',
     capture_method: 'manual', // clave del modelo escrow: autoriza sin capturar
+    // Solo tarjeta: la cuenta tiene activados por defecto métodos como
+    // Klarna/Amazon Pay/Satispay que NO soportan captura manual, y con
+    // automatic_payment_methods habilitado (el default de la cuenta) el
+    // Payment Sheet del móvil falla al inicializarse por esos métodos
+    // incompatibles antes de que el cliente llegue a ver el formulario
+    // de tarjeta. Tarjeta es además el único método que tiene sentido
+    // para un pago retenido de días.
+    payment_method_types: ['card'],
     customer: clienteStripeCustomerId,
     metadata: { serviceRequestId, presupuestoId, ...(ampliacionId ? { ampliacionId } : {}) },
   });
