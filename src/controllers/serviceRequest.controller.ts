@@ -10,6 +10,36 @@ import { enviarNotificacion, enviarNotificacionMasiva } from '../services/notifi
 
 const RADIO_BUSQUEDA_METROS = 50000; // 50 km, ajustable por categoría en el futuro
 
+/**
+ * Serializa el último Presupuesto de una solicitud (pendiente, aceptado
+ * o rechazado — no solo el aceptado) para que el frontend distinga los
+ * cuatro estados posibles (incluido "todavía no hay ninguno" = null) y
+ * decida qué tarjeta mostrar. Usado en getServiceRequestById y
+ * listMyAssignedRequests.
+ */
+function serializarPresupuesto(p: {
+  id: string;
+  tipo: string;
+  monto: Prisma.Decimal | null;
+  tarifaHora: Prisma.Decimal | null;
+  horasEstimadas: Prisma.Decimal | null;
+  mensaje: string | null;
+  estado: string;
+  createdAt: Date;
+} | undefined) {
+  if (!p) return null;
+  return {
+    id: p.id,
+    tipo: p.tipo,
+    monto: p.monto ? Number(p.monto) : null,
+    tarifaHora: p.tarifaHora ? Number(p.tarifaHora) : null,
+    horasEstimadas: p.horasEstimadas ? Number(p.horasEstimadas) : null,
+    mensaje: p.mensaje,
+    estado: p.estado,
+    createdAt: p.createdAt,
+  };
+}
+
 const createRequestSchema = z.object({
   categoryId: z.number().int(),
   descripcion: z.string().min(5).max(1000),
@@ -17,7 +47,6 @@ const createRequestSchema = z.object({
   direccionTexto: z.string().optional(),
   latitud: z.number().min(-90).max(90),
   longitud: z.number().min(-180).max(180),
-  precioEstimado: z.number().positive().optional(),
   urgencia: z.enum(['lo_antes_posible', 'hoy', 'manana', 'fecha_especifica']).default('lo_antes_posible'),
   // Requerida solo cuando urgencia = fecha_especifica — se valida más abajo,
   // porque zod no puede condicionar un campo a otro dentro del mismo objeto
@@ -42,7 +71,6 @@ export async function createServiceRequest(req: Request, res: Response) {
     direccionTexto,
     latitud,
     longitud,
-    precioEstimado,
     urgencia,
     fechaDeseada,
   } = parsed.data;
@@ -60,11 +88,11 @@ export async function createServiceRequest(req: Request, res: Response) {
   const [solicitud] = await prisma.$queryRaw<{ id: string }[]>`
     INSERT INTO service_requests (
       id, cliente_id, category_id, descripcion, fotos_urls, direccion_texto,
-      precio_estimado, urgencia, fecha_deseada, ubicacion, estado, created_at
+      urgencia, fecha_deseada, ubicacion, estado, created_at
     )
     VALUES (
       uuid_generate_v4(), ${clienteId}::uuid, ${categoryId}, ${descripcion},
-      ${fotosUrls ?? []}, ${direccionTexto ?? null}, ${precioEstimado ?? null},
+      ${fotosUrls ?? []}, ${direccionTexto ?? null},
       ${urgencia}::"UrgenciaSolicitud", ${fechaDeseada ? new Date(fechaDeseada) : null},
       ST_SetSRID(ST_MakePoint(${longitud}, ${latitud}), 4326)::geography,
       'pendiente', now()
@@ -128,6 +156,7 @@ export async function getServiceRequestById(req: Request, res: Response) {
       // quién estaba hablando el cliente sin esto.
       profesional: { include: { user: { select: { nombre: true } } } },
       _count: { select: { postulaciones: { where: { estado: 'pendiente' } } } },
+      presupuestos: { orderBy: { createdAt: 'desc' }, take: 1 },
     },
   });
 
@@ -152,11 +181,11 @@ export async function getServiceRequestById(req: Request, res: Response) {
     direccionTexto: solicitud.direccionTexto,
     urgencia: solicitud.urgencia,
     fechaDeseada: solicitud.fechaDeseada,
-    precioEstimado: solicitud.precioEstimado ? Number(solicitud.precioEstimado) : null,
     precioFinal: solicitud.precioFinal ? Number(solicitud.precioFinal) : null,
     estado: solicitud.estado,
     createdAt: solicitud.createdAt,
     numCandidatos: solicitud._count.postulaciones,
+    presupuesto: serializarPresupuesto(solicitud.presupuestos[0]),
     payment: solicitud.payment
       ? {
           estado: solicitud.payment.estado,
@@ -497,14 +526,21 @@ export async function markChatRead(req: Request, res: Response) {
 // pulsa un botón.
 
 const completeRequestSchema = z.object({
-  precioFinal: z.number().positive(),
+  // Solo obligatorio si el presupuesto aceptado es "por_horas" — se
+  // valida más abajo, una vez se sabe el tipo (no lo elige el cliente
+  // en este body, lo decide el presupuesto ya aceptado).
+  horasReales: z.number().positive().optional(),
 });
 
 /**
  * Marca la solicitud como completada y libera el pago retenido:
  * captura el cargo en Stripe y transfiere al profesional (menos comisión).
  * El pago debe existir ya en estado "retenido" — se crea antes, cuando
- * el cliente autoriza el cargo (ver payment.controller.ts).
+ * el cliente autoriza el cargo (ver payment.controller.ts). El importe
+ * final sale siempre del presupuesto aceptado, nunca de un número que
+ * el profesional escriba a mano: si es "cerrado" es el monto fijo, si
+ * es "por_horas" es tarifaHora × horas reales (capado al techo ya
+ * autorizado — superarlo requiere una ampliación, ver Fase 2 del plan).
  */
 export async function completeServiceRequest(req: Request, res: Response) {
   const { id } = req.params;
@@ -512,10 +548,13 @@ export async function completeServiceRequest(req: Request, res: Response) {
 
   const parsed = completeRequestSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Falta el precio final del servicio' });
+    return res.status(400).json({ error: 'Datos inválidos' });
   }
 
-  const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
+  const solicitud = await prisma.serviceRequest.findUnique({
+    where: { id },
+    include: { presupuestos: { where: { estado: 'aceptado' }, orderBy: { createdAt: 'desc' }, take: 1 } },
+  });
 
   if (!solicitud) {
     return res.status(404).json({ error: 'Solicitud no encontrada' });
@@ -534,9 +573,32 @@ export async function completeServiceRequest(req: Request, res: Response) {
     });
   }
 
+  const presupuesto = solicitud.presupuestos[0];
+  if (!presupuesto) {
+    return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud' });
+  }
+
+  let precioFinal: number;
+  if (presupuesto.tipo === 'cerrado') {
+    precioFinal = Number(presupuesto.monto);
+  } else {
+    if (!parsed.data.horasReales) {
+      return res.status(400).json({ error: 'Indica las horas reales trabajadas' });
+    }
+    const tarifaHora = Number(presupuesto.tarifaHora);
+    const horasEstimadas = Number(presupuesto.horasEstimadas);
+    if (parsed.data.horasReales > horasEstimadas) {
+      console.warn(
+        `[completeServiceRequest] ${id}: horas reales (${parsed.data.horasReales}) superan las ` +
+          `estimadas (${horasEstimadas}) — capado al techo ya autorizado en Stripe`
+      );
+    }
+    precioFinal = tarifaHora * Math.min(parsed.data.horasReales, horasEstimadas);
+  }
+
   await prisma.serviceRequest.update({
     where: { id },
-    data: { estado: 'completada', precioFinal: parsed.data.precioFinal, completadaAt: new Date() },
+    data: { estado: 'completada', precioFinal, completadaAt: new Date() },
   });
 
   enviarNotificacion(solicitud.clienteId, {
@@ -584,6 +646,7 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
       cliente: { select: { nombre: true, telefono: true, fotoPerfilUrl: true } },
       payment: true,
       reviews: true,
+      presupuestos: { orderBy: { createdAt: 'desc' }, take: 1 },
     },
     orderBy: { aceptadaAt: 'desc' },
     take: 50,
@@ -599,8 +662,8 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
       clienteNombre: s.cliente.nombre,
       clienteTelefono: s.cliente.telefono,
       clienteFotoUrl: s.cliente.fotoPerfilUrl,
-      precioEstimado: s.precioEstimado ? Number(s.precioEstimado) : null,
       precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
+      presupuesto: serializarPresupuesto(s.presupuestos[0]),
       createdAt: s.createdAt,
       tienePago: Boolean(s.payment),
       tieneValoracion: s.reviews.some((r) => r.autorId === profesionalId),
@@ -636,7 +699,6 @@ export async function listMyServiceRequests(req: Request, res: Response) {
       profesionalNombre: s.profesional?.user.nombre ?? null,
       estado: s.estado,
       urgencia: s.urgencia,
-      precioEstimado: s.precioEstimado ? Number(s.precioEstimado) : null,
       precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
       createdAt: s.createdAt,
       tienePago: Boolean(s.payment),

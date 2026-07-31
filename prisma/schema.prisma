@@ -66,6 +66,7 @@ model Professional {
   user                  User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
   serviceRequests       ServiceRequest[]
   postulaciones         Postulacion[]
+  presupuestos          Presupuesto[]
 
   @@index([ubicacionActual], map: "idx_professionals_ubicacion_actual", type: Gist)
   @@map("professionals")
@@ -93,7 +94,6 @@ model ServiceRequest {
   direccionTexto String?                  @map("direccion_texto")
   urgencia       UrgenciaSolicitud        @default(lo_antes_posible)
   fechaDeseada   DateTime?                @map("fecha_deseada")
-  precioEstimado Decimal?                 @map("precio_estimado")
   precioFinal    Decimal?                 @map("precio_final")
   estado         EstadoSolicitud          @default(pendiente)
   createdAt      DateTime                 @default(now()) @map("created_at")
@@ -103,6 +103,7 @@ model ServiceRequest {
   payment        Payment?
   reviews        Review[]
   postulaciones  Postulacion[]
+  presupuestos   Presupuesto[]
   categoria      ServiceCategory          @relation(fields: [categoryId], references: [id])
   cliente        User                     @relation("ClienteRequests", fields: [clienteId], references: [id])
   profesional    Professional?            @relation(fields: [profesionalId], references: [userId])
@@ -185,6 +186,33 @@ model Postulacion {
   @@map("postulaciones")
 }
 
+// Presupuesto real que el profesional envía tras ser elegido — sustituye
+// al antiguo precioEstimado (adivinado por el cliente al crear la
+// solicitud, nunca acordado con nadie). Dos modalidades: precio cerrado
+// (monto fijo) o por horas (tarifa × horas estimadas, el importe que se
+// autoriza en Stripe es ese techo). Sin @@unique a propósito, a
+// diferencia de Postulacion: puede haber varias filas para el mismo
+// profesional si el cliente rechaza una y llega una nueva — el control
+// de "solo un pendiente a la vez" se hace en el controlador, no aquí.
+model Presupuesto {
+  id               String            @id @default(uuid())
+  serviceRequestId String            @map("service_request_id")
+  profesionalId    String            @map("profesional_id")
+  tipo             TipoPresupuesto
+  monto            Decimal? // solo tipo=cerrado
+  tarifaHora       Decimal?          @map("tarifa_hora") // solo tipo=por_horas
+  horasEstimadas   Decimal?          @map("horas_estimadas") // solo tipo=por_horas
+  mensaje          String?
+  estado           EstadoPresupuesto @default(pendiente)
+  createdAt        DateTime          @default(now()) @map("created_at")
+  resueltaAt       DateTime?         @map("resuelta_at")
+  serviceRequest   ServiceRequest    @relation(fields: [serviceRequestId], references: [id])
+  profesional      Professional      @relation(fields: [profesionalId], references: [userId])
+
+  @@index([serviceRequestId, estado])
+  @@map("presupuestos")
+}
+
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model spatial_ref_sys {
   srid      Int     @id
@@ -233,6 +261,17 @@ enum EstadoPostulacion {
   pendiente
   aceptada
   rechazada
+}
+
+enum TipoPresupuesto {
+  cerrado
+  por_horas
+}
+
+enum EstadoPresupuesto {
+  pendiente
+  aceptado
+  rechazado
 }
 
 // Motivos fijos de reclamación — lista cerrada a propósito (en vez de

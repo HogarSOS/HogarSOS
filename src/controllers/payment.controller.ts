@@ -26,7 +26,10 @@ export async function createPaymentIntent(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({
     where: { id: serviceRequestId },
-    include: { payment: true },
+    include: {
+      payment: true,
+      presupuestos: { where: { estado: 'aceptado' }, orderBy: { createdAt: 'desc' }, take: 1 },
+    },
   });
 
   if (!solicitud) {
@@ -41,13 +44,19 @@ export async function createPaymentIntent(req: Request, res: Response) {
   if (solicitud.payment) {
     return res.status(409).json({ error: 'Ya existe un pago para esta solicitud' });
   }
-  if (!solicitud.precioEstimado) {
-    return res.status(409).json({ error: 'La solicitud no tiene un precio estimado definido' });
+  const presupuestoAceptado = solicitud.presupuestos[0];
+  if (!presupuestoAceptado) {
+    return res.status(409).json({ error: 'Todavía no hay un presupuesto aceptado para esta solicitud' });
   }
+
+  const montoTotal =
+    presupuestoAceptado.tipo === 'cerrado'
+      ? Number(presupuestoAceptado.monto)
+      : Number(presupuestoAceptado.tarifaHora) * Number(presupuestoAceptado.horasEstimadas);
 
   const { pago, clientSecret } = await createEscrowPaymentIntent({
     serviceRequestId,
-    montoTotal: Number(solicitud.precioEstimado),
+    montoTotal,
   });
 
   return res.status(201).json({

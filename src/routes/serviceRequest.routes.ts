@@ -16,6 +16,7 @@ import {
 } from '../controllers/serviceRequest.controller';
 import { createDispute } from '../controllers/dispute.controller';
 import { createPostulacion, listPostulaciones, selectPostulacion } from '../controllers/postulacion.controller';
+import { createPresupuesto, responderPresupuesto } from '../controllers/presupuesto.controller';
 
 const router = Router();
 
@@ -37,5 +38,7 @@ router.post('/:id/disputes', authMiddleware(['cliente', 'profesional']), asyncHa
 router.post('/:id/postulaciones', authMiddleware(['profesional']), asyncHandler(createPostulacion));
 router.get('/:id/postulaciones', authMiddleware(['cliente']), asyncHandler(listPostulaciones));
 router.post('/:id/postulaciones/:postulacionId/seleccionar', authMiddleware(['cliente']), asyncHandler(selectPostulacion));
+router.post('/:id/presupuesto', authMiddleware(['profesional']), asyncHandler(createPresupuesto));
+router.post('/:id/presupuesto/:presupuestoId/responder', authMiddleware(['cliente']), asyncHandler(responderPresupuesto));
 
 export default router;
