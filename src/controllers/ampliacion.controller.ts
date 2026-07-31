@@ -5,16 +5,18 @@ import { enviarNotificacion } from '../services/notification.service';
 import { razonBloqueoTexto } from '../utils/contactFilter';
 
 const createAmpliacionSchema = z.object({
-  horasAdicionales: z.number().positive(),
+  horasAdicionales: z.number().positive().optional(),
+  montoAdicional: z.number().positive().optional(),
   mensaje: z.string().trim().max(200).optional(),
 });
 
 /**
- * El profesional pide más horas cuando un trabajo "por_horas" se
- * alarga más de lo estimado — nunca se cobra el exceso fuera de la
- * app, hay que pasar por aquí y que el cliente lo acepte. Solo aplica
- * sobre el presupuesto ya aceptado de la solicitud (tiene que ser
- * "por_horas" — un presupuesto "cerrado" no tiene ampliaciones).
+ * El profesional pide más margen cuando el trabajo se complica más de
+ * lo previsto — nunca se cobra el exceso fuera de la app, hay que
+ * pasar por aquí y que el cliente lo acepte. Dos modalidades, igual
+ * que Presupuesto: si el presupuesto aceptado es "por_horas", pide
+ * horasAdicionales; si es "cerrado", pide montoAdicional directo (ej.
+ * "+40€, hay que sustituir una válvula").
  */
 export async function crearAmpliacion(req: Request, res: Response) {
   const { id } = req.params;
@@ -53,8 +55,12 @@ export async function crearAmpliacion(req: Request, res: Response) {
   if (!presupuesto) {
     return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud' });
   }
-  if (presupuesto.tipo !== 'por_horas') {
-    return res.status(409).json({ error: 'Solo se puede pedir una ampliación en un presupuesto por horas' });
+
+  if (presupuesto.tipo === 'por_horas' && !parsed.data.horasAdicionales) {
+    return res.status(400).json({ error: 'Indica las horas adicionales' });
+  }
+  if (presupuesto.tipo === 'cerrado' && !parsed.data.montoAdicional) {
+    return res.status(400).json({ error: 'Indica el importe adicional' });
   }
 
   const yaPendiente = await prisma.ampliacion.findFirst({
@@ -65,16 +71,18 @@ export async function crearAmpliacion(req: Request, res: Response) {
   }
 
   const ampliacion = await prisma.ampliacion.create({
-    data: {
-      presupuestoId: presupuesto.id,
-      horasAdicionales: parsed.data.horasAdicionales,
-      mensaje: parsed.data.mensaje,
-    },
+    data:
+      presupuesto.tipo === 'por_horas'
+        ? { presupuestoId: presupuesto.id, horasAdicionales: parsed.data.horasAdicionales, mensaje: parsed.data.mensaje }
+        : { presupuestoId: presupuesto.id, montoAdicional: parsed.data.montoAdicional, mensaje: parsed.data.mensaje },
   });
 
   enviarNotificacion(solicitud.clienteId, {
-    title: 'El profesional necesita más tiempo',
-    body: 'Ha pedido ampliar las horas del trabajo — revísalo para aceptar o rechazar',
+    title: presupuesto.tipo === 'por_horas' ? 'El profesional necesita más tiempo' : 'El profesional necesita un presupuesto adicional',
+    body:
+      presupuesto.tipo === 'por_horas'
+        ? 'Ha pedido ampliar las horas del trabajo — revísalo para aceptar o rechazar'
+        : 'Ha pedido ampliar el presupuesto del trabajo — revísalo para aceptar o rechazar',
   }, { tipo: 'nueva_ampliacion', solicitudId: id }).catch((e) =>
     console.error(`[crearAmpliacion] Error al notificar al cliente de ${id}:`, e)
   );
@@ -131,8 +139,8 @@ export async function responderAmpliacion(req: Request, res: Response) {
     title: nuevoEstado === 'aceptado' ? '¡Ampliación aceptada!' : 'Ampliación rechazada',
     body:
       nuevoEstado === 'aceptado'
-        ? 'El cliente ha aceptado tu petición de más horas — te avisaremos cuando autorice el pago adicional'
-        : 'El cliente ha rechazado tu petición de más horas',
+        ? 'El cliente ha aceptado tu petición de ampliación — te avisaremos cuando autorice el pago adicional'
+        : 'El cliente ha rechazado tu petición de ampliación',
   }, { tipo: nuevoEstado === 'aceptado' ? 'ampliacion_aceptada' : 'ampliacion_rechazada', solicitudId: id }).catch(
     (e) => console.error(`[responderAmpliacion] Error al notificar al profesional de ${id}:`, e)
   );

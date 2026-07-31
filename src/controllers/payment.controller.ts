@@ -72,7 +72,10 @@ export async function createPaymentIntent(req: Request, res: Response) {
       return res.status(409).json({ error: 'No hay nada pendiente de autorizar para esta solicitud' });
     }
     ampliacionId = ampliacionSinAutorizar.id;
-    montoTotal = Number(ampliacionSinAutorizar.horasAdicionales) * Number(presupuesto.tarifaHora);
+    montoTotal =
+      presupuesto.tipo === 'cerrado'
+        ? Number(ampliacionSinAutorizar.montoAdicional)
+        : Number(ampliacionSinAutorizar.horasAdicionales) * Number(presupuesto.tarifaHora);
   }
 
   const { pago, clientSecret } = await createEscrowPaymentIntent({

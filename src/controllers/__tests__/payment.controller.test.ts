@@ -148,6 +148,24 @@ describe('createPaymentIntent', () => {
     expect(res.status).toHaveBeenCalledWith(201);
   });
 
+  it('"cerrado": autoriza el montoAdicional de una ampliación aceptada', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(
+      solicitud({
+        presupuesto: { id: 'pres-1', tipo: 'cerrado', monto: 250 },
+        pagos: [{ presupuestoId: 'pres-1', ampliacionId: null }],
+        ampliaciones: [{ id: 'ampl-1', montoAdicional: 40 }],
+      })
+    );
+
+    const res = fakeRes();
+    await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
+
+    expect(mockCreateEscrow).toHaveBeenCalledWith(
+      expect.objectContaining({ presupuestoId: 'pres-1', ampliacionId: 'ampl-1', montoTotal: 40 })
+    );
+    expect(res.status).toHaveBeenCalledWith(201);
+  });
+
   it('devuelve 409 si la ampliación aceptada ya tiene su propia autorización', async () => {
     mockPrisma.serviceRequest.findUnique.mockResolvedValue(
       solicitud({

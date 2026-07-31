@@ -93,13 +93,38 @@ describe('crearAmpliacion', () => {
     expect(res.status).toHaveBeenCalledWith(409);
   });
 
-  it('devuelve 409 si el presupuesto aceptado es "cerrado" (no admite ampliación)', async () => {
+  it('"cerrado": crea la ampliación con montoAdicional', async () => {
+    mockPrisma.presupuesto.findFirst.mockResolvedValue({ id: 'pres-1', tipo: 'cerrado', estado: 'aceptado' });
+    mockPrisma.ampliacion.create.mockResolvedValue({ id: 'ampl-2', estado: 'pendiente' });
+
+    const res = fakeRes();
+    await crearAmpliacion(
+      fakeReq({ id: 'sr-1' }, 'pro-1', { montoAdicional: 40, mensaje: 'Hay que sustituir una válvula' }),
+      res
+    );
+
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(mockPrisma.ampliacion.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ presupuestoId: 'pres-1', montoAdicional: 40 }) })
+    );
+  });
+
+  it('"cerrado": devuelve 400 si falta el montoAdicional', async () => {
     mockPrisma.presupuesto.findFirst.mockResolvedValue({ id: 'pres-1', tipo: 'cerrado', estado: 'aceptado' });
 
     const res = fakeRes();
-    await crearAmpliacion(fakeReq({ id: 'sr-1' }, 'pro-1', { horasAdicionales: 2 }), res);
+    await crearAmpliacion(fakeReq({ id: 'sr-1' }, 'pro-1', {}), res);
 
-    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockPrisma.ampliacion.create).not.toHaveBeenCalled();
+  });
+
+  it('"por_horas": devuelve 400 si faltan las horasAdicionales', async () => {
+    const res = fakeRes();
+    await crearAmpliacion(fakeReq({ id: 'sr-1' }, 'pro-1', {}), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockPrisma.ampliacion.create).not.toHaveBeenCalled();
   });
 
   it('devuelve 409 si ya hay una ampliación pendiente', async () => {

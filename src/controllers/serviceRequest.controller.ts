@@ -43,7 +43,8 @@ function serializarPresupuesto(p: {
 /** Misma idea que serializarPresupuesto, para la última Ampliacion de un presupuesto (cualquier estado). */
 function serializarAmpliacion(a: {
   id: string;
-  horasAdicionales: Prisma.Decimal;
+  horasAdicionales: Prisma.Decimal | null;
+  montoAdicional: Prisma.Decimal | null;
   mensaje: string | null;
   estado: string;
   createdAt: Date;
@@ -51,7 +52,8 @@ function serializarAmpliacion(a: {
   if (!a) return null;
   return {
     id: a.id,
-    horasAdicionales: Number(a.horasAdicionales),
+    horasAdicionales: a.horasAdicionales ? Number(a.horasAdicionales) : null,
+    montoAdicional: a.montoAdicional ? Number(a.montoAdicional) : null,
     mensaje: a.mensaje,
     estado: a.estado,
     createdAt: a.createdAt,
@@ -876,6 +878,7 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
         cierreHoras: serializarCierreHoras(s.cierresHoras[0]),
         createdAt: s.createdAt,
         tienePago: s.pagos.length > 0,
+        payment: agregarPagos(s.pagos),
         tieneValoracion: s.reviews.some((r) => r.autorId === profesionalId),
       };
     }),

@@ -235,10 +235,16 @@ model Presupuesto {
 // modifica la autorización original, así funciona igual en cualquier
 // tarjeta/banco sin depender de la autorización incremental nativa de
 // Stripe, que no todas las tarjetas europeas soportan de forma fiable.
+// Dos modalidades, igual que Presupuesto: si el presupuesto es
+// "por_horas", horasAdicionales; si es "cerrado", montoAdicional
+// directo (ej. "+40€, hay que sustituir una válvula"). Exactamente una
+// de las dos viene rellena, según el tipo del presupuesto al que
+// pertenece — se valida en el controlador, no aquí.
 model Ampliacion {
   id               String            @id @default(uuid())
   presupuestoId    String            @map("presupuesto_id")
-  horasAdicionales Decimal           @map("horas_adicionales")
+  horasAdicionales Decimal?          @map("horas_adicionales")
+  montoAdicional   Decimal?          @map("monto_adicional")
   mensaje          String?
   estado           EstadoPresupuesto @default(pendiente)
   createdAt        DateTime          @default(now()) @map("created_at")
