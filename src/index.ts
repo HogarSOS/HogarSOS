@@ -78,11 +78,30 @@ app.use((req, res, next) => {
   next();
 });
 
-// Rate limit
+// Health Check — registrado antes del rate limiter a propósito: Render
+// hace ping a este endpoint constantemente y, si comparte el límite de
+// 200 peticiones/15min con el resto del tráfico, puede recibir 429 y
+// Render entiende eso como "backend caído" y reinicia el servicio.
+app.get('/health', (_req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    server: 'hogarSOS',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Rate limit — 200/15min se agotaba solo con el sondeo de
+// SeguimientoSolicitudScreen (una petición GET /:id cada 5s = 180 en
+// 15 minutos desde una única pantalla abierta), dejando casi ningún
+// margen para el resto de la app: cualquier acción real del cliente o
+// profesional (postularse, ver candidatos, borrar...) podía recibir
+// 429 y parecer "roto" sin ningún error explícito. 2000 deja margen
+// de sobra para varios testers/pantallas activas a la vez sin dejar
+// de proteger contra abuso.
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 200,
+    max: 2000,
   })
 );
 
@@ -90,15 +109,6 @@ app.use(
 // texto plano (ver paginaInicio en legal.routes.ts).
 app.get('/', (_req, res) => {
   res.status(200).send(paginaInicio());
-});
-
-// Health Check
-app.get('/health', (_req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    server: 'hogarSOS',
-    timestamp: new Date().toISOString(),
-  });
 });
 
 // Fotos subidas por los clientes (ver upload.controller.ts) — servidas
