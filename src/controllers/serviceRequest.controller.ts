@@ -966,27 +966,47 @@ export async function listMyServiceRequests(req: Request, res: Response) {
       pagos: true,
       reviews: true,
       profesional: { include: { user: { select: { nombre: true } } } },
+      presupuestos: {
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        include: { ampliaciones: { orderBy: { createdAt: 'desc' }, take: 1 } },
+      },
+      cierresHoras: { orderBy: { createdAt: 'desc' }, take: 1 },
     },
     orderBy: { createdAt: 'desc' },
     take: 50,
   });
 
   return res.json({
-    solicitudes: solicitudes.map((s) => ({
-      id: s.id,
-      categoria: s.categoria.nombre,
-      descripcion: s.descripcion,
-      profesionalNombre: s.profesional?.user.nombre ?? null,
-      estado: s.estado,
-      urgencia: s.urgencia,
-      precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
-      createdAt: s.createdAt,
-      tienePago: s.pagos.length > 0,
-      // Antes era "¿existe ALGUNA valoración?" — con reviews
-      // bidireccionales eso ya no distingue si fue el cliente o el
-      // profesional quien la dejó. Ahora comprueba específicamente si
-      // el cliente (el dueño de esta lista) ya valoró.
-      tieneValoracion: s.reviews.some((r) => r.autorId === clienteId),
-    })),
+    solicitudes: solicitudes.map((s) => {
+      const presupuesto = s.presupuestos[0];
+      const ampliacion = presupuesto?.ampliaciones[0];
+      const cierreHoras = s.cierresHoras[0];
+      return {
+        id: s.id,
+        categoria: s.categoria.nombre,
+        descripcion: s.descripcion,
+        profesionalNombre: s.profesional?.user.nombre ?? null,
+        estado: s.estado,
+        urgencia: s.urgencia,
+        precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
+        createdAt: s.createdAt,
+        tienePago: s.pagos.length > 0,
+        // Antes era "¿existe ALGUNA valoración?" — con reviews
+        // bidireccionales eso ya no distingue si fue el cliente o el
+        // profesional quien la dejó. Ahora comprueba específicamente si
+        // el cliente (el dueño de esta lista) ya valoró.
+        tieneValoracion: s.reviews.some((r) => r.autorId === clienteId),
+        // El listado no manda el presupuesto/ampliación/cierreHoras
+        // completos (eso ya vive en el detalle, seguimiento_solicitud_screen)
+        // — solo este booleano, para que la tarjeta de la lista pueda
+        // destacar visualmente "tienes algo pendiente de confirmar" sin
+        // que el cliente tenga que entrar a cada solicitud a comprobarlo.
+        requiereAccion:
+          presupuesto?.estado === 'pendiente' ||
+          ampliacion?.estado === 'pendiente' ||
+          cierreHoras?.estado === 'pendiente',
+      };
+    }),
   });
 }
