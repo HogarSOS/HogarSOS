@@ -58,10 +58,10 @@ function pagina(titulo: string, secciones: { titulo: string; texto: string }[], 
   ${cabeza(`${titulo} — hogarSOS`, `${titulo} de hogarSOS, la app que conecta clientes con profesionales de servicios a domicilio.`, ruta)}
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; color: #1a1a2e; line-height: 1.6; }
-    h1 { color: #3D4FE0; font-size: 26px; }
+    h1 { color: #1E8A5A; font-size: 26px; }
     h2 { font-size: 17px; margin-top: 32px; }
     p { font-size: 15px; color: #333; }
-    a { color: #3D4FE0; }
+    a { color: #1E8A5A; }
     header { border-bottom: 1px solid #e5e5f0; padding-bottom: 16px; margin-bottom: 24px; }
     .volver { display: inline-block; margin-bottom: 20px; font-size: 14px; text-decoration: none; }
   </style>
@@ -142,7 +142,7 @@ export function paginaInicio(): string {
     .logo .marca { display: flex; align-items: center; gap: 10px; }
     .logo .marca span { font-size: 24px; font-weight: 800; }
     .logo .marca span b { color: #FF6A4D; }
-    .proximamente { font-size: 15px; letter-spacing: 2px; text-transform: uppercase; color: #3D4FE0; font-weight: 700; }
+    .proximamente { font-size: 15px; letter-spacing: 2px; text-transform: uppercase; color: #1E8A5A; font-weight: 700; }
   </style>
 </head>
 <body>
@@ -151,8 +151,8 @@ export function paginaInicio(): string {
       <svg viewBox="0 0 100 100" width="48" height="48" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#3D4FE0"/>
-            <stop offset="100%" stop-color="#2635A8"/>
+            <stop offset="0%" stop-color="#1E8A5A"/>
+            <stop offset="100%" stop-color="#146B45"/>
           </linearGradient>
         </defs>
         <rect width="100" height="100" rx="22" fill="url(#bg)"/>
@@ -207,13 +207,13 @@ export function _paginaInicioCompleta(): string {
     .como-funciona h2 { text-align: center; font-size: 22px; margin: 0 0 36px; }
     .pasos { display: flex; flex-wrap: wrap; justify-content: center; gap: 28px; max-width: 820px; margin: 0 auto; }
     .paso { flex: 1 1 220px; max-width: 250px; text-align: center; }
-    .paso .num { width: 32px; height: 32px; line-height: 32px; border-radius: 50%; background: #3D4FE0; color: #fff; font-weight: 700; font-size: 14px; margin: 0 auto 12px; }
+    .paso .num { width: 32px; height: 32px; line-height: 32px; border-radius: 50%; background: #1E8A5A; color: #fff; font-weight: 700; font-size: 14px; margin: 0 auto 12px; }
     .paso h3 { font-size: 14.5px; margin: 0 0 6px; }
     .paso p { font-size: 13px; color: #666; line-height: 1.5; margin: 0; }
     .beta { text-align: center; padding: 40px 20px; }
     .beta p { font-size: 13.5px; color: #888; max-width: 420px; margin: 0 auto; }
     footer { text-align: center; padding: 16px 20px 48px; font-size: 13px; color: #888; }
-    footer a { color: #3D4FE0; text-decoration: none; margin: 0 8px; }
+    footer a { color: #1E8A5A; text-decoration: none; margin: 0 8px; }
   </style>
 </head>
 <body>
@@ -222,8 +222,8 @@ export function _paginaInicioCompleta(): string {
       <svg viewBox="0 0 100 100" width="40" height="40" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#3D4FE0"/>
-            <stop offset="100%" stop-color="#2635A8"/>
+            <stop offset="0%" stop-color="#1E8A5A"/>
+            <stop offset="100%" stop-color="#146B45"/>
           </linearGradient>
         </defs>
         <rect width="100" height="100" rx="22" fill="url(#bg)"/>
