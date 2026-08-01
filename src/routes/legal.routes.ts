@@ -55,7 +55,7 @@ function pagina(titulo: string, secciones: { titulo: string; texto: string }[], 
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
-  ${cabeza(`${titulo} — hogarSOS`, `${titulo} de hogarSOS, la app que conecta clientes con profesionales de servicios a domicilio.`, ruta)}
+  ${cabeza(`${titulo} — Hogar SOS`, `${titulo} de Hogar SOS, la app que conecta clientes con profesionales de servicios a domicilio.`, ruta)}
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 720px; margin: 0 auto; padding: 32px 20px 64px; color: #1a1a2e; line-height: 1.6; }
     h1 { color: #1E8A5A; font-size: 26px; }
@@ -79,11 +79,11 @@ router.get('/privacidad', (_req, res) => {
     pagina('Política de privacidad', [
       {
         titulo: '1. Quién trata tus datos',
-        texto: 'hogarSOS es una app que conecta a clientes con profesionales de servicios a domicilio. Somos responsables del tratamiento de los datos personales que recoge la aplicación, descritos en esta política.',
+        texto: 'Hogar SOS es una app que conecta a clientes con profesionales de servicios a domicilio. Somos responsables del tratamiento de los datos personales que recoge la aplicación, descritos en esta política.',
       },
       {
         titulo: '2. Qué datos recogemos',
-        texto: '• Datos de cuenta: nombre, email y teléfono al registrarte.\n• Ubicación: tu ubicación aproximada o precisa (con tu permiso) para mostrarte profesionales cercanos, o para que un profesional aparezca en las búsquedas de clientes cerca de él.\n• Fotos: las que adjuntes a una solicitud de servicio o a tu perfil.\n• Documentos de verificación (solo profesionales): documento de identidad, certificados y seguro de responsabilidad civil, usados exclusivamente para verificar tu identidad y aptitud antes de permitirte operar en la plataforma.\n• Datos de pago: gestionados directamente por Stripe, nuestro procesador de pagos — hogarSOS nunca almacena el número completo de tu tarjeta.\n• Mensajes de chat entre cliente y profesional de una misma solicitud.',
+        texto: '• Datos de cuenta: nombre, email y teléfono al registrarte.\n• Ubicación: tu ubicación aproximada o precisa (con tu permiso) para mostrarte profesionales cercanos, o para que un profesional aparezca en las búsquedas de clientes cerca de él.\n• Fotos: las que adjuntes a una solicitud de servicio o a tu perfil.\n• Documentos de verificación (solo profesionales): documento de identidad, certificados y seguro de responsabilidad civil, usados exclusivamente para verificar tu identidad y aptitud antes de permitirte operar en la plataforma.\n• Datos de pago: gestionados directamente por Stripe, nuestro procesador de pagos — Hogar SOS nunca almacena el número completo de tu tarjeta.\n• Mensajes de chat entre cliente y profesional de una misma solicitud.',
       },
       {
         titulo: '3. Para qué usamos tus datos',
@@ -111,7 +111,7 @@ router.get('/privacidad', (_req, res) => {
 
 /**
  * Página de inicio pública en la raíz del dominio (hogarsos.es) — antes
- * era el texto plano "hogarSOS API funcionando" (ver index.ts), nada
+ * era el texto plano "Hogar SOS API funcionando" (ver index.ts), nada
  * presentable si alguien visita el dominio directamente. Sencilla a
  * propósito: logo + qué es la app + enlaces legales, no una web de
  * marketing elaborada. El icono SVG reproduce (simplificado) la misma
@@ -132,8 +132,8 @@ export function paginaInicio(): string {
 <html lang="es">
 <head>
   ${cabeza(
-    'hogarSOS — Próximamente',
-    'hogarSOS está en camino. Muy pronto.',
+    'Hogar SOS — Próximamente',
+    'Hogar SOS está en camino. Muy pronto.',
     '/'
   )}
   <style>
@@ -160,7 +160,7 @@ export function paginaInicio(): string {
         <rect x="30" y="52" width="40" height="28" rx="6" fill="#fff"/>
         <circle cx="74" cy="28" r="7" fill="#FF6A4D"/>
       </svg>
-      <span>hogar<b>SOS</b></span>
+      <span>Hogar <b>SOS</b></span>
     </div>
     <div class="proximamente">Próximamente</div>
   </div>
@@ -176,8 +176,8 @@ export function _paginaInicioCompleta(): string {
 <html lang="es">
 <head>
   \${cabeza(
-    'hogarSOS — Profesionales de confianza para tu hogar',
-    'hogarSOS conecta a personas que necesitan un servicio a domicilio con profesionales verificados de su zona — electricidad, fontanería, limpieza y mucho más.',
+    'Hogar SOS — Profesionales de confianza para tu hogar',
+    'Hogar SOS conecta a personas que necesitan un servicio a domicilio con profesionales verificados de su zona — electricidad, fontanería, limpieza y mucho más.',
     '/'
   )}
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -231,10 +231,10 @@ export function _paginaInicioCompleta(): string {
         <rect x="30" y="52" width="40" height="28" rx="6" fill="#fff"/>
         <circle cx="74" cy="28" r="7" fill="#FF6A4D"/>
       </svg>
-      <span>hogar<b>SOS</b></span>
+      <span>Hogar <b>SOS</b></span>
     </div>
     <h1>Encuentra ayuda de confianza para tu hogar, cerca de ti</h1>
-    <p>hogarSOS conecta a personas que necesitan un servicio a domicilio con profesionales verificados de su zona — electricidad, fontanería, limpieza y mucho más.</p>
+    <p>Hogar SOS conecta a personas que necesitan un servicio a domicilio con profesionales verificados de su zona — electricidad, fontanería, limpieza y mucho más.</p>
   </div>
   <div class="features">
     <div class="feature">
@@ -298,10 +298,10 @@ export function _paginaInicioCompleta(): string {
     </div>
   </div>
   <div class="beta">
-    <p>hogarSOS está actualmente en fase beta. Si quieres ser de los primeros en probarlo, escríbenos.</p>
+    <p>Hogar SOS está actualmente en fase beta. Si quieres ser de los primeros en probarlo, escríbenos.</p>
   </div>
   <footer>
-    hogarSOS · <a href="/privacidad">Política de privacidad</a> · <a href="/terminos">Términos de servicio</a>
+    Hogar SOS · <a href="/privacidad">Política de privacidad</a> · <a href="/terminos">Términos de servicio</a>
   </footer>
 </body>
 </html>\`;
@@ -312,8 +312,8 @@ router.get('/terminos', (_req, res) => {
   res.send(
     pagina('Términos de servicio', [
       {
-        titulo: '1. Qué es hogarSOS',
-        texto: 'hogarSOS es una plataforma que conecta a clientes que necesitan un servicio a domicilio (electricidad, fontanería, limpieza, etc.) con profesionales independientes que los ofrecen. hogarSOS no presta los servicios directamente ni es empleador de los profesionales — actúa como intermediario entre ambas partes.',
+        titulo: '1. Qué es Hogar SOS',
+        texto: 'Hogar SOS es una plataforma que conecta a clientes que necesitan un servicio a domicilio (electricidad, fontanería, limpieza, etc.) con profesionales independientes que los ofrecen. Hogar SOS no presta los servicios directamente ni es empleador de los profesionales — actúa como intermediario entre ambas partes.',
       },
       {
         titulo: '2. Cuentas de usuario',
@@ -321,7 +321,7 @@ router.get('/terminos', (_req, res) => {
       },
       {
         titulo: '3. Pagos y comisión',
-        texto: 'El pago de un servicio se autoriza a través de Stripe al aceptar el trabajo, pero no se cobra hasta que el profesional marca el servicio como completado. hogarSOS retiene una comisión sobre el precio final del servicio; el resto se transfiere al profesional. Los precios los fija el profesional o se acuerdan entre ambas partes por chat.',
+        texto: 'El pago de un servicio se autoriza a través de Stripe al aceptar el trabajo, pero no se cobra hasta que el profesional marca el servicio como completado. Hogar SOS retiene una comisión sobre el precio final del servicio; el resto se transfiere al profesional. Los precios los fija el profesional o se acuerdan entre ambas partes por chat.',
       },
       {
         titulo: '4. Cancelaciones y reembolsos',
@@ -333,15 +333,15 @@ router.get('/terminos', (_req, res) => {
       },
       {
         titulo: '6. Responsabilidad',
-        texto: 'hogarSOS facilita el contacto y el pago entre cliente y profesional, pero no supervisa ni garantiza la calidad del trabajo realizado — la relación de servicio es directamente entre ambas partes. Recomendamos revisar las valoraciones de un profesional antes de contratarlo.',
+        texto: 'Hogar SOS facilita el contacto y el pago entre cliente y profesional, pero no supervisa ni garantiza la calidad del trabajo realizado — la relación de servicio es directamente entre ambas partes. Recomendamos revisar las valoraciones de un profesional antes de contratarlo.',
       },
       {
         titulo: '7. Conducta de los profesionales',
-        texto: 'Los profesionales verificados deben prestar el servicio con la diligencia y competencia propias de su oficio. hogarSOS puede suspender o revocar una cuenta que reciba valoraciones reiteradamente negativas, incumpla estos términos, o cuya verificación resulte fraudulenta.',
+        texto: 'Los profesionales verificados deben prestar el servicio con la diligencia y competencia propias de su oficio. Hogar SOS puede suspender o revocar una cuenta que reciba valoraciones reiteradamente negativas, incumpla estos términos, o cuya verificación resulte fraudulenta.',
       },
       {
         titulo: '8. Cambios en estos términos',
-        texto: 'Podemos actualizar estos términos; los cambios relevantes se notificarán dentro de la app antes de entrar en vigor. Seguir usando hogarSOS después de un cambio implica aceptarlo.',
+        texto: 'Podemos actualizar estos términos; los cambios relevantes se notificarán dentro de la app antes de entrar en vigor. Seguir usando Hogar SOS después de un cambio implica aceptarlo.',
       },
       {
         titulo: '9. Ley aplicable',
