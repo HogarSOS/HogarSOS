@@ -13,6 +13,28 @@ const createIntentSchema = z.object({
 });
 
 /**
+ * `payment.service.createEscrowPaymentIntent` crea la fila Payment (con
+ * estado 'retenido') en el mismo momento en que se crea el PaymentIntent
+ * en Stripe — ANTES de que el cliente confirme nada con el Payment
+ * Sheet. Si esa confirmación nunca llega a completarse (el SDK de Stripe
+ * falla al inicializarse, el usuario cierra la app, se cae la conexión a
+ * mitad...) la fila se queda ahí para siempre y bloquea cualquier
+ * reintento — el bug real detrás de "no se pudo procesar el pago,
+ * inténtalo de nuevo" seguido de "no hay nada pendiente de autorizar".
+ * Antes de tratar un pago existente como bloqueante, se comprueba su
+ * estado real en Stripe: si nunca llegó a confirmarse (o se canceló),
+ * no es una autorización real — se deja reintentar reutilizando el
+ * mismo PaymentIntent en vez de crear uno nuevo.
+ */
+const ESTADOS_STRIPE_ABANDONABLES = new Set(['requires_payment_method', 'canceled']);
+
+async function intentoAbandonado(pago: { stripePaymentIntentId: string | null }) {
+  if (!pago.stripePaymentIntentId) return null;
+  const paymentIntent = await stripe.paymentIntents.retrieve(pago.stripePaymentIntentId);
+  return ESTADOS_STRIPE_ABANDONABLES.has(paymentIntent.status) ? paymentIntent.client_secret : null;
+}
+
+/**
  * El cliente llama a esto para autorizar un cargo — puede ser la
  * autorización inicial (tras aceptar el presupuesto) o una autorización
  * adicional (tras aceptar una ampliación de horas): el endpoint decide
@@ -69,10 +91,32 @@ export async function createPaymentIntent(req: Request, res: Response) {
         ? Number(presupuesto.monto)
         : Number(presupuesto.tarifaHora) * Number(presupuesto.horasEstimadas);
   } else {
+    const reintentoInicial = await intentoAbandonado(pagoInicial);
+    if (reintentoInicial) {
+      return res.status(201).json({
+        paymentId: pagoInicial.id,
+        clientSecret: reintentoInicial,
+        montoBase: Number(pagoInicial.montoBase),
+        montoTotal: Number(pagoInicial.montoTotal),
+        comisionPlataforma: Number(pagoInicial.comisionPlataforma),
+      });
+    }
+
     const ampliacionSinAutorizar = presupuesto.ampliaciones.find(
       (a) => !solicitud.pagos.some((p) => p.ampliacionId === a.id)
     );
     if (!ampliacionSinAutorizar) {
+      const ultimoPagoAmpliacion = [...solicitud.pagos].reverse().find((p) => p.ampliacionId);
+      const reintentoAmpliacion = ultimoPagoAmpliacion ? await intentoAbandonado(ultimoPagoAmpliacion) : null;
+      if (reintentoAmpliacion && ultimoPagoAmpliacion) {
+        return res.status(201).json({
+          paymentId: ultimoPagoAmpliacion.id,
+          clientSecret: reintentoAmpliacion,
+          montoBase: Number(ultimoPagoAmpliacion.montoBase),
+          montoTotal: Number(ultimoPagoAmpliacion.montoTotal),
+          comisionPlataforma: Number(ultimoPagoAmpliacion.comisionPlataforma),
+        });
+      }
       return res.status(409).json({ error: 'No hay nada pendiente de autorizar para esta solicitud' });
     }
     ampliacionId = ampliacionSinAutorizar.id;
