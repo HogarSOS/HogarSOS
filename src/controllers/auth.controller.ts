@@ -49,23 +49,39 @@ export async function register(req: Request, res: Response) {
     return res.status(401).json({ error: 'Token de Firebase inválido' });
   }
 
-  if (!decoded.email) {
-    return res.status(400).json({ error: 'El token de Firebase no contiene un email' });
+  // El token de Firebase trae email (registro con email/contraseña) O
+  // phone_number (registro con teléfono/SMS) — nunca ninguno de los dos
+  // a la vez, según cómo se autenticó en el cliente. `telefono` del
+  // body es el campo de contacto opcional del formulario de email; si
+  // el registro fue por SMS, el número YA verificado por Firebase
+  // manda sobre cualquier cosa que viniera en el body.
+  const email = decoded.email ?? null;
+  const telefonoVerificado = decoded.phone_number ?? telefono ?? null;
+
+  if (!email && !telefonoVerificado) {
+    return res.status(400).json({ error: 'El token de Firebase no contiene ni email ni número de teléfono' });
   }
 
   // ÚNICO punto de todo el backend que decide "ya existe": busca por
-  // email en la tabla `users` de Postgres. Si esto devuelve un 409,
-  // es porque hay una fila real con ese email en tu base de datos en
-  // este momento — no hay otra ruta de código que pueda producir este
+  // firebaseUid (el mismo usuario de Firebase intentando registrarse
+  // dos veces), por email o por teléfono ya usados por OTRA cuenta. Si
+  // esto devuelve un 409, hay una fila real en tu base de datos ahora
+  // mismo que choca — no hay otra ruta de código que produzca este
   // mensaje. Log explícito para que quede constancia en el servidor.
-  const existente = await prisma.user.findUnique({ where: { email: decoded.email } });
+  const condicionesExistente: Array<{ firebaseUid: string } | { email: string } | { telefono: string }> = [
+    { firebaseUid: decoded.uid },
+  ];
+  if (email) condicionesExistente.push({ email });
+  if (telefonoVerificado) condicionesExistente.push({ telefono: telefonoVerificado });
+
+  const existente = await prisma.user.findFirst({ where: { OR: condicionesExistente } });
   if (existente) {
     console.log(
-      `[auth.register] 409: ya existe fila en Postgres para email=${decoded.email} ` +
+      `[auth.register] 409: ya existe fila en Postgres para email=${email} telefono=${telefonoVerificado} ` +
       `(id=${existente.id}, creado=${existente.createdAt.toISOString()}, firebaseUid=${existente.firebaseUid})`
     );
     return res.status(409).json({
-      error: 'Ya existe un usuario en la base de datos de hogarSOS con este email',
+      error: 'Ya existe un usuario en la base de datos de hogarSOS con este email o teléfono',
     });
   }
 
@@ -81,9 +97,9 @@ export async function register(req: Request, res: Response) {
     nuevoUsuario = await prisma.$transaction(async (tx) => {
       const usuario = await tx.user.create({
         data: {
-          email: decoded.email as string,
+          email,
           nombre,
-          telefono,
+          telefono: telefonoVerificado,
           role,
           firebaseUid: decoded.uid,
         },

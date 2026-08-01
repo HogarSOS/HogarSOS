@@ -266,7 +266,10 @@ export async function startStripeOnboarding(req: Request, res: Response) {
     const account = await stripe.accounts.create({
       type: 'express',
       country: 'ES',
-      email: profesional.user.email,
+      // Profesionales registrados solo por teléfono no tienen email —
+      // Stripe lo pedirá igualmente durante el propio onboarding
+      // (accountLink de más abajo) si hace falta.
+      email: profesional.user.email ?? undefined,
       capabilities: {
         transfers: { requested: true },
       },

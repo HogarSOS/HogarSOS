@@ -5,7 +5,7 @@ import { prisma } from '../config/prisma';
 function serializarUsuario(usuario: {
   id: string;
   nombre: string;
-  email: string;
+  email: string | null;
   telefono: string | null;
   fotoPerfilUrl: string | null;
   role: string;
