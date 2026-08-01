@@ -2,7 +2,7 @@ services:
   - type: web
     name: hogarsos-backend
     runtime: node
-    plan: free
+    plan: starter
     region: oregon
     # NODE_ENV=production (más abajo) hace que `npm install` a secas
     # omita devDependencies — y ahí viven typescript, los @types/* y el
@@ -19,14 +19,14 @@ services:
     buildCommand: npm install --include=dev && npx prisma generate && npm run build && npx prisma migrate deploy && npm prune --omit=dev
     startCommand: npm start
     healthCheckPath: /health
-    # El plan free de Render no admite discos persistentes: las fotos
-    # subidas a /uploads (perfil, verificación) se pierden en cada
-    # redeploy o reinicio del servicio. Al pasar a un plan de pago
-    # (Starter o superior), añadir aquí:
-    #   disk:
-    #     name: hogarsos-uploads
-    #     mountPath: /opt/render/project/src/uploads
-    #     sizeGB: 1
+    # El plan free de Render no admitía discos persistentes: las fotos
+    # subidas a /uploads (perfil, verificación) se perdían en cada
+    # redeploy o reinicio del servicio. Ya en Starter, disco persistente
+    # real para que esas fotos sobrevivan a los despliegues.
+    disk:
+      name: hogarsos-uploads
+      mountPath: /opt/render/project/src/uploads
+      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
