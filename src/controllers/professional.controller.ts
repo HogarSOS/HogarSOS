@@ -153,7 +153,7 @@ export async function updateMyProfile(req: Request, res: Response) {
 }
 
 const verificationSchema = z.object({
-  documentoIdentidadUrl: z.string().url(),
+  documentoIdentidadUrl: z.string().url().optional(),
   certificadosUrl: z.array(z.string().url()).optional(),
   seguroRcUrl: z.string().url().optional(),
   categoriaIds: z.array(z.number().int()).min(1),

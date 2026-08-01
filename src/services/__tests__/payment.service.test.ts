@@ -14,16 +14,18 @@ jest.mock('../../config/stripe', () => ({
 
 import { prisma } from '../../config/prisma';
 import { stripe } from '../../config/stripe';
-import { releasePayments, refundPayment, calcularComision } from '../payment.service';
+import { releasePayments, refundPayment, calcularDesglose } from '../payment.service';
 
 const mockPrisma = prisma as any;
 const mockStripe = stripe as any;
 
-describe('calcularComision', () => {
-  it('calcula la comisión de la plataforma (18% por defecto) y el resto para el profesional', () => {
-    const { comision, montoProfesional } = calcularComision(100);
-    expect(comision).toBe(18);
-    expect(montoProfesional).toBe(82);
+describe('calcularDesglose', () => {
+  it('calcula lo que paga el cliente (base+5%) y lo que recibe el profesional (base-5%) con el fallback por defecto', () => {
+    const { montoBase, montoTotalCliente, montoProfesional, comisionPlataforma } = calcularDesglose(100);
+    expect(montoBase).toBe(100);
+    expect(montoTotalCliente).toBe(105);
+    expect(montoProfesional).toBe(95);
+    expect(comisionPlataforma).toBe(10);
   });
 });
 
@@ -37,6 +39,7 @@ describe('releasePayments', () => {
     profesional: { stripeAccountId: 'acct_pro_1' },
   };
 
+  // Por defecto representa una autorización con base=100 (cliente 105, profesional 95).
   const pagoRetenido = (overrides: Partial<Record<string, unknown>> = {}) => ({
     id: 'pago-1',
     serviceRequestId: 'sr-1',
@@ -44,8 +47,9 @@ describe('releasePayments', () => {
     ampliacionId: null,
     estado: 'retenido',
     stripePaymentIntentId: 'pi_123',
-    montoTotal: 100,
-    montoProfesional: 82,
+    montoBase: 100,
+    montoTotal: 105,
+    montoProfesional: 95,
     ...overrides,
   });
 
@@ -81,7 +85,7 @@ describe('releasePayments', () => {
     );
   });
 
-  it('captura el total autorizado cuando el importe final lo cubre exactamente (caso "cerrado")', async () => {
+  it('captura el total autorizado cuando la base final lo cubre exactamente (caso "cerrado")', async () => {
     mockPrisma.payment.findMany.mockResolvedValue([pagoRetenido()]);
     mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
     mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_123', latest_charge: 'ch_456' });
@@ -92,35 +96,38 @@ describe('releasePayments', () => {
 
     // Sin amount_to_capture — captura completa, no parcial.
     expect(mockStripe.paymentIntents.capture).toHaveBeenCalledWith('pi_123', undefined);
+    // Se transfiere el montoProfesional YA FIJADO en la autorización (95€), no recalculado.
     expect(mockStripe.transfers.create).toHaveBeenCalledWith(
-      expect.objectContaining({ amount: 8200, destination: 'acct_pro_1' })
+      expect.objectContaining({ amount: 9500, destination: 'acct_pro_1' })
     );
   });
 
-  it('captura parcial cuando el importe final es menor que lo autorizado (horas reales por debajo de las estimadas)', async () => {
-    mockPrisma.payment.findMany.mockResolvedValue([pagoRetenido({ montoTotal: 100, montoProfesional: 82 })]);
+  it('captura parcial cuando la base final es menor que la autorizada (horas reales por debajo de las estimadas), escalando proporcionalmente lo ya fijado', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pagoRetenido()]); // base autorizada 100 (cliente 105, profesional 95)
     mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
     mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_123', latest_charge: 'ch_456' });
     mockStripe.transfers.create.mockResolvedValue({ id: 'tr_789' });
     mockPrisma.payment.update.mockResolvedValue({ estado: 'liberado' });
 
-    await releasePayments('sr-1', 75); // se autorizaron 100, solo se cobran 75
+    await releasePayments('sr-1', 75); // se autorizó una base de 100, solo se consume una base de 75 (75% de la autorización)
 
-    expect(mockStripe.paymentIntents.capture).toHaveBeenCalledWith('pi_123', { amount_to_capture: 7500 });
-    // Comisión (18%) recalculada sobre lo REALMENTE capturado (75), no sobre los 100 autorizados.
+    // 75% de 105€ cobrados al cliente = 78.75€
+    expect(mockStripe.paymentIntents.capture).toHaveBeenCalledWith('pi_123', { amount_to_capture: 7875 });
+    // 75% de los 95€ que iba a recibir el profesional = 71.25€ — proporción fijada en la autorización, no recalculada con el % vigente.
     expect(mockStripe.transfers.create).toHaveBeenCalledWith(
-      expect.objectContaining({ amount: 6150 })
+      expect.objectContaining({ amount: 7125 })
     );
   });
 
-  it('reparte entre varias autorizaciones (inicial + ampliación) hasta cubrir el importe final, y cancela la sobrante', async () => {
-    const pagoInicial = pagoRetenido({ id: 'pago-1', stripePaymentIntentId: 'pi_inicial', montoTotal: 100, montoProfesional: 82 });
+  it('reparte entre varias autorizaciones (inicial + ampliación) hasta cubrir la base final, y cancela la sobrante', async () => {
+    const pagoInicial = pagoRetenido({ id: 'pago-1', stripePaymentIntentId: 'pi_inicial', montoBase: 100, montoTotal: 105, montoProfesional: 95 });
     const pagoAmpliacion = pagoRetenido({
       id: 'pago-2',
       ampliacionId: 'ampl-1',
       stripePaymentIntentId: 'pi_ampliacion',
-      montoTotal: 50,
-      montoProfesional: 41,
+      montoBase: 50,
+      montoTotal: 52.5,
+      montoProfesional: 47.5,
     });
     mockPrisma.payment.findMany.mockResolvedValue([pagoInicial, pagoAmpliacion]);
     mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
@@ -130,22 +137,24 @@ describe('releasePayments', () => {
     mockStripe.transfers.create.mockResolvedValue({ id: 'tr_789' });
     mockPrisma.payment.update.mockResolvedValue({ estado: 'liberado' });
 
-    // Importe final 120: cubre los 100 de la inicial completos + 20 de los 50 de la ampliación.
+    // Base final 120: cubre los 100 de base de la inicial completos + 20 de los 50 de base de la ampliación (40%).
     await releasePayments('sr-1', 120);
 
     expect(mockStripe.paymentIntents.capture).toHaveBeenNthCalledWith(1, 'pi_inicial', undefined);
-    expect(mockStripe.paymentIntents.capture).toHaveBeenNthCalledWith(2, 'pi_ampliacion', { amount_to_capture: 2000 });
+    // 40% de los 52.5€ autorizados en la ampliación = 21€.
+    expect(mockStripe.paymentIntents.capture).toHaveBeenNthCalledWith(2, 'pi_ampliacion', { amount_to_capture: 2100 });
     expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
   });
 
-  it('cancela sin cobrar las autorizaciones que sobran una vez cubierto el importe final', async () => {
-    const pagoInicial = pagoRetenido({ id: 'pago-1', stripePaymentIntentId: 'pi_inicial', montoTotal: 100, montoProfesional: 82 });
+  it('cancela sin cobrar las autorizaciones que sobran una vez cubierta la base final', async () => {
+    const pagoInicial = pagoRetenido({ id: 'pago-1', stripePaymentIntentId: 'pi_inicial', montoBase: 100, montoTotal: 105, montoProfesional: 95 });
     const pagoAmpliacion = pagoRetenido({
       id: 'pago-2',
       ampliacionId: 'ampl-1',
       stripePaymentIntentId: 'pi_ampliacion',
-      montoTotal: 50,
-      montoProfesional: 41,
+      montoBase: 50,
+      montoTotal: 52.5,
+      montoProfesional: 47.5,
     });
     mockPrisma.payment.findMany.mockResolvedValue([pagoInicial, pagoAmpliacion]);
     mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
@@ -154,11 +163,12 @@ describe('releasePayments', () => {
     mockStripe.transfers.create.mockResolvedValue({ id: 'tr_789' });
     mockPrisma.payment.update.mockResolvedValue({ estado: 'liberado' });
 
-    // Importe final 90: cubre la inicial parcialmente, la ampliación sobra entera.
+    // Base final 90: cubre el 90% de la base de la inicial, la ampliación sobra entera.
     await releasePayments('sr-1', 90);
 
     expect(mockStripe.paymentIntents.capture).toHaveBeenCalledTimes(1);
-    expect(mockStripe.paymentIntents.capture).toHaveBeenCalledWith('pi_inicial', { amount_to_capture: 9000 });
+    // 90% de los 105€ autorizados en la inicial = 94.5€.
+    expect(mockStripe.paymentIntents.capture).toHaveBeenCalledWith('pi_inicial', { amount_to_capture: 9450 });
     expect(mockStripe.paymentIntents.cancel).toHaveBeenCalledWith('pi_ampliacion');
     expect(mockPrisma.payment.update).toHaveBeenCalledWith(
       expect.objectContaining({ where: { id: 'pago-2' }, data: expect.objectContaining({ estado: 'reembolsado' }) })

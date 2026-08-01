@@ -51,7 +51,7 @@ describe('createPaymentIntent', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockCreateEscrow.mockResolvedValue({
-      pago: { id: 'pago-1', montoTotal: 100, comisionPlataforma: 10 },
+      pago: { id: 'pago-1', montoBase: 95.24, montoTotal: 100, comisionPlataforma: 10 },
       clientSecret: 'secret_123',
     });
   });
@@ -65,7 +65,7 @@ describe('createPaymentIntent', () => {
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
 
     expect(mockCreateEscrow).toHaveBeenCalledWith(
-      expect.objectContaining({ serviceRequestId: SR_ID, presupuestoId: 'pres-1', montoTotal: 180, ampliacionId: undefined })
+      expect.objectContaining({ serviceRequestId: SR_ID, presupuestoId: 'pres-1', montoBase: 180, ampliacionId: undefined })
     );
     expect(res.status).toHaveBeenCalledWith(201);
   });
@@ -78,7 +78,7 @@ describe('createPaymentIntent', () => {
     const res = fakeRes();
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
 
-    expect(mockCreateEscrow).toHaveBeenCalledWith(expect.objectContaining({ montoTotal: 100 }));
+    expect(mockCreateEscrow).toHaveBeenCalledWith(expect.objectContaining({ montoBase: 100 }));
   });
 
   it('devuelve 409 si no hay ningún presupuesto aceptado', async () => {
@@ -143,7 +143,7 @@ describe('createPaymentIntent', () => {
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
 
     expect(mockCreateEscrow).toHaveBeenCalledWith(
-      expect.objectContaining({ presupuestoId: 'pres-1', ampliacionId: 'ampl-1', montoTotal: 50 })
+      expect.objectContaining({ presupuestoId: 'pres-1', ampliacionId: 'ampl-1', montoBase: 50 })
     );
     expect(res.status).toHaveBeenCalledWith(201);
   });
@@ -161,7 +161,7 @@ describe('createPaymentIntent', () => {
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
 
     expect(mockCreateEscrow).toHaveBeenCalledWith(
-      expect.objectContaining({ presupuestoId: 'pres-1', ampliacionId: 'ampl-1', montoTotal: 40 })
+      expect.objectContaining({ presupuestoId: 'pres-1', ampliacionId: 'ampl-1', montoBase: 40 })
     );
     expect(res.status).toHaveBeenCalledWith(201);
   });

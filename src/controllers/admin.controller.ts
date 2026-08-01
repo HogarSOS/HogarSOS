@@ -151,7 +151,7 @@ export async function resolveDispute(req: Request, res: Response) {
       const retenidos = await prisma.payment.findMany({
         where: { serviceRequestId: disputa.serviceRequestId, estado: 'retenido' },
       });
-      const importeFinal = retenidos.reduce((acc, p) => acc + Number(p.montoTotal), 0);
+      const importeFinal = retenidos.reduce((acc, p) => acc + Number(p.montoBase), 0);
       await releasePayments(disputa.serviceRequestId, importeFinal);
       await prisma.serviceRequest.update({
         where: { id: disputa.serviceRequestId },

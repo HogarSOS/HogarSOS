@@ -51,7 +51,7 @@ describe('completeServiceRequest', () => {
       clienteId: 'cliente-1',
       profesionalId: 'pro-1',
       estado: 'aceptada',
-      presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180 }],
+      presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180, ampliaciones: [] }],
     });
 
     const res = fakeRes();
@@ -62,6 +62,29 @@ describe('completeServiceRequest', () => {
     );
     expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 180);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ estado: 'completada' }));
+  });
+
+  it('"cerrado": suma al importe final las ampliaciones (montoAdicional) aceptadas, en vez de ignorarlas', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'aceptada',
+      presupuestos: [{
+        id: 'pres-1',
+        tipo: 'cerrado',
+        monto: 200,
+        ampliaciones: [{ id: 'ampl-1', montoAdicional: 50, estado: 'aceptado' }],
+      }],
+    });
+
+    const res = fakeRes();
+    await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
+
+    expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ estado: 'completada', precioFinal: 250 }) })
+    );
+    expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 250);
   });
 
   it('"por_horas": crea un CierreHoras pendiente y NO completa ni libera el pago todavía', async () => {
@@ -128,7 +151,7 @@ describe('completeServiceRequest', () => {
     mockPrisma.payment.findFirst.mockResolvedValue(null);
     mockPrisma.serviceRequest.findUnique.mockResolvedValue({
       id: 'sr-1', clienteId: 'cliente-1', profesionalId: 'pro-1', estado: 'aceptada',
-      presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180 }],
+      presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180, ampliaciones: [] }],
     });
 
     const res = fakeRes();
@@ -140,7 +163,7 @@ describe('completeServiceRequest', () => {
   it('devuelve 403 si no es el profesional asignado', async () => {
     mockPrisma.serviceRequest.findUnique.mockResolvedValue({
       id: 'sr-1', clienteId: 'cliente-1', profesionalId: 'otro-pro', estado: 'aceptada',
-      presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180 }],
+      presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180, ampliaciones: [] }],
     });
 
     const res = fakeRes();

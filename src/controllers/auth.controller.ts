@@ -93,7 +93,7 @@ export async function register(req: Request, res: Response) {
         await tx.professional.create({
           data: {
             userId: usuario.id,
-            documentoIdentidadUrl: '', // se completa en el flujo de verificación posterior
+            documentoIdentidadUrl: null, // opcional — se puede aportar en el flujo de verificación posterior
             tarifaBase: 0,
           },
         });

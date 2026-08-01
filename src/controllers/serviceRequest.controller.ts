@@ -80,7 +80,13 @@ function serializarCierreHoras(c: {
  * si no "liberado" si se liberó alguna, si no el resto de casos.
  */
 export function agregarPagos(
-  pagos: { estado: string; montoTotal: Prisma.Decimal; comisionPlataforma: Prisma.Decimal; montoProfesional: Prisma.Decimal }[]
+  pagos: {
+    estado: string;
+    montoBase: Prisma.Decimal;
+    montoTotal: Prisma.Decimal;
+    comisionPlataforma: Prisma.Decimal;
+    montoProfesional: Prisma.Decimal;
+  }[]
 ) {
   if (pagos.length === 0) return null;
 
@@ -93,11 +99,12 @@ export function agregarPagos(
         : 'reembolsado';
 
   const relevantes = pagos.filter((p) => p.estado === 'retenido' || p.estado === 'liberado');
-  const sumar = (clave: 'montoTotal' | 'comisionPlataforma' | 'montoProfesional') =>
+  const sumar = (clave: 'montoBase' | 'montoTotal' | 'comisionPlataforma' | 'montoProfesional') =>
     Number(relevantes.reduce((acc, p) => acc + Number(p[clave]), 0).toFixed(2));
 
   return {
     estado,
+    montoBase: sumar('montoBase'),
     montoTotal: sumar('montoTotal'),
     comisionPlataforma: sumar('comisionPlataforma'),
     montoProfesional: sumar('montoProfesional'),
@@ -676,7 +683,14 @@ export async function completeServiceRequest(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({
     where: { id },
-    include: { presupuestos: { where: { estado: 'aceptado' }, orderBy: { createdAt: 'desc' }, take: 1 } },
+    include: {
+      presupuestos: {
+        where: { estado: 'aceptado' },
+        orderBy: { createdAt: 'desc' },
+        take: 1,
+        include: { ampliaciones: { where: { estado: 'aceptado' } } },
+      },
+    },
   });
 
   if (!solicitud) {
@@ -730,7 +744,16 @@ export async function completeServiceRequest(req: Request, res: Response) {
     });
   }
 
-  const precioFinal = Number(presupuesto.monto);
+  // "cerrado": el importe final es el monto base más cualquier
+  // ampliación (montoAdicional) que el cliente haya aceptado — cada una
+  // tiene su propia autorización de Stripe retenida aparte (ver
+  // createPaymentIntent), y releasePayments necesita conocer la suma
+  // total para no dejarlas fuera y cancelarlas sin cobrar.
+  const montoAmpliaciones = presupuesto.ampliaciones.reduce(
+    (acc, a) => acc + Number(a.montoAdicional ?? 0),
+    0
+  );
+  const precioFinal = Number(presupuesto.monto) + montoAmpliaciones;
 
   await prisma.serviceRequest.update({
     where: { id },

@@ -2,7 +2,11 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { stripe } from '../config/stripe';
 import { prisma } from '../config/prisma';
-import { createEscrowPaymentIntent } from '../services/payment.service';
+import {
+  createEscrowPaymentIntent,
+  COMISION_CLIENTE_PORCENTAJE,
+  COMISION_PROFESIONAL_PORCENTAJE,
+} from '../services/payment.service';
 
 const createIntentSchema = z.object({
   serviceRequestId: z.string().uuid(),
@@ -56,11 +60,11 @@ export async function createPaymentIntent(req: Request, res: Response) {
 
   const pagoInicial = solicitud.pagos.find((p) => p.presupuestoId === presupuesto.id && !p.ampliacionId);
 
-  let montoTotal: number;
+  let montoBase: number;
   let ampliacionId: string | undefined;
 
   if (!pagoInicial) {
-    montoTotal =
+    montoBase =
       presupuesto.tipo === 'cerrado'
         ? Number(presupuesto.monto)
         : Number(presupuesto.tarifaHora) * Number(presupuesto.horasEstimadas);
@@ -72,7 +76,7 @@ export async function createPaymentIntent(req: Request, res: Response) {
       return res.status(409).json({ error: 'No hay nada pendiente de autorizar para esta solicitud' });
     }
     ampliacionId = ampliacionSinAutorizar.id;
-    montoTotal =
+    montoBase =
       presupuesto.tipo === 'cerrado'
         ? Number(ampliacionSinAutorizar.montoAdicional)
         : Number(ampliacionSinAutorizar.horasAdicionales) * Number(presupuesto.tarifaHora);
@@ -82,14 +86,29 @@ export async function createPaymentIntent(req: Request, res: Response) {
     serviceRequestId,
     presupuestoId: presupuesto.id,
     ampliacionId,
-    montoTotal,
+    montoBase,
   });
 
   return res.status(201).json({
     paymentId: pago.id,
     clientSecret,
+    montoBase: Number(pago.montoBase),
     montoTotal: Number(pago.montoTotal),
     comisionPlataforma: Number(pago.comisionPlataforma),
+  });
+}
+
+/**
+ * Porcentajes de comisión vigentes ahora mismo — cualquier usuario
+ * logueado puede consultarlos (cliente para ver cuánto pagará de más,
+ * profesional para ver cuánto recibirá de menos) antes de aceptar un
+ * presupuesto/ampliación. Puramente informativo: los importes reales
+ * se calculan y fijan en el backend al crear cada autorización.
+ */
+export async function getComisiones(_req: Request, res: Response) {
+  return res.json({
+    comisionClientePorcentaje: COMISION_CLIENTE_PORCENTAJE,
+    comisionProfesionalPorcentaje: COMISION_PROFESIONAL_PORCENTAJE,
   });
 }
 

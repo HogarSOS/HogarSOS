@@ -45,7 +45,7 @@ model ServiceCategory {
 
 model Professional {
   userId                String                    @id @map("user_id")
-  documentoIdentidadUrl String                    @map("documento_identidad_url")
+  documentoIdentidadUrl String?                   @map("documento_identidad_url")
   certificadosUrl       String[]                  @map("certificados_url")
   seguroRcUrl           String?                   @map("seguro_rc_url")
   estadoVerificacion    EstadoVerificacion        @default(pendiente) @map("estado_verificacion")
@@ -128,6 +128,7 @@ model Payment {
   serviceRequestId      String         @map("service_request_id")
   presupuestoId         String         @map("presupuesto_id")
   ampliacionId          String?        @map("ampliacion_id")
+  montoBase             Decimal        @map("monto_base")
   montoTotal            Decimal        @map("monto_total")
   comisionPlataforma    Decimal        @map("comision_plataforma")
   montoProfesional      Decimal        @map("monto_profesional")

@@ -1,7 +1,8 @@
 import { stripe } from '../config/stripe';
 import { prisma } from '../config/prisma';
 
-const COMISION_PLATAFORMA_PORCENTAJE = Number(process.env.PLATFORM_COMMISSION_PERCENT ?? 18);
+export const COMISION_CLIENTE_PORCENTAJE = Number(process.env.PLATFORM_COMMISSION_CLIENT_PERCENT ?? 5);
+export const COMISION_PROFESIONAL_PORCENTAJE = Number(process.env.PLATFORM_COMMISSION_PROFESSIONAL_PERCENT ?? 5);
 
 /**
  * Modelo de pago tipo escrow, usando Stripe Connect:
@@ -25,29 +26,46 @@ const COMISION_PLATAFORMA_PORCENTAJE = Number(process.env.PLATFORM_COMMISSION_PE
  *    captura a su cuenta Stripe Connect — la plataforma se queda con
  *    la comisión de cada una.
  *
+ * Modelo de comisión: el profesional cotiza un `montoBase` (lo que él
+ * cobra). El cliente paga `montoBase * (1 + %cliente)`, el profesional
+ * recibe `montoBase * (1 - %profesional)` — ambos porcentajes son
+ * variables de entorno independientes, sin ningún concepto de "promo"
+ * en el código: si en un momento dado ambas están a 0, es simplemente
+ * el valor vigente (la UI decide si eso merece un distintivo especial).
+ *
+ * IMPORTANTE: `releasePayments` NUNCA recalcula el desglose con los
+ * porcentajes vigentes en ese momento — los porcentajes pueden haber
+ * cambiado entre la autorización y la liberación (que puede ocurrir
+ * días después). En vez de eso, escala proporcionalmente los importes
+ * YA FIJADOS en cada autorización (`montoTotal`/`montoProfesional` de
+ * esa fila) según qué fracción de su `montoBase` autorizado se está
+ * consumiendo realmente. Así cada autorización honra el acuerdo con el
+ * que el cliente/profesional la aceptaron, pase lo que pase después.
+ *
  * Nota: Stripe autoriza los cargos por un máximo de ~7 días según el
  * método de pago. Si un servicio tarda más en completarse, haría falta
  * lógica adicional de re-autorización — no cubierto en este MVP.
  */
 
-export function calcularComision(montoTotal: number) {
-  const comision = Number((montoTotal * (COMISION_PLATAFORMA_PORCENTAJE / 100)).toFixed(2));
-  const montoProfesional = Number((montoTotal - comision).toFixed(2));
-  return { comision, montoProfesional };
+export function calcularDesglose(montoBase: number) {
+  const montoTotalCliente = Number((montoBase * (1 + COMISION_CLIENTE_PORCENTAJE / 100)).toFixed(2));
+  const montoProfesional = Number((montoBase * (1 - COMISION_PROFESIONAL_PORCENTAJE / 100)).toFixed(2));
+  const comisionPlataforma = Number((montoTotalCliente - montoProfesional).toFixed(2));
+  return { montoBase, montoTotalCliente, montoProfesional, comisionPlataforma };
 }
 
 export async function createEscrowPaymentIntent(params: {
   serviceRequestId: string;
   presupuestoId: string;
   ampliacionId?: string;
-  montoTotal: number;
+  montoBase: number;
   clienteStripeCustomerId?: string;
 }) {
-  const { serviceRequestId, presupuestoId, ampliacionId, montoTotal, clienteStripeCustomerId } = params;
-  const { comision, montoProfesional } = calcularComision(montoTotal);
+  const { serviceRequestId, presupuestoId, ampliacionId, montoBase, clienteStripeCustomerId } = params;
+  const { montoTotalCliente, montoProfesional, comisionPlataforma } = calcularDesglose(montoBase);
 
   const paymentIntent = await stripe.paymentIntents.create({
-    amount: Math.round(montoTotal * 100), // Stripe trabaja en céntimos
+    amount: Math.round(montoTotalCliente * 100), // Stripe trabaja en céntimos
     currency: 'eur',
     capture_method: 'manual', // clave del modelo escrow: autoriza sin capturar
     // Solo tarjeta: la cuenta tiene activados por defecto métodos como
@@ -67,8 +85,9 @@ export async function createEscrowPaymentIntent(params: {
       serviceRequestId,
       presupuestoId,
       ampliacionId,
-      montoTotal,
-      comisionPlataforma: comision,
+      montoBase,
+      montoTotal: montoTotalCliente,
+      comisionPlataforma,
       montoProfesional,
       estado: 'retenido',
       stripePaymentIntentId: paymentIntent.id,
@@ -87,7 +106,7 @@ export async function createEscrowPaymentIntent(params: {
  * (varias autorizaciones si hubo ampliaciones, la última se captura
  * solo en parte y el resto queda liberado en la tarjeta del cliente).
  */
-export async function releasePayments(serviceRequestId: string, importeFinal: number) {
+export async function releasePayments(serviceRequestId: string, baseFinal: number) {
   const pagos = await prisma.payment.findMany({
     where: { serviceRequestId, estado: 'retenido' },
     orderBy: { createdAt: 'asc' },
@@ -102,13 +121,13 @@ export async function releasePayments(serviceRequestId: string, importeFinal: nu
     throw new Error('PROFESIONAL_SIN_CUENTA_STRIPE');
   }
 
-  let restante = importeFinal;
+  let restanteBase = baseFinal;
   const resultados = [];
 
   for (const pago of pagos) {
     if (!pago.stripePaymentIntentId) throw new Error('SIN_PAYMENT_INTENT');
 
-    if (restante <= 0) {
+    if (restanteBase <= 0) {
       // Nada que cobrar de esta autorización — se cancela entera, el
       // cliente nunca llega a pagarla.
       await stripe.paymentIntents.cancel(pago.stripePaymentIntentId);
@@ -118,29 +137,42 @@ export async function releasePayments(serviceRequestId: string, importeFinal: nu
       continue;
     }
 
-    const montoAutorizado = Number(pago.montoTotal);
-    const aCapturar = Number(Math.min(restante, montoAutorizado).toFixed(2));
-    const capturaParcial = aCapturar < montoAutorizado;
+    const montoBaseAutorizado = Number(pago.montoBase);
+    const baseAConsumir = Number(Math.min(restanteBase, montoBaseAutorizado).toFixed(2));
+    const capturaParcial = baseAConsumir < montoBaseAutorizado;
+    const fraccion = baseAConsumir / montoBaseAutorizado;
+
+    // Escalamos lo YA FIJADO en esta autorización — nunca recalculamos
+    // el desglose con los porcentajes vigentes ahora mismo (ver nota en
+    // la cabecera del archivo). Con consumo completo usamos el valor
+    // exacto guardado, para no arrastrar el redondeo de la fracción.
+    const aCapturarCliente = capturaParcial
+      ? Number((Number(pago.montoTotal) * fraccion).toFixed(2))
+      : Number(pago.montoTotal);
+    const montoProfesionalTransfer = capturaParcial
+      ? Number((Number(pago.montoProfesional) * fraccion).toFixed(2))
+      : Number(pago.montoProfesional);
 
     // Capturar menos del importe autorizado libera automáticamente el
     // resto de esa autorización en Stripe — no hace falta cancelarla
     // aparte.
     const paymentIntentCapturado = await stripe.paymentIntents.capture(
       pago.stripePaymentIntentId,
-      capturaParcial ? { amount_to_capture: Math.round(aCapturar * 100) } : undefined
+      capturaParcial ? { amount_to_capture: Math.round(aCapturarCliente * 100) } : undefined
     );
 
     const chargeId = typeof paymentIntentCapturado.latest_charge === 'string'
       ? paymentIntentCapturado.latest_charge
       : paymentIntentCapturado.latest_charge?.id;
 
-    const { comision, montoProfesional } = calcularComision(aCapturar);
     const transfer = await stripe.transfers.create({
-      amount: Math.round(montoProfesional * 100),
+      amount: Math.round(montoProfesionalTransfer * 100),
       currency: 'eur',
       destination: solicitud.profesional.stripeAccountId,
       source_transaction: chargeId,
     });
+
+    const comisionReal = Number((aCapturarCliente - montoProfesionalTransfer).toFixed(2));
 
     resultados.push(
       await prisma.payment.update({
@@ -152,14 +184,15 @@ export async function releasePayments(serviceRequestId: string, importeFinal: nu
           // Se ajustan a lo REALMENTE capturado (puede ser menos que
           // lo autorizado) para que la suma de las filas "liberado"
           // refleje el dinero que de verdad se movió.
-          montoTotal: aCapturar,
-          comisionPlataforma: comision,
-          montoProfesional,
+          montoBase: baseAConsumir,
+          montoTotal: aCapturarCliente,
+          comisionPlataforma: comisionReal,
+          montoProfesional: montoProfesionalTransfer,
         },
       })
     );
 
-    restante = Number((restante - aCapturar).toFixed(2));
+    restanteBase = Number((restanteBase - baseAConsumir).toFixed(2));
   }
 
   return resultados;

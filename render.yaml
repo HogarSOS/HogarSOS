@@ -42,8 +42,10 @@ services:
         value: 15m
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
-      - key: PLATFORM_COMMISSION_PERCENT
-        value: "18"
+      - key: PLATFORM_COMMISSION_CLIENT_PERCENT
+        value: "0"
+      - key: PLATFORM_COMMISSION_PROFESSIONAL_PERCENT
+        value: "0"
       - key: REQUIRE_PROFESSIONAL_VERIFICATION
         value: "true"
       # Rellenar a mano en el dashboard de Render (Environment ->
