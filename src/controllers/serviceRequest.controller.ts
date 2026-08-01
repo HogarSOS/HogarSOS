@@ -10,6 +10,13 @@ import { enviarNotificacion, enviarNotificacionMasiva } from '../services/notifi
 
 const RADIO_BUSQUEDA_METROS = 50000; // 50 km, ajustable por categoría en el futuro
 
+// Pasadas estas horas sin que ningún profesional la acepte, una solicitud
+// deja de ofrecerse como "nueva disponible" en listNearbyRequests — no se
+// cancela ni se toca su estado (el cliente la sigue viendo pendiente en su
+// propia lista), simplemente ya no tiene sentido mostrarla como si acabara
+// de llegar.
+const SOLICITUD_EXPIRA_HORAS = 48;
+
 /**
  * Serializa el último Presupuesto de una solicitud (pendiente, aceptado
  * o rechazado — no solo el aceptado) para que el frontend distinga los
@@ -333,6 +340,8 @@ export async function listNearbyRequests(req: Request, res: Response) {
     return res.status(200).json({ solicitudes: [], aviso: 'No tienes categorías configuradas' });
   }
 
+  const noExpiradaDesde = new Date(Date.now() - SOLICITUD_EXPIRA_HORAS * 60 * 60 * 1000);
+
   // Distancia calculada desde la última ubicación conocida del profesional.
   // user_id es `text` en la BD (sin @db.Uuid) — sin cast a ::uuid aquí,
   // igual que en professional.controller.ts (ver comentario allí).
@@ -358,6 +367,7 @@ export async function listNearbyRequests(req: Request, res: Response) {
     LEFT JOIN postulaciones po ON po.service_request_id = sr.id AND po.profesional_id = ${profesionalId}
     WHERE sr.estado = 'pendiente'
       AND sr.category_id = ANY(${categoriaIds})
+      AND sr.created_at > ${noExpiradaDesde}
       AND p.ubicacion_actual IS NOT NULL
       AND ST_DWithin(sr.ubicacion, p.ubicacion_actual, ${RADIO_BUSQUEDA_METROS})
     ORDER BY distancia_metros ASC
