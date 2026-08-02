@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
+import { enviarNotificacion } from '../services/notification.service';
 
 const createReviewSchema = z.object({
   serviceRequestId: z.string().uuid(),
@@ -26,7 +27,7 @@ const createReviewSchema = z.object({
 export async function createReview(req: Request, res: Response) {
   const parsed = createReviewSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const { serviceRequestId, puntuacion, comentario } = parsed.data;
@@ -35,10 +36,10 @@ export async function createReview(req: Request, res: Response) {
   const solicitud = await prisma.serviceRequest.findUnique({ where: { id: serviceRequestId } });
 
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.estado !== 'completada') {
-    return res.status(409).json({ error: 'Solo se puede valorar un servicio ya completado' });
+    return res.status(409).json({ error: 'Solo se puede valorar un servicio ya completado', code: 'REVIEW_ONLY_COMPLETED' });
   }
 
   // Defensa en profundidad: el bloqueo principal ya lo da el estado
@@ -49,26 +50,26 @@ export async function createReview(req: Request, res: Response) {
     where: { serviceRequestId, estado: 'abierta' },
   });
   if (disputaAbierta) {
-    return res.status(409).json({ error: 'Existe una reclamación abierta — no se puede valorar hasta que se resuelva' });
+    return res.status(409).json({ error: 'Existe una reclamación abierta — no se puede valorar hasta que se resuelva', code: 'REVIEW_BLOCKED_BY_DISPUTE' });
   }
 
   let destinatarioId: string;
   if (solicitud.clienteId === autorId) {
     if (!solicitud.profesionalId) {
-      return res.status(409).json({ error: 'Esta solicitud no tiene profesional asignado' });
+      return res.status(409).json({ error: 'Esta solicitud no tiene profesional asignado', code: 'REQUEST_NO_PROFESSIONAL_ASSIGNED' });
     }
     destinatarioId = solicitud.profesionalId;
   } else if (solicitud.profesionalId === autorId) {
     destinatarioId = solicitud.clienteId;
   } else {
-    return res.status(403).json({ error: 'No participaste en esta solicitud, no puedes valorarla' });
+    return res.status(403).json({ error: 'No participaste en esta solicitud, no puedes valorarla', code: 'REVIEW_NOT_PARTICIPANT' });
   }
 
   const existente = await prisma.review.findUnique({
     where: { serviceRequestId_autorId: { serviceRequestId, autorId } },
   });
   if (existente) {
-    return res.status(409).json({ error: 'Ya has valorado esta solicitud' });
+    return res.status(409).json({ error: 'Ya has valorado esta solicitud', code: 'REVIEW_ALREADY_SENT' });
   }
 
   const resultado = await prisma.$transaction(async (tx) => {
@@ -106,6 +107,10 @@ export async function createReview(req: Request, res: Response) {
 
     return review;
   });
+
+  enviarNotificacion(destinatarioId, 'valoracion_recibida', { puntuacion }, { solicitudId: serviceRequestId }).catch((e) =>
+    console.error(`[createReview] Error al notificar a ${destinatarioId} de ${serviceRequestId}:`, e)
+  );
 
   return res.status(201).json(resultado);
 }

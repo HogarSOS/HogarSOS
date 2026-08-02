@@ -29,7 +29,7 @@ export function authMiddleware(allowedRoles?: JwtPayload['role'][]) {
     const authHeader = req.headers.authorization;
 
     if (!authHeader?.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Token no proporcionado' });
+      return res.status(401).json({ error: 'Token no proporcionado', code: 'AUTH_TOKEN_MISSING' });
     }
 
     const token = authHeader.split(' ')[1];
@@ -39,12 +39,12 @@ export function authMiddleware(allowedRoles?: JwtPayload['role'][]) {
       req.user = payload;
 
       if (allowedRoles && !allowedRoles.includes(payload.role)) {
-        return res.status(403).json({ error: 'No tienes permiso para esta acción' });
+        return res.status(403).json({ error: 'No tienes permiso para esta acción', code: 'AUTH_FORBIDDEN' });
       }
 
       next();
     } catch {
-      return res.status(401).json({ error: 'Token inválido o expirado' });
+      return res.status(401).json({ error: 'Token inválido o expirado', code: 'AUTH_TOKEN_INVALID' });
     }
   };
 }

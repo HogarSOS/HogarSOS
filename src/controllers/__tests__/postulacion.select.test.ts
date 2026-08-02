@@ -111,13 +111,15 @@ describe('selectPostulacion', () => {
 
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-elegido',
+      'postulacion_aceptada',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'postulacion_aceptada' })
+      expect.any(Object)
     );
     expect(mockEnviarNotificacionMasiva).toHaveBeenCalledWith(
       ['pro-2', 'pro-3'],
+      'postulacion_rechazada',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'postulacion_rechazada' })
+      expect.any(Object)
     );
   });
 

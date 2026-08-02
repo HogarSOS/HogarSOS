@@ -46,8 +46,9 @@ describe('createPostulacion', () => {
     expect(res.status).toHaveBeenCalledWith(201);
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'cliente-1',
+      'nueva_postulacion',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'nueva_postulacion' })
+      expect.any(Object)
     );
   });
 

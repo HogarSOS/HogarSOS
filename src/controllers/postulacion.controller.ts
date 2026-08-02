@@ -45,7 +45,7 @@ export async function createPostulacion(req: Request, res: Response) {
   const bloqueo = razonBloqueoTexto(datos.mensaje);
   if (bloqueo) {
     return res.status(400).json({
-      error: 'Por seguridad, los datos de contacto solo podrán compartirse cuando el trabajo haya sido aceptado.',
+      error: 'Por seguridad, los datos de contacto solo podrán compartirse cuando el trabajo haya sido aceptado.', code: 'CONTACT_INFO_BLOCKED',
       motivo: bloqueo,
     });
   }
@@ -55,15 +55,15 @@ export async function createPostulacion(req: Request, res: Response) {
     !profesional ||
     (REQUIRE_PROFESSIONAL_VERIFICATION && profesional.estadoVerificacion !== 'aprobado')
   ) {
-    return res.status(403).json({ error: 'No autorizado para postularte a solicitudes' });
+    return res.status(403).json({ error: 'No autorizado para postularte a solicitudes', code: 'APPLICATION_NOT_AUTHORIZED' });
   }
 
   const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.estado !== 'pendiente') {
-    return res.status(409).json({ error: 'Esta solicitud ya no está disponible' });
+    return res.status(409).json({ error: 'Esta solicitud ya no está disponible', code: 'REQUEST_NO_LONGER_AVAILABLE' });
   }
 
   try {
@@ -71,10 +71,7 @@ export async function createPostulacion(req: Request, res: Response) {
       data: { serviceRequestId: id, profesionalId, mensaje: datos.mensaje },
     });
 
-    enviarNotificacion(solicitud.clienteId, {
-      title: 'Nuevo profesional interesado',
-      body: 'Un profesional se ha postulado a tu solicitud',
-    }, { tipo: 'nueva_postulacion', solicitudId: id }).catch((e) =>
+    enviarNotificacion(solicitud.clienteId, 'nueva_postulacion', {}, { solicitudId: id }).catch((e) =>
       console.error(`[createPostulacion] Error al notificar al cliente de ${id}:`, e)
     );
 
@@ -83,7 +80,7 @@ export async function createPostulacion(req: Request, res: Response) {
     // Constraint único (serviceRequestId, profesionalId) — mismo
     // patrón que el de Review, ver schema.prisma.
     if (err?.code === 'P2002') {
-      return res.status(409).json({ error: 'Ya te has postulado a esta solicitud' });
+      return res.status(409).json({ error: 'Ya te has postulado a esta solicitud', code: 'APPLICATION_ALREADY_SENT' });
     }
     throw err;
   }
@@ -105,10 +102,10 @@ export async function listPostulaciones(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== clienteId) {
-    return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
+    return res.status(403).json({ error: 'No tienes acceso a esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
 
   const postulaciones = await prisma.$queryRaw<
@@ -155,15 +152,15 @@ export async function selectPostulacion(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== clienteId) {
-    return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
+    return res.status(403).json({ error: 'No tienes acceso a esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
 
   const postulacion = await prisma.postulacion.findUnique({ where: { id: postulacionId } });
   if (!postulacion || postulacion.serviceRequestId !== id) {
-    return res.status(404).json({ error: 'Candidatura no encontrada' });
+    return res.status(404).json({ error: 'Candidatura no encontrada', code: 'APPLICATION_NOT_FOUND' });
   }
 
   const otrasIds = await prisma.$transaction(async (tx) => {
@@ -194,7 +191,7 @@ export async function selectPostulacion(req: Request, res: Response) {
   });
 
   if (otrasIds === null) {
-    return res.status(409).json({ error: 'Esta solicitud ya no está disponible' });
+    return res.status(409).json({ error: 'Esta solicitud ya no está disponible', code: 'REQUEST_NO_LONGER_AVAILABLE' });
   }
 
   try {
@@ -203,18 +200,12 @@ export async function selectPostulacion(req: Request, res: Response) {
     console.error(`[selectPostulacion] Fallo al sincronizar Firestore para ${id}:`, firestoreErr);
   }
 
-  enviarNotificacion(postulacion.profesionalId, {
-    title: '¡Te han elegido!',
-    body: 'El cliente ha seleccionado tu candidatura',
-  }, { tipo: 'postulacion_aceptada', solicitudId: id }).catch((e) =>
+  enviarNotificacion(postulacion.profesionalId, 'postulacion_aceptada', {}, { solicitudId: id }).catch((e) =>
     console.error(`[selectPostulacion] Error al notificar al elegido de ${id}:`, e)
   );
 
   if (otrasIds.length > 0) {
-    enviarNotificacionMasiva(otrasIds, {
-      title: 'Selección finalizada',
-      body: 'El cliente ha seleccionado a otro profesional. Gracias por tu interés.',
-    }, { tipo: 'postulacion_rechazada', solicitudId: id }).catch((e) =>
+    enviarNotificacionMasiva(otrasIds, 'postulacion_rechazada', {}, { solicitudId: id }).catch((e) =>
       console.error(`[selectPostulacion] Error al notificar a los descartados de ${id}:`, e)
     );
   }

@@ -48,8 +48,9 @@ describe('createPresupuesto', () => {
     );
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'cliente-1',
+      'nuevo_presupuesto',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'nuevo_presupuesto' })
+      expect.any(Object)
     );
   });
 

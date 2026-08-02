@@ -34,16 +34,16 @@ export async function createDispute(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== userId && solicitud.profesionalId !== userId) {
-    return res.status(403).json({ error: 'No participas en esta solicitud' });
+    return res.status(403).json({ error: 'No participas en esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
   if (!['aceptada', 'en_progreso', 'completada'].includes(solicitud.estado)) {
-    return res.status(409).json({ error: 'Solo se puede reportar un problema en un trabajo aceptado' });
+    return res.status(409).json({ error: 'Solo se puede reportar un problema en un trabajo aceptado', code: 'DISPUTE_ONLY_ON_ACCEPTED_JOB' });
   }
   if (solicitud.estado === 'disputada') {
-    return res.status(409).json({ error: 'Ya existe una reclamación abierta para este trabajo' });
+    return res.status(409).json({ error: 'Ya existe una reclamación abierta para este trabajo', code: 'DISPUTE_ALREADY_OPEN' });
   }
 
   const dispute = await prisma.$transaction(async (tx) => {
@@ -62,10 +62,7 @@ export async function createDispute(req: Request, res: Response) {
 
   const otraParteId = solicitud.clienteId === userId ? solicitud.profesionalId : solicitud.clienteId;
   if (otraParteId) {
-    enviarNotificacion(otraParteId, {
-      title: 'Reclamación abierta',
-      body: 'Se ha abierto una reclamación sobre un trabajo — nuestro equipo lo está revisando',
-    }, { tipo: 'reclamacion_abierta', solicitudId: id }).catch((e) =>
+    enviarNotificacion(otraParteId, 'reclamacion_abierta', {}, { solicitudId: id }).catch((e) =>
       console.error(`[createDispute] Error al notificar a ${otraParteId} de ${id}:`, e)
     );
   }

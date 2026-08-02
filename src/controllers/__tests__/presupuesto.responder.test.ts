@@ -54,8 +54,9 @@ describe('responderPresupuesto', () => {
     );
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
+      'presupuesto_aceptado',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'presupuesto_aceptado' })
+      expect.any(Object)
     );
     expect(res.json).toHaveBeenCalledWith({ id: 'pres-1', estado: 'aceptado' });
   });
@@ -69,8 +70,9 @@ describe('responderPresupuesto', () => {
     );
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
+      'presupuesto_rechazado',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'presupuesto_rechazado' })
+      expect.any(Object)
     );
   });
 

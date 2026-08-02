@@ -6,7 +6,7 @@ import { prisma } from '../config/prisma';
 import { firestore } from '../config/firebase';
 import { releasePayments, refundPayment } from '../services/payment.service';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
-import { enviarNotificacion, enviarNotificacionMasiva } from '../services/notification.service';
+import { enviarNotificacion, enviarNotificacionMasiva, enviarNotificacionCruda } from '../services/notification.service';
 
 const RADIO_BUSQUEDA_METROS = 50000; // 50 km, ajustable por categoría en el futuro
 
@@ -161,7 +161,7 @@ const createRequestSchema = z.object({
 export async function createServiceRequest(req: Request, res: Response) {
   const parsed = createRequestSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const {
@@ -177,12 +177,12 @@ export async function createServiceRequest(req: Request, res: Response) {
   const clienteId = req.user!.userId;
 
   if (urgencia === 'fecha_especifica' && !fechaDeseada) {
-    return res.status(400).json({ error: 'fechaDeseada es obligatoria cuando urgencia es "fecha_especifica"' });
+    return res.status(400).json({ error: 'fechaDeseada es obligatoria cuando urgencia es "fecha_especifica"', code: 'REQUEST_DATE_REQUIRED' });
   }
 
   const categoria = await prisma.serviceCategory.findUnique({ where: { id: categoryId } });
   if (!categoria || !categoria.activo) {
-    return res.status(404).json({ error: 'Categoría de servicio no válida' });
+    return res.status(404).json({ error: 'Categoría de servicio no válida', code: 'CATEGORY_INVALID' });
   }
 
   const [solicitud] = await prisma.$queryRaw<{ id: string }[]>`
@@ -236,8 +236,9 @@ async function notificarProfesionalesCercanos(
 
   await enviarNotificacionMasiva(
     profesionales.map((p) => p.user_id),
-    { title: 'Nueva solicitud cerca de ti', body: `Alguien necesita ${categoriaNombre.toLowerCase()} cerca de tu ubicación` },
-    { tipo: 'nueva_solicitud', solicitudId }
+    'nueva_solicitud',
+    { categoria: categoriaNombre },
+    { solicitudId }
   );
 }
 
@@ -266,7 +267,7 @@ export async function getServiceRequestById(req: Request, res: Response) {
   });
 
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
 
   // Un cliente o profesional solo puede ver sus propias solicitudes;
@@ -274,7 +275,7 @@ export async function getServiceRequestById(req: Request, res: Response) {
   // row-level security recomendado a nivel de base de datos.
   const esParticipante = solicitud.clienteId === userId || solicitud.profesionalId === userId;
   if (role !== 'admin' && !esParticipante) {
-    return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
+    return res.status(403).json({ error: 'No tienes acceso a esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
 
   const presupuesto = solicitud.presupuestos[0];
@@ -324,11 +325,11 @@ export async function listNearbyRequests(req: Request, res: Response) {
   });
 
   if (!profesional) {
-    return res.status(404).json({ error: 'Perfil de profesional no encontrado' });
+    return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
 
   if (REQUIRE_PROFESSIONAL_VERIFICATION && profesional.estadoVerificacion !== 'aprobado') {
-    return res.status(403).json({ error: 'Tu cuenta aún no ha sido verificada' });
+    return res.status(403).json({ error: 'Tu cuenta aún no ha sido verificada', code: 'ACCOUNT_NOT_VERIFIED' });
   }
 
   if (!profesional.disponible) {
@@ -428,10 +429,7 @@ export async function cancelServiceRequest(req: Request, res: Response) {
     }
 
     if (actual.profesionalId) {
-      enviarNotificacion(actual.profesionalId, {
-        title: 'Solicitud cancelada',
-        body: 'El cliente ha cancelado un trabajo que tenías asignado',
-      }, { tipo: 'solicitud_cancelada', solicitudId: id }).catch((e) =>
+      enviarNotificacion(actual.profesionalId, 'solicitud_cancelada', {}, { solicitudId: id }).catch((e) =>
         console.error(`[cancelServiceRequest] Error al notificar al profesional de ${id}:`, e)
       );
     }
@@ -439,13 +437,13 @@ export async function cancelServiceRequest(req: Request, res: Response) {
     return res.json({ id, estado: 'cancelada' });
   } catch (err) {
     if (err instanceof Error && err.message === 'NOT_FOUND') {
-      return res.status(404).json({ error: 'Solicitud no encontrada' });
+      return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
     }
     if (err instanceof Error && err.message === 'NO_AUTORIZADO') {
-      return res.status(403).json({ error: 'Solo el cliente que creó esta solicitud puede cancelarla' });
+      return res.status(403).json({ error: 'Solo el cliente que creó esta solicitud puede cancelarla', code: 'REQUEST_ONLY_CREATOR_CANCEL' });
     }
     if (err instanceof Error && err.message === 'YA_NO_CANCELABLE') {
-      return res.status(409).json({ error: 'Esta solicitud ya no se puede cancelar — el profesional ya empezó o ya se resolvió' });
+      return res.status(409).json({ error: 'Esta solicitud ya no se puede cancelar — el profesional ya empezó o ya se resolvió', code: 'REQUEST_CANNOT_CANCEL' });
     }
     throw err;
   }
@@ -465,13 +463,13 @@ export async function deleteServiceRequest(req: Request, res: Response) {
 
   const actual = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!actual) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (actual.clienteId !== clienteId) {
-    return res.status(403).json({ error: 'Solo el cliente que creó esta solicitud puede borrarla' });
+    return res.status(403).json({ error: 'Solo el cliente que creó esta solicitud puede borrarla', code: 'REQUEST_ONLY_CREATOR_DELETE' });
   }
   if (actual.profesionalId !== null || !['pendiente', 'cancelada'].includes(actual.estado)) {
-    return res.status(409).json({ error: 'Solo se pueden borrar solicitudes que nadie llegó a aceptar' });
+    return res.status(409).json({ error: 'Solo se pueden borrar solicitudes que nadie llegó a aceptar', code: 'REQUEST_CANNOT_DELETE_ACCEPTED' });
   }
 
   await prisma.serviceRequest.delete({ where: { id } });
@@ -494,10 +492,10 @@ export async function archiveServiceRequest(req: Request, res: Response) {
 
   const actual = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!actual) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (!['completada', 'cancelada'].includes(actual.estado)) {
-    return res.status(409).json({ error: 'Solo se pueden archivar solicitudes completadas o canceladas' });
+    return res.status(409).json({ error: 'Solo se pueden archivar solicitudes completadas o canceladas', code: 'REQUEST_CANNOT_ARCHIVE' });
   }
 
   if (actual.clienteId === userId) {
@@ -508,7 +506,7 @@ export async function archiveServiceRequest(req: Request, res: Response) {
     await prisma.serviceRequest.update({ where: { id }, data: { archivadoProfesional: true } });
     return res.status(204).send();
   }
-  return res.status(403).json({ error: 'No participas en esta solicitud' });
+  return res.status(403).json({ error: 'No participas en esta solicitud', code: 'REQUEST_NO_ACCESS' });
 }
 
 /**
@@ -550,13 +548,13 @@ export async function syncChat(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== userId && solicitud.profesionalId !== userId) {
-    return res.status(403).json({ error: 'No participas en esta solicitud' });
+    return res.status(403).json({ error: 'No participas en esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
   if (!solicitud.profesionalId) {
-    return res.status(409).json({ error: 'Esta solicitud todavía no tiene profesional asignado' });
+    return res.status(409).json({ error: 'Esta solicitud todavía no tiene profesional asignado', code: 'REQUEST_NO_PROFESSIONAL_ASSIGNED' });
   }
 
   await sincronizarChatFirestore(id, solicitud.clienteId, solicitud.profesionalId);
@@ -583,7 +581,7 @@ export async function notifyChatMessage(req: Request, res: Response) {
 
   const parsed = chatNotifySchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Falta el texto del mensaje' });
+    return res.status(400).json({ error: 'Falta el texto del mensaje', code: 'CHAT_MESSAGE_REQUIRED' });
   }
 
   const solicitud = await prisma.serviceRequest.findUnique({
@@ -596,10 +594,10 @@ export async function notifyChatMessage(req: Request, res: Response) {
     },
   });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== userId && solicitud.profesionalId !== userId) {
-    return res.status(403).json({ error: 'No participas en esta solicitud' });
+    return res.status(403).json({ error: 'No participas en esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
 
   const esCliente = solicitud.clienteId === userId;
@@ -614,7 +612,7 @@ export async function notifyChatMessage(req: Request, res: Response) {
   // "Nuevo mensaje" genérico) para que se vea igual que cualquier app de
   // mensajería normal — el cuerpo es el mensaje en sí, recortado por si
   // alguien manda un texto larguísimo.
-  enviarNotificacion(
+  enviarNotificacionCruda(
     destinatarioId,
     { title: remitenteNombre, body: parsed.data.texto.slice(0, 150) },
     { tipo: 'chat_mensaje', solicitudId: id }
@@ -644,10 +642,10 @@ export async function markChatRead(req: Request, res: Response) {
     select: { clienteId: true, profesionalId: true },
   });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== userId && solicitud.profesionalId !== userId) {
-    return res.status(403).json({ error: 'No participas en esta solicitud' });
+    return res.status(403).json({ error: 'No participas en esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
 
   const campo = solicitud.clienteId === userId ? 'lastReadCliente' : 'lastReadProfesional';
@@ -688,7 +686,7 @@ export async function completeServiceRequest(req: Request, res: Response) {
 
   const parsed = completeRequestSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos' });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID' });
   }
 
   const solicitud = await prisma.serviceRequest.findUnique({
@@ -704,45 +702,42 @@ export async function completeServiceRequest(req: Request, res: Response) {
   });
 
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.profesionalId !== profesionalId) {
-    return res.status(403).json({ error: 'No eres el profesional asignado a esta solicitud' });
+    return res.status(403).json({ error: 'No eres el profesional asignado a esta solicitud', code: 'NOT_ASSIGNED_PROFESSIONAL' });
   }
   if (solicitud.estado !== 'aceptada' && solicitud.estado !== 'en_progreso') {
-    return res.status(409).json({ error: 'La solicitud no está en un estado válido para completarse' });
+    return res.status(409).json({ error: 'La solicitud no está en un estado válido para completarse', code: 'REQUEST_INVALID_STATE_COMPLETE' });
   }
 
   const pagoExistente = await prisma.payment.findFirst({ where: { serviceRequestId: id, estado: 'retenido' } });
   if (!pagoExistente) {
     return res.status(409).json({
-      error: 'El cliente aún no ha autorizado el pago de este servicio',
+      error: 'El cliente aún no ha autorizado el pago de este servicio', code: 'PAYMENT_NOT_AUTHORIZED',
     });
   }
 
   const presupuesto = solicitud.presupuestos[0];
   if (!presupuesto) {
-    return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud' });
+    return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud', code: 'NO_ACCEPTED_BUDGET' });
   }
 
   if (presupuesto.tipo === 'por_horas') {
     if (!parsed.data.horasReales) {
-      return res.status(400).json({ error: 'Indica las horas reales trabajadas' });
+      return res.status(400).json({ error: 'Indica las horas reales trabajadas', code: 'HOURS_REQUIRED' });
     }
 
     const yaPendiente = await prisma.cierreHoras.findFirst({ where: { serviceRequestId: id, estado: 'pendiente' } });
     if (yaPendiente) {
-      return res.status(409).json({ error: 'Ya hay un cierre pendiente de confirmación del cliente' });
+      return res.status(409).json({ error: 'Ya hay un cierre pendiente de confirmación del cliente', code: 'HOURS_CLOSURE_ALREADY_PENDING' });
     }
 
     const cierre = await prisma.cierreHoras.create({
       data: { serviceRequestId: id, horasReales: parsed.data.horasReales },
     });
 
-    enviarNotificacion(solicitud.clienteId, {
-      title: 'El profesional ha terminado el trabajo',
-      body: 'Confirma las horas trabajadas para liberar el pago',
-    }, { tipo: 'cierre_horas_pendiente', solicitudId: id }).catch((e) =>
+    enviarNotificacion(solicitud.clienteId, 'cierre_horas_pendiente', {}, { solicitudId: id }).catch((e) =>
       console.error(`[completeServiceRequest] Error al notificar al cliente de ${id}:`, e)
     );
 
@@ -770,10 +765,7 @@ export async function completeServiceRequest(req: Request, res: Response) {
     data: { estado: 'completada', precioFinal, completadaAt: new Date() },
   });
 
-  enviarNotificacion(solicitud.clienteId, {
-    title: 'Servicio completado',
-    body: '¿Qué tal fue? Cuéntaselo a otros valorando al profesional',
-  }, { tipo: 'solicitud_completada', solicitudId: id }).catch((e) =>
+  enviarNotificacion(solicitud.clienteId, 'solicitud_completada', {}, { solicitudId: id }).catch((e) =>
     console.error(`[completeServiceRequest] Error al notificar al cliente de ${id}:`, e)
   );
 
@@ -816,7 +808,7 @@ export async function responderCierreHoras(req: Request, res: Response) {
 
   const parsed = responderCierreHorasSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Falta indicar si aceptas o rechazas las horas declaradas' });
+    return res.status(400).json({ error: 'Falta indicar si aceptas o rechazas las horas declaradas', code: 'HOURS_DECISION_REQUIRED' });
   }
 
   const solicitud = await prisma.serviceRequest.findUnique({
@@ -824,15 +816,15 @@ export async function responderCierreHoras(req: Request, res: Response) {
     include: { presupuestos: { where: { estado: 'aceptado' }, orderBy: { createdAt: 'desc' }, take: 1 } },
   });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== clienteId) {
-    return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
+    return res.status(403).json({ error: 'No tienes acceso a esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
 
   const cierre = await prisma.cierreHoras.findUnique({ where: { id: cierreId } });
   if (!cierre || cierre.serviceRequestId !== id) {
-    return res.status(404).json({ error: 'Cierre no encontrado' });
+    return res.status(404).json({ error: 'Cierre no encontrado', code: 'HOURS_CLOSURE_NOT_FOUND' });
   }
 
   if (parsed.data.accion === 'rechazar') {
@@ -841,13 +833,10 @@ export async function responderCierreHoras(req: Request, res: Response) {
       data: { estado: 'rechazado', resueltaAt: new Date() },
     });
     if (count === 0) {
-      return res.status(409).json({ error: 'Este cierre ya no está pendiente de respuesta' });
+      return res.status(409).json({ error: 'Este cierre ya no está pendiente de respuesta', code: 'HOURS_CLOSURE_NOT_PENDING' });
     }
     if (solicitud.profesionalId) {
-      enviarNotificacion(solicitud.profesionalId, {
-        title: 'El cliente no está de acuerdo con las horas',
-        body: 'Habladlo por chat, o el cliente puede abrir una reclamación si no llegáis a un acuerdo',
-      }, { tipo: 'cierre_horas_rechazado', solicitudId: id }).catch((e) =>
+      enviarNotificacion(solicitud.profesionalId, 'cierre_horas_rechazado', {}, { solicitudId: id }).catch((e) =>
         console.error(`[responderCierreHoras] Error al notificar al profesional de ${id}:`, e)
       );
     }
@@ -856,7 +845,7 @@ export async function responderCierreHoras(req: Request, res: Response) {
 
   const presupuesto = solicitud.presupuestos[0];
   if (!presupuesto) {
-    return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud' });
+    return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud', code: 'NO_ACCEPTED_BUDGET' });
   }
 
   const { count } = await prisma.cierreHoras.updateMany({
@@ -864,7 +853,7 @@ export async function responderCierreHoras(req: Request, res: Response) {
     data: { estado: 'aceptado', resueltaAt: new Date() },
   });
   if (count === 0) {
-    return res.status(409).json({ error: 'Este cierre ya no está pendiente de respuesta' });
+    return res.status(409).json({ error: 'Este cierre ya no está pendiente de respuesta', code: 'HOURS_CLOSURE_NOT_PENDING' });
   }
 
   const precioFinal = Number(presupuesto.tarifaHora) * Number(cierre.horasReales);
@@ -875,10 +864,7 @@ export async function responderCierreHoras(req: Request, res: Response) {
   });
 
   if (solicitud.profesionalId) {
-    enviarNotificacion(solicitud.profesionalId, {
-      title: 'Horas confirmadas',
-      body: 'El cliente ha confirmado las horas trabajadas — el pago ya se ha liberado',
-    }, { tipo: 'cierre_horas_aceptado', solicitudId: id }).catch((e) =>
+    enviarNotificacion(solicitud.profesionalId, 'cierre_horas_aceptado', {}, { solicitudId: id }).catch((e) =>
       console.error(`[responderCierreHoras] Error al notificar al profesional de ${id}:`, e)
     );
   }

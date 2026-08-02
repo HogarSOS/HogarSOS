@@ -36,7 +36,7 @@ const refreshSchema = z.object({
 export async function register(req: Request, res: Response) {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const { firebaseIdToken, nombre, telefono, role } = parsed.data;
@@ -46,7 +46,7 @@ export async function register(req: Request, res: Response) {
     decoded = await firebaseAuth.verifyIdToken(firebaseIdToken);
   } catch (e) {
     console.error('[auth.register] Token de Firebase inválido:', e);
-    return res.status(401).json({ error: 'Token de Firebase inválido' });
+    return res.status(401).json({ error: 'Token de Firebase inválido', code: 'AUTH_FIREBASE_TOKEN_INVALID' });
   }
 
   // El token de Firebase trae email (registro con email/contraseña) O
@@ -59,7 +59,7 @@ export async function register(req: Request, res: Response) {
   const telefonoVerificado = decoded.phone_number ?? telefono ?? null;
 
   if (!email && !telefonoVerificado) {
-    return res.status(400).json({ error: 'El token de Firebase no contiene ni email ni número de teléfono' });
+    return res.status(400).json({ error: 'El token de Firebase no contiene ni email ni número de teléfono', code: 'AUTH_FIREBASE_TOKEN_NO_CONTACT' });
   }
 
   // ÚNICO punto de todo el backend que decide "ya existe": busca por
@@ -81,7 +81,7 @@ export async function register(req: Request, res: Response) {
       `(id=${existente.id}, creado=${existente.createdAt.toISOString()}, firebaseUid=${existente.firebaseUid})`
     );
     return res.status(409).json({
-      error: 'Ya existe un usuario en la base de datos de hogarSOS con este email o teléfono',
+      error: 'Ya existe un usuario en la base de datos de hogarSOS con este email o teléfono', code: 'AUTH_USER_ALREADY_EXISTS',
     });
   }
 
@@ -136,7 +136,7 @@ export async function register(req: Request, res: Response) {
 export async function login(req: Request, res: Response) {
   const parsed = loginSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   let decoded;
@@ -144,18 +144,18 @@ export async function login(req: Request, res: Response) {
     decoded = await firebaseAuth.verifyIdToken(parsed.data.firebaseIdToken);
   } catch (e) {
     console.error('[auth.login] Token de Firebase inválido:', e);
-    return res.status(401).json({ error: 'Token de Firebase inválido' });
+    return res.status(401).json({ error: 'Token de Firebase inválido', code: 'AUTH_FIREBASE_TOKEN_INVALID' });
   }
 
   const usuario = await prisma.user.findUnique({ where: { firebaseUid: decoded.uid } });
 
   if (!usuario) {
     console.log(`[auth.login] No existe fila en Postgres para firebaseUid=${decoded.uid} (email=${decoded.email})`);
-    return res.status(404).json({ error: 'No existe una cuenta asociada. Regístrate primero.' });
+    return res.status(404).json({ error: 'No existe una cuenta asociada. Regístrate primero.', code: 'AUTH_NO_ACCOUNT' });
   }
 
   if (!usuario.activo) {
-    return res.status(403).json({ error: 'Esta cuenta ha sido desactivada' });
+    return res.status(403).json({ error: 'Esta cuenta ha sido desactivada', code: 'AUTH_ACCOUNT_DISABLED' });
   }
 
   const payload = { userId: usuario.id, role: usuario.role };
@@ -182,17 +182,41 @@ export async function updateFcmToken(req: Request, res: Response) {
   const userId = req.user!.userId;
   const parsed = fcmTokenSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Falta fcmToken' });
+    return res.status(400).json({ error: 'Falta fcmToken', code: 'AUTH_FCM_TOKEN_MISSING' });
   }
 
   await prisma.user.update({ where: { id: userId }, data: { fcmToken: parsed.data.fcmToken } });
   return res.json({ success: true });
 }
 
+const idiomaSchema = z.object({
+  idioma: z.enum(['es', 'en']),
+});
+
+/**
+ * Guarda el idioma preferido del dispositivo actual, para poder enviar
+ * las notificaciones push en ese idioma (ver
+ * `services/notification.service.ts` e `i18n/notifications.ts`). Se
+ * llama en el mismo momento que updateFcmToken de arriba — tras
+ * login/registro y al restaurar sesión al arrancar — a partir del
+ * locale del sistema que ya resuelve MaterialApp en el frontend, no de
+ * una preferencia manual (la app no tiene selector de idioma propio).
+ */
+export async function updateIdioma(req: Request, res: Response) {
+  const userId = req.user!.userId;
+  const parsed = idiomaSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Falta idioma válido (es/en)', code: 'AUTH_IDIOMA_INVALID' });
+  }
+
+  await prisma.user.update({ where: { id: userId }, data: { idioma: parsed.data.idioma } });
+  return res.json({ success: true });
+}
+
 export async function refreshToken(req: Request, res: Response) {
   const parsed = refreshSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Falta el refreshToken' });
+    return res.status(400).json({ error: 'Falta el refreshToken', code: 'AUTH_REFRESH_TOKEN_MISSING' });
   }
 
   try {
@@ -202,7 +226,7 @@ export async function refreshToken(req: Request, res: Response) {
     // emitir un nuevo access token (por si fue desactivado entretanto).
     const usuario = await prisma.user.findUnique({ where: { id: payload.userId } });
     if (!usuario || !usuario.activo) {
-      return res.status(403).json({ error: 'Usuario no válido' });
+      return res.status(403).json({ error: 'Usuario no válido', code: 'AUTH_USER_INVALID' });
     }
 
     return res.json({
@@ -210,6 +234,6 @@ export async function refreshToken(req: Request, res: Response) {
     });
   } catch (e) {
     console.error('[auth.refreshToken] Refresh token inválido o expirado:', e);
-    return res.status(401).json({ error: 'Refresh token inválido o expirado' });
+    return res.status(401).json({ error: 'Refresh token inválido o expirado', code: 'AUTH_REFRESH_TOKEN_INVALID' });
   }
 }

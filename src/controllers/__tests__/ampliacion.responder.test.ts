@@ -50,8 +50,9 @@ describe('responderAmpliacion', () => {
     );
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
+      'ampliacion_aceptada',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'ampliacion_aceptada' })
+      expect.any(Object)
     );
   });
 
@@ -64,8 +65,9 @@ describe('responderAmpliacion', () => {
     );
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
+      'ampliacion_rechazada',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'ampliacion_rechazada' })
+      expect.any(Object)
     );
   });
 

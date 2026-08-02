@@ -60,8 +60,9 @@ describe('crearAmpliacion', () => {
     );
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'cliente-1',
+      'nueva_ampliacion',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'nueva_ampliacion' })
+      expect.any(Object)
     );
   });
 

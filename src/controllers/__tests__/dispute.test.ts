@@ -59,8 +59,9 @@ describe('createDispute', () => {
     expect(res.status).toHaveBeenCalledWith(201);
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
+      'reclamacion_abierta',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'reclamacion_abierta' })
+      expect.any(Object)
     );
   });
 

@@ -7,6 +7,7 @@ import {
   COMISION_CLIENTE_PORCENTAJE,
   COMISION_PROFESIONAL_PORCENTAJE,
 } from '../services/payment.service';
+import { enviarNotificacion } from '../services/notification.service';
 
 const createIntentSchema = z.object({
   serviceRequestId: z.string().uuid(),
@@ -47,7 +48,7 @@ async function intentoAbandonado(pago: { stripePaymentIntentId: string | null })
 export async function createPaymentIntent(req: Request, res: Response) {
   const parsed = createIntentSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Falta serviceRequestId' });
+    return res.status(400).json({ error: 'Falta serviceRequestId', code: 'PAYMENT_REQUEST_ID_MISSING' });
   }
 
   const { serviceRequestId } = parsed.data;
@@ -67,17 +68,17 @@ export async function createPaymentIntent(req: Request, res: Response) {
   });
 
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== clienteId) {
-    return res.status(403).json({ error: 'No eres el cliente de esta solicitud' });
+    return res.status(403).json({ error: 'No eres el cliente de esta solicitud', code: 'NOT_REQUEST_CLIENT' });
   }
   if (solicitud.estado !== 'aceptada' && solicitud.estado !== 'en_progreso') {
-    return res.status(409).json({ error: 'La solicitud debe estar aceptada por un profesional antes de pagar' });
+    return res.status(409).json({ error: 'La solicitud debe estar aceptada por un profesional antes de pagar', code: 'PAYMENT_REQUEST_NOT_ACCEPTED' });
   }
   const presupuesto = solicitud.presupuestos[0];
   if (!presupuesto) {
-    return res.status(409).json({ error: 'Todavía no hay un presupuesto aceptado para esta solicitud' });
+    return res.status(409).json({ error: 'Todavía no hay un presupuesto aceptado para esta solicitud', code: 'NO_ACCEPTED_BUDGET' });
   }
 
   const pagoInicial = solicitud.pagos.find((p) => p.presupuestoId === presupuesto.id && !p.ampliacionId);
@@ -117,7 +118,7 @@ export async function createPaymentIntent(req: Request, res: Response) {
           comisionPlataforma: Number(ultimoPagoAmpliacion.comisionPlataforma),
         });
       }
-      return res.status(409).json({ error: 'No hay nada pendiente de autorizar para esta solicitud' });
+      return res.status(409).json({ error: 'No hay nada pendiente de autorizar para esta solicitud', code: 'PAYMENT_NOTHING_PENDING' });
     }
     ampliacionId = ampliacionSinAutorizar.id;
     montoBase =
@@ -177,6 +178,26 @@ export async function stripeWebhook(req: Request, res: Response) {
   }
 
   switch (event.type) {
+    // Se dispara cuando un PaymentIntent con capture_method: manual
+    // pasa a 'requires_capture' — es decir, cuando la autorización en
+    // la tarjeta del cliente se confirma de verdad (no antes: crear el
+    // PaymentIntent en createPaymentIntent() no garantiza que el
+    // cliente llegue a confirmarlo con el Payment Sheet). Este es el
+    // único punto fiable para avisar al profesional de que el pago ya
+    // está retenido.
+    case 'payment_intent.amount_capturable_updated': {
+      const intent = event.data.object as { id: string };
+      const pago = await prisma.payment.findUnique({
+        where: { stripePaymentIntentId: intent.id },
+        include: { serviceRequest: { select: { profesionalId: true } } },
+      });
+      if (pago?.serviceRequest.profesionalId) {
+        enviarNotificacion(pago.serviceRequest.profesionalId, 'pago_autorizado', {}, {
+          solicitudId: pago.serviceRequestId,
+        }).catch((e) => console.error(`[stripeWebhook] Error al notificar pago autorizado de ${pago.id}:`, e));
+      }
+      break;
+    }
     case 'payment_intent.payment_failed': {
       const intent = event.data.object as { id: string };
       await prisma.payment.updateMany({

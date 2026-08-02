@@ -141,7 +141,7 @@ app.use('/api/uploads', uploadRoutes);
 app.use((_req, res) => {
   res.status(404).json({
     success: false,
-    error: 'Ruta no encontrada',
+    error: 'Ruta no encontrada', code: 'ROUTE_NOT_FOUND',
     message: 'Ruta no encontrada',
   });
 });
@@ -165,6 +165,7 @@ app.use(
     res.status(err.status || 500).json({
       success: false,
       error: mensaje,
+      code: 'INTERNAL_ERROR',
       message: mensaje,
     });
   }

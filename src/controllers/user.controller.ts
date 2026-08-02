@@ -37,7 +37,7 @@ export async function getMe(req: Request, res: Response) {
 
   const usuario = await prisma.user.findUnique({ where: { id: userId } });
   if (!usuario) {
-    return res.status(404).json({ error: 'Usuario no encontrado' });
+    return res.status(404).json({ error: 'Usuario no encontrado', code: 'USER_NOT_FOUND' });
   }
 
   return res.json(serializarUsuario(usuario));
@@ -58,7 +58,7 @@ export async function updateMe(req: Request, res: Response) {
   const userId = req.user!.userId;
   const parsed = updateMeSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const usuario = await prisma.user.update({ where: { id: userId }, data: parsed.data });

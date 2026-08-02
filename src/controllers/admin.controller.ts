@@ -43,18 +43,18 @@ export async function approveProfessional(req: Request, res: Response) {
 
   const parsed = decisionSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
   if (!parsed.data.aprobar && !parsed.data.motivoRechazo) {
-    return res.status(400).json({ error: 'Un rechazo requiere motivoRechazo' });
+    return res.status(400).json({ error: 'Un rechazo requiere motivoRechazo', code: 'VERIFICATION_REJECT_REASON_REQUIRED' });
   }
 
   const profesional = await prisma.professional.findUnique({ where: { userId: professionalId } });
   if (!profesional) {
-    return res.status(404).json({ error: 'Profesional no encontrado' });
+    return res.status(404).json({ error: 'Profesional no encontrado', code: 'PROFESSIONAL_NOT_FOUND' });
   }
   if (profesional.estadoVerificacion !== 'pendiente') {
-    return res.status(409).json({ error: 'Este profesional no tiene una verificación pendiente' });
+    return res.status(409).json({ error: 'Este profesional no tiene una verificación pendiente', code: 'VERIFICATION_NOT_PENDING' });
   }
 
   const actualizado = await prisma.professional.update({
@@ -124,15 +124,15 @@ export async function resolveDispute(req: Request, res: Response) {
 
   const parsed = resolveDisputeSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const disputa = await prisma.dispute.findUnique({ where: { id } });
   if (!disputa) {
-    return res.status(404).json({ error: 'Disputa no encontrada' });
+    return res.status(404).json({ error: 'Disputa no encontrada', code: 'DISPUTE_NOT_FOUND' });
   }
   if (disputa.estado === 'resuelta_cliente' || disputa.estado === 'resuelta_profesional') {
-    return res.status(409).json({ error: 'Esta disputa ya fue resuelta' });
+    return res.status(409).json({ error: 'Esta disputa ya fue resuelta', code: 'DISPUTE_ALREADY_RESOLVED' });
   }
 
   const { resolucion, notas } = parsed.data;
@@ -160,7 +160,7 @@ export async function resolveDispute(req: Request, res: Response) {
     }
   } catch (err) {
     return res.status(502).json({
-      error: 'La resolución no pudo aplicarse en Stripe. Revisa el estado del pago manualmente.',
+      error: 'La resolución no pudo aplicarse en Stripe. Revisa el estado del pago manualmente.', code: 'DISPUTE_RESOLUTION_STRIPE_FAILED',
       detalle: (err as Error).message,
     });
   }

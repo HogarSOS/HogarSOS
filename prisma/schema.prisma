@@ -20,6 +20,13 @@ model User {
   role                     UserRole         @default(cliente)
   firebaseUid              String?          @unique @map("firebase_uid")
   fcmToken                 String?          @map("fcm_token")
+  // Idioma preferido para las notificaciones push — se actualiza solo
+  // (sin acción del usuario) desde el dispositivo en cada arranque con
+  // sesión activa, igual que fcmToken (ver PATCH /auth/me/idioma), a
+  // partir del locale del sistema que ya resuelve MaterialApp en el
+  // frontend. Por defecto 'es' porque es el idioma con el que arrancó
+  // la app antes de añadir soporte a inglés.
+  idioma                   Idioma           @default(es)
   fotoPerfilUrl            String?          @map("foto_perfil_url")
   valoracionMedia          Decimal          @default(0.00) @map("valoracion_media")
   totalValoraciones        Int              @default(0) @map("total_valoraciones")
@@ -296,6 +303,11 @@ enum UserRole {
   cliente
   profesional
   admin
+}
+
+enum Idioma {
+  es
+  en
 }
 
 enum EstadoVerificacion {

@@ -24,14 +24,14 @@ export async function crearAmpliacion(req: Request, res: Response) {
 
   const parsed = createAmpliacionSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos de ampliación inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos de ampliación inválidos', code: 'EXTENSION_INVALID_DATA', detalles: parsed.error.flatten() });
   }
 
   if (parsed.data.mensaje) {
     const bloqueo = razonBloqueoTexto(parsed.data.mensaje);
     if (bloqueo) {
       return res.status(400).json({
-        error: 'Por seguridad, los datos de contacto solo podrán compartirse cuando el trabajo haya sido aceptado.',
+        error: 'Por seguridad, los datos de contacto solo podrán compartirse cuando el trabajo haya sido aceptado.', code: 'CONTACT_INFO_BLOCKED',
         motivo: bloqueo,
       });
     }
@@ -39,13 +39,13 @@ export async function crearAmpliacion(req: Request, res: Response) {
 
   const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.profesionalId !== profesionalId) {
-    return res.status(403).json({ error: 'No eres el profesional asignado a esta solicitud' });
+    return res.status(403).json({ error: 'No eres el profesional asignado a esta solicitud', code: 'NOT_ASSIGNED_PROFESSIONAL' });
   }
   if (solicitud.estado !== 'aceptada' && solicitud.estado !== 'en_progreso') {
-    return res.status(409).json({ error: 'La solicitud no está en un estado válido para pedir una ampliación' });
+    return res.status(409).json({ error: 'La solicitud no está en un estado válido para pedir una ampliación', code: 'REQUEST_INVALID_STATE_EXTENSION' });
   }
 
   const presupuesto = await prisma.presupuesto.findFirst({
@@ -53,21 +53,21 @@ export async function crearAmpliacion(req: Request, res: Response) {
     orderBy: { createdAt: 'desc' },
   });
   if (!presupuesto) {
-    return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud' });
+    return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud', code: 'NO_ACCEPTED_BUDGET' });
   }
 
   if (presupuesto.tipo === 'por_horas' && !parsed.data.horasAdicionales) {
-    return res.status(400).json({ error: 'Indica las horas adicionales' });
+    return res.status(400).json({ error: 'Indica las horas adicionales', code: 'EXTENSION_HOURS_REQUIRED' });
   }
   if (presupuesto.tipo === 'cerrado' && !parsed.data.montoAdicional) {
-    return res.status(400).json({ error: 'Indica el importe adicional' });
+    return res.status(400).json({ error: 'Indica el importe adicional', code: 'EXTENSION_AMOUNT_REQUIRED' });
   }
 
   const yaPendiente = await prisma.ampliacion.findFirst({
     where: { presupuestoId: presupuesto.id, estado: 'pendiente' },
   });
   if (yaPendiente) {
-    return res.status(409).json({ error: 'Ya hay una ampliación pendiente de respuesta' });
+    return res.status(409).json({ error: 'Ya hay una ampliación pendiente de respuesta', code: 'EXTENSION_ALREADY_PENDING' });
   }
 
   const ampliacion = await prisma.ampliacion.create({
@@ -77,13 +77,12 @@ export async function crearAmpliacion(req: Request, res: Response) {
         : { presupuestoId: presupuesto.id, montoAdicional: parsed.data.montoAdicional, mensaje: parsed.data.mensaje },
   });
 
-  enviarNotificacion(solicitud.clienteId, {
-    title: presupuesto.tipo === 'por_horas' ? 'El profesional necesita más tiempo' : 'El profesional necesita un presupuesto adicional',
-    body:
-      presupuesto.tipo === 'por_horas'
-        ? 'Ha pedido ampliar las horas del trabajo — revísalo para aceptar o rechazar'
-        : 'Ha pedido ampliar el presupuesto del trabajo — revísalo para aceptar o rechazar',
-  }, { tipo: 'nueva_ampliacion', solicitudId: id }).catch((e) =>
+  enviarNotificacion(
+    solicitud.clienteId,
+    'nueva_ampliacion',
+    { tipoAmpliacion: presupuesto.tipo === 'por_horas' ? 'por_horas' : 'monto' },
+    { solicitudId: id }
+  ).catch((e) =>
     console.error(`[crearAmpliacion] Error al notificar al cliente de ${id}:`, e)
   );
 
@@ -107,15 +106,15 @@ export async function responderAmpliacion(req: Request, res: Response) {
 
   const parsed = responderAmpliacionSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Falta indicar si aceptas o rechazas la ampliación' });
+    return res.status(400).json({ error: 'Falta indicar si aceptas o rechazas la ampliación', code: 'EXTENSION_DECISION_REQUIRED' });
   }
 
   const solicitud = await prisma.serviceRequest.findUnique({ where: { id } });
   if (!solicitud) {
-    return res.status(404).json({ error: 'Solicitud no encontrada' });
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
   }
   if (solicitud.clienteId !== clienteId) {
-    return res.status(403).json({ error: 'No tienes acceso a esta solicitud' });
+    return res.status(403).json({ error: 'No tienes acceso a esta solicitud', code: 'REQUEST_NO_ACCESS' });
   }
 
   const ampliacion = await prisma.ampliacion.findUnique({
@@ -123,7 +122,7 @@ export async function responderAmpliacion(req: Request, res: Response) {
     include: { presupuesto: true },
   });
   if (!ampliacion || ampliacion.presupuesto.serviceRequestId !== id) {
-    return res.status(404).json({ error: 'Ampliación no encontrada' });
+    return res.status(404).json({ error: 'Ampliación no encontrada', code: 'EXTENSION_NOT_FOUND' });
   }
 
   const nuevoEstado = parsed.data.accion === 'aceptar' ? 'aceptado' : 'rechazado';
@@ -132,16 +131,15 @@ export async function responderAmpliacion(req: Request, res: Response) {
     data: { estado: nuevoEstado, resueltaAt: new Date() },
   });
   if (count === 0) {
-    return res.status(409).json({ error: 'Esta ampliación ya no está pendiente de respuesta' });
+    return res.status(409).json({ error: 'Esta ampliación ya no está pendiente de respuesta', code: 'EXTENSION_NOT_PENDING' });
   }
 
-  enviarNotificacion(ampliacion.presupuesto.profesionalId, {
-    title: nuevoEstado === 'aceptado' ? '¡Ampliación aceptada!' : 'Ampliación rechazada',
-    body:
-      nuevoEstado === 'aceptado'
-        ? 'El cliente ha aceptado tu petición de ampliación — te avisaremos cuando autorice el pago adicional'
-        : 'El cliente ha rechazado tu petición de ampliación',
-  }, { tipo: nuevoEstado === 'aceptado' ? 'ampliacion_aceptada' : 'ampliacion_rechazada', solicitudId: id }).catch(
+  enviarNotificacion(
+    ampliacion.presupuesto.profesionalId,
+    nuevoEstado === 'aceptado' ? 'ampliacion_aceptada' : 'ampliacion_rechazada',
+    {},
+    { solicitudId: id }
+  ).catch(
     (e) => console.error(`[responderAmpliacion] Error al notificar al profesional de ${id}:`, e)
   );
 

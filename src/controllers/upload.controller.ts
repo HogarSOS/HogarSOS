@@ -19,7 +19,7 @@ import path from 'path';
  */
 export async function uploadPhoto(req: Request, res: Response) {
   if (!req.file) {
-    return res.status(400).json({ error: 'No se recibió ningún archivo' });
+    return res.status(400).json({ error: 'No se recibió ningún archivo', code: 'UPLOAD_NO_FILE' });
   }
 
   const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:3000';

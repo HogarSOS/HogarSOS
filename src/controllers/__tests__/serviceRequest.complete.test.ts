@@ -109,8 +109,9 @@ describe('completeServiceRequest', () => {
     expect(res.status).toHaveBeenCalledWith(202);
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'cliente-1',
+      'cierre_horas_pendiente',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'cierre_horas_pendiente' })
+      expect.any(Object)
     );
   });
 
@@ -199,8 +200,9 @@ describe('responderCierreHoras', () => {
     expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 87.5);
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
+      'cierre_horas_aceptado',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'cierre_horas_aceptado' })
+      expect.any(Object)
     );
   });
 
@@ -212,8 +214,9 @@ describe('responderCierreHoras', () => {
     expect(mockReleasePayments).not.toHaveBeenCalled();
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
+      'cierre_horas_rechazado',
       expect.any(Object),
-      expect.objectContaining({ tipo: 'cierre_horas_rechazado' })
+      expect.any(Object)
     );
   });
 

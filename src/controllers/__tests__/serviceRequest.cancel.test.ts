@@ -126,8 +126,9 @@ describe('cancelServiceRequest', () => {
 
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
-      expect.objectContaining({ title: expect.any(String) }),
-      expect.objectContaining({ tipo: 'solicitud_cancelada' })
+      'solicitud_cancelada',
+      expect.any(Object),
+      expect.any(Object)
     );
   });
 

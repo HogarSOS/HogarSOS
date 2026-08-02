@@ -17,7 +17,7 @@ export async function getProfile(req: Request, res: Response) {
   });
 
   if (!profesional) {
-    return res.status(404).json({ error: 'Perfil de profesional no encontrado' });
+    return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
 
   // Reviews recibidas — antes solo se veían desde el perfil PÚBLICO
@@ -78,19 +78,19 @@ export async function updateAvailability(req: Request, res: Response) {
   const userId = req.user!.userId;
   const parsed = availabilitySchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const profesional = await prisma.professional.findUnique({ where: { userId } });
   if (!profesional) {
-    return res.status(404).json({ error: 'Perfil de profesional no encontrado' });
+    return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
   if (
     REQUIRE_PROFESSIONAL_VERIFICATION &&
     parsed.data.disponible &&
     profesional.estadoVerificacion !== 'aprobado'
   ) {
-    return res.status(403).json({ error: 'No puedes ponerte disponible hasta ser verificado' });
+    return res.status(403).json({ error: 'No puedes ponerte disponible hasta ser verificado', code: 'PROFESSIONAL_NOT_VERIFIED' });
   }
 
   const { disponible, modoDisponibilidad, latitud, longitud } = parsed.data;
@@ -132,12 +132,12 @@ export async function updateMyProfile(req: Request, res: Response) {
   const userId = req.user!.userId;
   const parsed = updateProfileSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const profesional = await prisma.professional.findUnique({ where: { userId } });
   if (!profesional) {
-    return res.status(404).json({ error: 'Perfil de profesional no encontrado' });
+    return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
 
   const actualizado = await prisma.professional.update({
@@ -169,7 +169,7 @@ export async function submitVerificationDocs(req: Request, res: Response) {
   const userId = req.user!.userId;
   const parsed = verificationSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const { documentoIdentidadUrl, certificadosUrl, seguroRcUrl, categoriaIds, tarifaBase } =
@@ -179,7 +179,7 @@ export async function submitVerificationDocs(req: Request, res: Response) {
     where: { id: { in: categoriaIds }, activo: true },
   });
   if (categoriasValidas.length !== categoriaIds.length) {
-    return res.status(400).json({ error: 'Una o más categorías no son válidas' });
+    return res.status(400).json({ error: 'Una o más categorías no son válidas', code: 'CATEGORIES_INVALID' });
   }
 
   await prisma.$transaction(async (tx) => {
@@ -217,21 +217,21 @@ export async function updateMyCategories(req: Request, res: Response) {
   const userId = req.user!.userId;
   const parsed = updateCategoriesSchema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Datos inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
   const { categoriaIds } = parsed.data;
 
   const profesional = await prisma.professional.findUnique({ where: { userId } });
   if (!profesional) {
-    return res.status(404).json({ error: 'Perfil de profesional no encontrado' });
+    return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
 
   const categoriasValidas = await prisma.serviceCategory.findMany({
     where: { id: { in: categoriaIds }, activo: true },
   });
   if (categoriasValidas.length !== categoriaIds.length) {
-    return res.status(400).json({ error: 'Una o más categorías no son válidas' });
+    return res.status(400).json({ error: 'Una o más categorías no son válidas', code: 'CATEGORIES_INVALID' });
   }
 
   await prisma.$transaction(async (tx) => {
@@ -257,7 +257,7 @@ export async function startStripeOnboarding(req: Request, res: Response) {
     include: { user: true },
   });
   if (!profesional) {
-    return res.status(404).json({ error: 'Perfil de profesional no encontrado' });
+    return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
 
   let accountId = profesional.stripeAccountId;
@@ -316,7 +316,7 @@ const searchSchema = z.object({
 export async function searchProfessionals(req: Request, res: Response) {
   const parsed = searchSchema.safeParse(req.query);
   if (!parsed.success) {
-    return res.status(400).json({ error: 'Parámetros de búsqueda inválidos', detalles: parsed.error.flatten() });
+    return res.status(400).json({ error: 'Parámetros de búsqueda inválidos', code: 'SEARCH_PARAMS_INVALID', detalles: parsed.error.flatten() });
   }
 
   const { categoryId, query, latitud, longitud, minValoracion, precioMax, soloDisponibles, radioMetros, page, limit } = parsed.data;
@@ -432,7 +432,7 @@ export async function getPublicProfile(req: Request, res: Response) {
   });
 
   if (!profesional) {
-    return res.status(404).json({ error: 'Profesional no encontrado' });
+    return res.status(404).json({ error: 'Profesional no encontrado', code: 'PROFESSIONAL_NOT_FOUND' });
   }
 
   const reviews = await prisma.review.findMany({
