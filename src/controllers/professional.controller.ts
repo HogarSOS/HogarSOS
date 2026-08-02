@@ -4,6 +4,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { stripe } from '../config/stripe';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
+import { derivarEstadoCuentaStripe, sincronizarEstadoCuentaStripe, intentarAprobacionAutomatica } from '../services/professional.service';
 
 export async function getProfile(req: Request, res: Response) {
   const userId = req.user!.userId;
@@ -18,6 +19,20 @@ export async function getProfile(req: Request, res: Response) {
 
   if (!profesional) {
     return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
+  }
+
+  // Refresco en caliente del estado de Stripe mientras no esté
+  // 'configurada' — no depende solo de que llegue el webhook
+  // account.updated (que hoy no puede verificar su firma porque
+  // STRIPE_WEBHOOK_SECRET está vacío en producción). Una vez
+  // 'configurada' dejamos de consultar Stripe en cada carga de perfil.
+  if (profesional.stripeAccountId && !(profesional.stripeChargesEnabled && profesional.stripePayoutsEnabled)) {
+    try {
+      const actualizado = await sincronizarEstadoCuentaStripe(userId, profesional.stripeAccountId);
+      Object.assign(profesional, actualizado);
+    } catch (e) {
+      console.error(`[getProfile] Error al sincronizar estado de Stripe para ${userId}:`, e);
+    }
   }
 
   // Reviews recibidas — antes solo se veían desde el perfil PÚBLICO
@@ -35,6 +50,7 @@ export async function getProfile(req: Request, res: Response) {
     email: profesional.user.email,
     telefono: profesional.user.telefono,
     estadoVerificacion: profesional.estadoVerificacion,
+    tipoProfesional: profesional.tipoProfesional,
     tarifaBase: Number(profesional.tarifaBase),
     valoracionMedia: Number(profesional.valoracionMedia),
     totalTrabajos: profesional.totalTrabajos,
@@ -48,7 +64,7 @@ export async function getProfile(req: Request, res: Response) {
     // enviado y solo estuviera pendiente de que un admin lo revisara.
     documentoIdentidadUrl: profesional.documentoIdentidadUrl || null,
     categorias: profesional.categorias.map((c) => c.category.nombre),
-    cuentaStripeConfigurada: Boolean(profesional.stripeAccountId),
+    estadoCuentaStripe: derivarEstadoCuentaStripe(profesional),
     opiniones: reviews.map((r) => ({
       autor: r.autor.nombre,
       puntuacion: r.puntuacion,
@@ -81,16 +97,37 @@ export async function updateAvailability(req: Request, res: Response) {
     return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
-  const profesional = await prisma.professional.findUnique({ where: { userId } });
-  if (!profesional) {
+  const profesionalExistente = await prisma.professional.findUnique({ where: { userId } });
+  if (!profesionalExistente) {
     return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
-  if (
-    REQUIRE_PROFESSIONAL_VERIFICATION &&
-    parsed.data.disponible &&
-    profesional.estadoVerificacion !== 'aprobado'
-  ) {
-    return res.status(403).json({ error: 'No puedes ponerte disponible hasta ser verificado', code: 'PROFESSIONAL_NOT_VERIFIED' });
+  let profesional = profesionalExistente;
+
+  // Roadmap económico punto 5: Registro → (Verificación + Stripe en
+  // paralelo) → Disponible para trabajar — "disponible" es el punto de
+  // llegada de AMBAS ramas, no solo la de verificación. Sin esto, un
+  // profesional podía aceptar trabajos que luego jamás se le podrían
+  // pagar (mismo hueco que releasePayments ya cerraba del lado del pago
+  // — ver PROFESIONAL_CUENTA_STRIPE_NO_OPERATIVA en payment.service.ts).
+  // Solo bloquea al INTENTAR activarse — un profesional ya disponible no
+  // se desactiva retroactivamente por esto.
+  if (REQUIRE_PROFESSIONAL_VERIFICATION && parsed.data.disponible) {
+    // Re-sincroniza con Stripe ANTES de evaluar los gates, no después:
+    // esto puede disparar la aprobación automática (roadmap punto 8) si
+    // completar el perfil era lo único que faltaba, y de paso evita un
+    // falso negativo si el profesional acaba de terminar el onboarding
+    // y el webhook todavía no ha llegado (ver incidencia conocida en
+    // professional.service.ts).
+    if (profesional.stripeAccountId && derivarEstadoCuentaStripe(profesional) !== 'configurada') {
+      profesional = await sincronizarEstadoCuentaStripe(userId, profesional.stripeAccountId).catch(() => profesional);
+    }
+
+    if (profesional.estadoVerificacion !== 'aprobado') {
+      return res.status(403).json({ error: 'No puedes ponerte disponible hasta ser verificado', code: 'PROFESSIONAL_NOT_VERIFIED' });
+    }
+    if (derivarEstadoCuentaStripe(profesional) !== 'configurada') {
+      return res.status(403).json({ error: 'No puedes ponerte disponible hasta configurar tu cuenta de cobro', code: 'PROFESSIONAL_STRIPE_NOT_CONFIGURED' });
+    }
   }
 
   const { disponible, modoDisponibilidad, latitud, longitud } = parsed.data;
@@ -158,6 +195,11 @@ const verificationSchema = z.object({
   seguroRcUrl: z.string().url().optional(),
   categoriaIds: z.array(z.number().int()).min(1),
   tarifaBase: z.number().positive(),
+  // Roadmap económico punto 4: HogarSOS no decide ni verifica esta
+  // situación, solo registra lo que el profesional declara — por eso
+  // no hay validación adicional más allá de que sea uno de los 3
+  // valores aprobados para la versión inicial en España.
+  tipoProfesional: z.enum(['autonomo', 'empresa', 'persona_fisica']),
 });
 
 /**
@@ -172,7 +214,7 @@ export async function submitVerificationDocs(req: Request, res: Response) {
     return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID', detalles: parsed.error.flatten() });
   }
 
-  const { documentoIdentidadUrl, certificadosUrl, seguroRcUrl, categoriaIds, tarifaBase } =
+  const { documentoIdentidadUrl, certificadosUrl, seguroRcUrl, categoriaIds, tarifaBase, tipoProfesional } =
     parsed.data;
 
   const categoriasValidas = await prisma.serviceCategory.findMany({
@@ -190,6 +232,7 @@ export async function submitVerificationDocs(req: Request, res: Response) {
         certificadosUrl: certificadosUrl ?? [],
         seguroRcUrl,
         tarifaBase,
+        tipoProfesional,
         estadoVerificacion: 'pendiente',
       },
     });
@@ -200,7 +243,16 @@ export async function submitVerificationDocs(req: Request, res: Response) {
     });
   });
 
-  return res.json({ estadoVerificacion: 'pendiente' });
+  // Roadmap económico punto 8 (aprobación semiautomática): completar el
+  // perfil es una de las dos ramas en paralelo (la otra es Stripe, ver
+  // sincronizarEstadoCuentaStripe) — si la cuenta de Stripe ya estaba
+  // configurada de antes, esto es lo único que faltaba para aprobar.
+  const profesionalActualizado = await prisma.professional.findUnique({ where: { userId } });
+  const estadoFinal = profesionalActualizado
+    ? await intentarAprobacionAutomatica(profesionalActualizado)
+    : null;
+
+  return res.json({ estadoVerificacion: estadoFinal?.estadoVerificacion ?? 'pendiente', tipoProfesional });
 }
 
 const updateCategoriesSchema = z.object({

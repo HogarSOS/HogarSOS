@@ -59,12 +59,19 @@ model Professional {
   certificadosUrl       String[]                  @map("certificados_url")
   seguroRcUrl           String?                   @map("seguro_rc_url")
   estadoVerificacion    EstadoVerificacion        @default(pendiente) @map("estado_verificacion")
+  // Nullable a propósito: los profesionales ya registrados antes de
+  // este campo no tienen uno todavía — se pide al completar perfil
+  // (submitVerificationDocs), no en el registro inicial.
+  tipoProfesional       TipoProfesional?          @map("tipo_profesional")
   tarifaBase            Decimal                   @map("tarifa_base")
   valoracionMedia       Decimal                   @default(0.00) @map("valoracion_media")
   totalTrabajos         Int                       @default(0) @map("total_trabajos")
   disponible            Boolean                   @default(false)
   modoDisponibilidad    ModoDisponibilidad        @default(horario_laboral) @map("modo_disponibilidad")
   stripeAccountId       String?                   @map("stripe_account_id")
+  stripeDetailsSubmitted Boolean                  @default(false) @map("stripe_details_submitted")
+  stripeChargesEnabled  Boolean                   @default(false) @map("stripe_charges_enabled")
+  stripePayoutsEnabled  Boolean                   @default(false) @map("stripe_payouts_enabled")
   verificadoPor         String?                   @map("verificado_por")
   verificadoAt          DateTime?                 @map("verificado_at")
   createdAt             DateTime                  @default(now()) @map("created_at")
@@ -314,6 +321,17 @@ enum EstadoVerificacion {
   pendiente
   aprobado
   rechazado
+}
+
+// Roadmap económico punto 4: HogarSOS no verifica la situación fiscal
+// del profesional ni decide cuál le corresponde — solo registra la que
+// el propio profesional declara. Enum cerrado a propósito (3 opciones
+// aprobadas para la versión inicial en España); ampliarlo a futuro es
+// solo añadir un valor aquí + una migración, no toca el resto del flujo.
+enum TipoProfesional {
+  autonomo
+  empresa
+  persona_fisica
 }
 
 enum EstadoSolicitud {

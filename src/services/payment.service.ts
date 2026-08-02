@@ -1,5 +1,7 @@
+import Stripe from 'stripe';
 import { stripe } from '../config/stripe';
 import { prisma } from '../config/prisma';
+import { sincronizarEstadoCuentaStripe, derivarEstadoCuentaStripe, EstadoCuentaStripe } from './professional.service';
 
 export const COMISION_CLIENTE_PORCENTAJE = Number(process.env.PLATFORM_COMMISSION_CLIENT_PERCENT ?? 5);
 export const COMISION_PROFESIONAL_PORCENTAJE = Number(process.env.PLATFORM_COMMISSION_PROFESSIONAL_PERCENT ?? 5);
@@ -121,6 +123,22 @@ export async function releasePayments(serviceRequestId: string, baseFinal: numbe
     throw new Error('PROFESIONAL_SIN_CUENTA_STRIPE');
   }
 
+  // stripeAccountId != null solo dice que el profesional EMPEZÓ el
+  // onboarding, no que Stripe ya pueda transferirle — sin esto,
+  // stripe.transfers.create() de más abajo fallaba en Stripe con una
+  // cuenta que existe pero no tiene payouts habilitados (verificación
+  // de identidad pendiente, documentación adicional pedida, etc.).
+  // Se re-sincroniza en caliente en vez de fiarse del flag ya
+  // guardado en BD, por si el webhook account.updated no ha llegado
+  // todavía (ver professional.service.ts).
+  const cuentaActualizada = await sincronizarEstadoCuentaStripe(
+    solicitud.profesional.userId,
+    solicitud.profesional.stripeAccountId
+  );
+  if (!cuentaActualizada.stripePayoutsEnabled) {
+    throw new Error('PROFESIONAL_CUENTA_STRIPE_NO_OPERATIVA');
+  }
+
   let restanteBase = baseFinal;
   const resultados = [];
 
@@ -208,4 +226,78 @@ export async function refundPayment(serviceRequestId: string) {
     await stripe.paymentIntents.cancel(pago.stripePaymentIntentId);
     await prisma.payment.update({ where: { id: pago.id }, data: { estado: 'reembolsado' } });
   }
+}
+
+export interface ResumenPagoHistorial {
+  id: string;
+  monto: number;
+  fecha: Date;
+  categoria: string;
+  descripcion: string;
+}
+
+export interface ResumenPagos {
+  estadoCuentaStripe: EstadoCuentaStripe;
+  pendiente: number;
+  disponible: number;
+  moneda: string;
+  historial: ResumenPagoHistorial[];
+}
+
+function _sumarImporteEur(items: Stripe.Balance['available']): number {
+  const partidaEur = items.find((i) => i.currency === 'eur');
+  return partidaEur ? partidaEur.amount / 100 : 0;
+}
+
+/**
+ * Centro de Pagos del profesional. "Pendiente" y "Disponible" se leen
+ * directamente del saldo real de Stripe Connect (`stripe.balance.retrieve`
+ * en el contexto de la cuenta conectada) — decisión de arquitectura del
+ * roadmap económico: Stripe es la fuente de verdad de cuánto dinero hay
+ * de verdad y en qué estado, no se recalcula a partir de las filas de
+ * `Payment` (esas solo dan el historial de cobros ya liberados).
+ *
+ * Deliberadamente NO incluye "Próximo pago": los payouts de HogarSOS son
+ * bajo demanda, no hay una fecha de pago recurrente que mostrar (decisión
+ * de producto ya tomada, ver roadmap económico).
+ *
+ * Preparado para un futuro botón "Cobrar ahora" (Stripe Instant Payout):
+ * cuando se implemente, la función iría aquí al lado (p.ej.
+ * `crearInstantPayout(userId)`), usando `stripe.payouts.create({...},
+ * { stripeAccount })` sobre el mismo saldo "disponible" que ya calcula
+ * esta función — no hace falta tocar nada de lo de arriba.
+ */
+export async function obtenerResumenPagos(userId: string): Promise<ResumenPagos> {
+  const profesional = await prisma.professional.findUnique({ where: { userId } });
+  if (!profesional) throw new Error('PROFESSIONAL_NOT_FOUND');
+
+  const estadoCuentaStripe = derivarEstadoCuentaStripe(profesional);
+
+  let pendiente = 0;
+  let disponible = 0;
+
+  // Sin cuenta Stripe todavía (ni siquiera empezó el onboarding) no hay
+  // nada que consultar — 0/0 es el estado correcto, no un error.
+  if (profesional.stripeAccountId) {
+    const balance = await stripe.balance.retrieve({ stripeAccount: profesional.stripeAccountId });
+    pendiente = _sumarImporteEur(balance.pending);
+    disponible = _sumarImporteEur(balance.available);
+  }
+
+  const pagosLiberados = await prisma.payment.findMany({
+    where: { estado: 'liberado', serviceRequest: { profesionalId: userId } },
+    orderBy: { liberadoAt: 'desc' },
+    take: 50,
+    include: { serviceRequest: { include: { categoria: true } } },
+  });
+
+  const historial: ResumenPagoHistorial[] = pagosLiberados.map((p) => ({
+    id: p.id,
+    monto: Number(p.montoProfesional),
+    fecha: p.liberadoAt!,
+    categoria: p.serviceRequest.categoria.nombre,
+    descripcion: p.serviceRequest.descripcion,
+  }));
+
+  return { estadoCuentaStripe, pendiente, disponible, moneda: 'eur', historial };
 }

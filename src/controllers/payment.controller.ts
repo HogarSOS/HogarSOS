@@ -4,10 +4,12 @@ import { stripe } from '../config/stripe';
 import { prisma } from '../config/prisma';
 import {
   createEscrowPaymentIntent,
+  obtenerResumenPagos,
   COMISION_CLIENTE_PORCENTAJE,
   COMISION_PROFESIONAL_PORCENTAJE,
 } from '../services/payment.service';
 import { enviarNotificacion } from '../services/notification.service';
+import { sincronizarEstadoCuentaStripe } from '../services/professional.service';
 
 const createIntentSchema = z.object({
   serviceRequestId: z.string().uuid(),
@@ -158,6 +160,37 @@ export async function getComisiones(_req: Request, res: Response) {
 }
 
 /**
+ * Centro de Pagos del profesional (roadmap económico, punto 1 y 6):
+ * cuenta de cobro, pendiente, disponible e historial de cobros.
+ */
+export async function getPaymentsSummary(req: Request, res: Response) {
+  const userId = req.user!.userId;
+
+  const resumen = await obtenerResumenPagos(userId).catch((e) => {
+    if (e instanceof Error && e.message === 'PROFESSIONAL_NOT_FOUND') return null;
+    throw e;
+  });
+
+  if (!resumen) {
+    return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
+  }
+
+  return res.json({
+    estadoCuentaStripe: resumen.estadoCuentaStripe,
+    pendiente: resumen.pendiente,
+    disponible: resumen.disponible,
+    moneda: resumen.moneda,
+    historial: resumen.historial.map((h) => ({
+      id: h.id,
+      monto: h.monto,
+      fecha: h.fecha,
+      categoria: h.categoria,
+      descripcion: h.descripcion,
+    })),
+  });
+}
+
+/**
  * Webhook de Stripe. No lleva JWT propio — Stripe autentica la petición
  * con una firma (stripe-signature) verificada contra STRIPE_WEBHOOK_SECRET.
  * IMPORTANTE: esta ruta debe montarse con express.raw(), no express.json(),
@@ -216,6 +249,24 @@ export async function stripeWebhook(req: Request, res: Response) {
     }
     // 'payment_intent.succeeded' se dispara tras la captura manual, que
     // ya gestionamos síncronamente en releasePayment() — no se duplica aquí.
+    //
+    // Se dispara cada vez que cambia el estado de una cuenta Connect
+    // (onboarding completado, Stripe pide más documentación, cuenta
+    // restringida, etc.) — sin esto, `getProfile` es la única vía de
+    // refresco (ver comentario en professional.controller.ts) y solo se
+    // actualiza cuando el propio profesional abre su perfil.
+    case 'account.updated': {
+      const account = event.data.object as { id: string };
+      const profesional = await prisma.professional.findFirst({
+        where: { stripeAccountId: account.id },
+      });
+      if (profesional) {
+        await sincronizarEstadoCuentaStripe(profesional.userId, account.id).catch((e) =>
+          console.error(`[stripeWebhook] Error al sincronizar cuenta Stripe de ${profesional.userId}:`, e)
+        );
+      }
+      break;
+    }
     default:
       break;
   }

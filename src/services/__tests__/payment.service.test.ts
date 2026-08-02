@@ -2,6 +2,7 @@ jest.mock('../../config/prisma', () => ({
   prisma: {
     payment: { findMany: jest.fn(), update: jest.fn(), create: jest.fn() },
     serviceRequest: { findUnique: jest.fn() },
+    professional: { findUnique: jest.fn(), update: jest.fn() },
   },
 }));
 
@@ -9,12 +10,14 @@ jest.mock('../../config/stripe', () => ({
   stripe: {
     paymentIntents: { capture: jest.fn(), cancel: jest.fn(), create: jest.fn() },
     transfers: { create: jest.fn() },
+    accounts: { retrieve: jest.fn() },
+    balance: { retrieve: jest.fn() },
   },
 }));
 
 import { prisma } from '../../config/prisma';
 import { stripe } from '../../config/stripe';
-import { releasePayments, refundPayment, calcularDesglose } from '../payment.service';
+import { releasePayments, refundPayment, calcularDesglose, obtenerResumenPagos } from '../payment.service';
 
 const mockPrisma = prisma as any;
 const mockStripe = stripe as any;
@@ -36,8 +39,26 @@ describe('releasePayments', () => {
 
   const solicitudConProfesional = {
     id: 'sr-1',
-    profesional: { stripeAccountId: 'acct_pro_1' },
+    profesional: { userId: 'prof-1', stripeAccountId: 'acct_pro_1' },
   };
+
+  // Por defecto, todos los tests de captura/transferencia asumen una
+  // cuenta Connect ya operativa — sincronizarEstadoCuentaStripe() se
+  // llama de verdad dentro de releasePayments() (ver comentario en
+  // payment.service.ts), así que hay que mockear tanto la consulta a
+  // Stripe como el update en BD, no solo el resultado final.
+  beforeEach(() => {
+    mockStripe.accounts.retrieve.mockResolvedValue({
+      details_submitted: true,
+      charges_enabled: true,
+      payouts_enabled: true,
+    });
+    mockPrisma.professional.update.mockResolvedValue({
+      stripeDetailsSubmitted: true,
+      stripeChargesEnabled: true,
+      stripePayoutsEnabled: true,
+    });
+  });
 
   // Por defecto representa una autorización con base=100 (cliente 105, profesional 95).
   const pagoRetenido = (overrides: Partial<Record<string, unknown>> = {}) => ({
@@ -185,6 +206,25 @@ describe('releasePayments', () => {
     mockPrisma.serviceRequest.findUnique.mockResolvedValue({ id: 'sr-1', profesional: { stripeAccountId: null } });
     await expect(releasePayments('sr-1', 100)).rejects.toThrow('PROFESIONAL_SIN_CUENTA_STRIPE');
   });
+
+  it('lanza PROFESIONAL_CUENTA_STRIPE_NO_OPERATIVA si la cuenta existe pero Stripe todavía no le habilitó los payouts', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pagoRetenido()]);
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
+    // Cuenta creada pero onboarding sin terminar / Stripe pidió más documentación.
+    mockStripe.accounts.retrieve.mockResolvedValue({
+      details_submitted: true,
+      charges_enabled: true,
+      payouts_enabled: false,
+    });
+    mockPrisma.professional.update.mockResolvedValue({
+      stripeDetailsSubmitted: true,
+      stripeChargesEnabled: true,
+      stripePayoutsEnabled: false,
+    });
+
+    await expect(releasePayments('sr-1', 100)).rejects.toThrow('PROFESIONAL_CUENTA_STRIPE_NO_OPERATIVA');
+    expect(mockStripe.transfers.create).not.toHaveBeenCalled();
+  });
 });
 
 describe('refundPayment', () => {
@@ -214,5 +254,84 @@ describe('refundPayment', () => {
     // debe poder distinguir este caso de un fallo real de Stripe.
     mockPrisma.payment.findMany.mockResolvedValue([]);
     await expect(refundPayment('sr-sin-pago')).rejects.toThrow('PAGO_NO_ENCONTRADO');
+  });
+});
+
+describe('obtenerResumenPagos', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('lee Pendiente/Disponible del saldo real de Stripe, no de las filas de Payment', async () => {
+    mockPrisma.professional.findUnique.mockResolvedValue({
+      stripeAccountId: 'acct_1',
+      stripeDetailsSubmitted: true,
+      stripeChargesEnabled: true,
+      stripePayoutsEnabled: true,
+    });
+    mockStripe.balance.retrieve.mockResolvedValue({
+      pending: [{ currency: 'eur', amount: 4500 }],
+      available: [{ currency: 'eur', amount: 12000 }],
+    });
+    mockPrisma.payment.findMany.mockResolvedValue([]);
+
+    const resumen = await obtenerResumenPagos('prof-1');
+
+    expect(mockStripe.balance.retrieve).toHaveBeenCalledWith({ stripeAccount: 'acct_1' });
+    expect(resumen.pendiente).toBe(45);
+    expect(resumen.disponible).toBe(120);
+    expect(resumen.estadoCuentaStripe).toBe('configurada');
+  });
+
+  it('no consulta Stripe y devuelve 0/0 si el profesional todavía no tiene cuenta Connect', async () => {
+    mockPrisma.professional.findUnique.mockResolvedValue({
+      stripeAccountId: null,
+      stripeDetailsSubmitted: false,
+      stripeChargesEnabled: false,
+      stripePayoutsEnabled: false,
+    });
+    mockPrisma.payment.findMany.mockResolvedValue([]);
+
+    const resumen = await obtenerResumenPagos('prof-1');
+
+    expect(mockStripe.balance.retrieve).not.toHaveBeenCalled();
+    expect(resumen.pendiente).toBe(0);
+    expect(resumen.disponible).toBe(0);
+    expect(resumen.estadoCuentaStripe).toBe('pendiente');
+  });
+
+  it('construye el historial solo con pagos liberados, más reciente primero', async () => {
+    mockPrisma.professional.findUnique.mockResolvedValue({
+      stripeAccountId: 'acct_1',
+      stripeDetailsSubmitted: true,
+      stripeChargesEnabled: true,
+      stripePayoutsEnabled: true,
+    });
+    mockStripe.balance.retrieve.mockResolvedValue({ pending: [], available: [] });
+    mockPrisma.payment.findMany.mockResolvedValue([
+      {
+        id: 'pago-1',
+        montoProfesional: 95,
+        liberadoAt: new Date('2026-08-01T10:00:00Z'),
+        serviceRequest: { categoria: { nombre: 'Fontanería' }, descripcion: 'Fuga en el baño' },
+      },
+    ]);
+
+    const resumen = await obtenerResumenPagos('prof-1');
+
+    expect(mockPrisma.payment.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { estado: 'liberado', serviceRequest: { profesionalId: 'prof-1' } },
+        orderBy: { liberadoAt: 'desc' },
+      })
+    );
+    expect(resumen.historial).toEqual([
+      { id: 'pago-1', monto: 95, fecha: new Date('2026-08-01T10:00:00Z'), categoria: 'Fontanería', descripcion: 'Fuga en el baño' },
+    ]);
+  });
+
+  it('lanza PROFESSIONAL_NOT_FOUND si no existe el profesional', async () => {
+    mockPrisma.professional.findUnique.mockResolvedValue(null);
+    await expect(obtenerResumenPagos('prof-inexistente')).rejects.toThrow('PROFESSIONAL_NOT_FOUND');
   });
 });
