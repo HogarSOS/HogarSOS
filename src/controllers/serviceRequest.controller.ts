@@ -781,10 +781,18 @@ export async function completeServiceRequest(req: Request, res: Response) {
     // Sprint 3 (el catch lo silenciaba del todo, sin ninguna pista de
     // qué había fallado en Stripe hasta que se investigó a mano).
     console.error(`[completeServiceRequest] Error al liberar el pago de ${id}:`, err);
+    // PAGO_NO_AUTORIZADO_TODAVIA (ver releasePayments) no es un fallo
+    // puntual de Stripe que "se reintente" solo: el cliente nunca llegó
+    // a confirmar el Payment Sheet, así que no hay nada que reintentar
+    // hasta que lo haga. Distinguirlo evita que el profesional espere
+    // indefinidamente un cobro que no se resolverá solo.
+    const pagoSinConfirmar = err instanceof Error && err.message === 'PAGO_NO_AUTORIZADO_TODAVIA';
     return res.status(202).json({
       solicitudId: id,
       estado: 'completada',
-      aviso: 'Servicio completado, pero la liberación del pago falló y se reintentará',
+      aviso: pagoSinConfirmar
+        ? 'Servicio completado, pero el cliente todavía no ha confirmado el pago en la app'
+        : 'Servicio completado, pero la liberación del pago falló y se reintentará',
     });
   }
 }
@@ -874,10 +882,13 @@ export async function responderCierreHoras(req: Request, res: Response) {
     return res.json({ id: cierreId, estado: 'aceptado', pago: pagoLiberado });
   } catch (err) {
     console.error(`[responderCierreHoras] Error al liberar el pago de ${id}:`, err);
+    const pagoSinConfirmar = err instanceof Error && err.message === 'PAGO_NO_AUTORIZADO_TODAVIA';
     return res.status(202).json({
       id: cierreId,
       estado: 'aceptado',
-      aviso: 'Horas confirmadas, pero la liberación del pago falló y se reintentará',
+      aviso: pagoSinConfirmar
+        ? 'Horas confirmadas, pero el cliente todavía no ha confirmado el pago en la app'
+        : 'Horas confirmadas, pero la liberación del pago falló y se reintentará',
     });
   }
 }

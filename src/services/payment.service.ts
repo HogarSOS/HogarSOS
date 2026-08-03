@@ -139,6 +139,27 @@ export async function releasePayments(serviceRequestId: string, baseFinal: numbe
     throw new Error('PROFESIONAL_CUENTA_STRIPE_NO_OPERATIVA');
   }
 
+  // Comprobación previa a tocar nada: `createEscrowPaymentIntent` marca
+  // la fila como 'retenido' en el mismo momento en que se crea el
+  // PaymentIntent en Stripe, ANTES de que el cliente llegue a confirmar
+  // el Payment Sheet (ver comentario en payment.controller.ts). Si el
+  // cliente abandona esa confirmación, la fila se queda 'retenido' en
+  // nuestra BD para siempre aunque Stripe nunca haya autorizado nada de
+  // verdad. Sin esta comprobación, `stripe.paymentIntents.capture()` más
+  // abajo fallaba a mitad del bucle con un error genérico de Stripe,
+  // dejando ya liberadas las autorizaciones anteriores del bucle y
+  // ninguna pista de qué pasó salvo leer logs — y el aviso genérico de
+  // "se reintentará" que dan los controladores es engañoso aquí: nunca
+  // se resolverá solo con reintentar, hace falta que el cliente vuelva
+  // a confirmar el pago.
+  for (const pago of pagos) {
+    if (!pago.stripePaymentIntentId) throw new Error('SIN_PAYMENT_INTENT');
+    const intent = await stripe.paymentIntents.retrieve(pago.stripePaymentIntentId);
+    if (intent.status !== 'requires_capture') {
+      throw new Error('PAGO_NO_AUTORIZADO_TODAVIA');
+    }
+  }
+
   let restanteBase = baseFinal;
   const resultados = [];
 

@@ -8,7 +8,7 @@ jest.mock('../../config/prisma', () => ({
 
 jest.mock('../../config/stripe', () => ({
   stripe: {
-    paymentIntents: { capture: jest.fn(), cancel: jest.fn(), create: jest.fn() },
+    paymentIntents: { capture: jest.fn(), cancel: jest.fn(), create: jest.fn(), retrieve: jest.fn() },
     transfers: { create: jest.fn() },
     accounts: { retrieve: jest.fn() },
     balance: { retrieve: jest.fn() },
@@ -58,6 +58,11 @@ describe('releasePayments', () => {
       stripeChargesEnabled: true,
       stripePayoutsEnabled: true,
     });
+    // Idem para el PaymentIntent de cada autorización: por defecto, ya
+    // confirmado de verdad por el cliente (requires_capture) — los
+    // tests de la incidencia real (cliente nunca confirmó el Payment
+    // Sheet) lo sobreescriben explícitamente.
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_capture' });
   });
 
   // Por defecto representa una autorización con base=100 (cliente 105, profesional 95).
@@ -223,6 +228,25 @@ describe('releasePayments', () => {
     });
 
     await expect(releasePayments('sr-1', 100)).rejects.toThrow('PROFESIONAL_CUENTA_STRIPE_NO_OPERATIVA');
+    expect(mockStripe.transfers.create).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Bug real detectado al revisar el flujo de pagos (2026-08-03):
+   * `createEscrowPaymentIntent` marca la fila como 'retenido' en cuanto
+   * se crea el PaymentIntent en Stripe, ANTES de que el cliente confirme
+   * el Payment Sheet — si lo abandona, la fila se queda 'retenido' en BD
+   * para siempre aunque Stripe nunca haya autorizado nada. Antes de este
+   * fix, intentar liberar ese pago hacía fallar `paymentIntents.capture()`
+   * con un error genérico de Stripe a mitad del bucle.
+   */
+  it('lanza PAGO_NO_AUTORIZADO_TODAVIA si el cliente nunca confirmó el Payment Sheet (PaymentIntent no está en requires_capture)', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pagoRetenido()]);
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_payment_method' });
+
+    await expect(releasePayments('sr-1', 100)).rejects.toThrow('PAGO_NO_AUTORIZADO_TODAVIA');
+    expect(mockStripe.paymentIntents.capture).not.toHaveBeenCalled();
     expect(mockStripe.transfers.create).not.toHaveBeenCalled();
   });
 });
