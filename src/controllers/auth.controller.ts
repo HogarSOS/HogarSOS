@@ -197,24 +197,22 @@ export async function forgotPassword(req: Request, res: Response) {
 
   const { email } = parsed.data;
 
-  let link: string;
+  // AUDITORÍA (Bloque 4, 2026-08-03): la respuesta es SIEMPRE la misma
+  // — {success:true} — exista o no una cuenta con este email, y tanto
+  // si el envío del correo triunfa como si falla. Antes devolvía un
+  // código distinto (ej. 'user-not-found') según el caso, lo que
+  // permitía a cualquiera enumerar qué emails tienen cuenta en
+  // hogarSOS probando este endpoint sin autenticación. El detalle real
+  // solo se registra en el log del servidor, nunca en la respuesta.
   try {
-    link = await firebaseAuth.generatePasswordResetLink(email);
-  } catch (e) {
-    const codigoFirebase = (e as { code?: string })?.code?.replace('auth/', '') ?? 'unexpected';
-    console.log(`[auth.forgotPassword] No se pudo generar el enlace para ${email}: ${codigoFirebase}`);
-    return res.status(400).json({ error: 'No se pudo generar el enlace de recuperación', code: codigoFirebase });
-  }
+    const link = await firebaseAuth.generatePasswordResetLink(email);
+    const oobCode = new URL(link).searchParams.get('oobCode');
+    if (!oobCode) {
+      throw new Error(`Enlace de Firebase sin oobCode: ${link}`);
+    }
 
-  const oobCode = new URL(link).searchParams.get('oobCode');
-  if (!oobCode) {
-    console.error('[auth.forgotPassword] El enlace generado por Firebase no trae oobCode:', link);
-    return res.status(500).json({ error: 'Error interno', code: 'AUTH_RESET_LINK_INVALID' });
-  }
+    const enlacePropio = `https://hogarsos.es/auth/reset-password?mode=resetPassword&oobCode=${encodeURIComponent(oobCode)}`;
 
-  const enlacePropio = `https://hogarsos.es/auth/reset-password?mode=resetPassword&oobCode=${encodeURIComponent(oobCode)}`;
-
-  try {
     await enviarEmail(
       email,
       'Restablece tu contraseña de Hogar SOS',
@@ -225,8 +223,14 @@ export async function forgotPassword(req: Request, res: Response) {
        <p>Equipo de Hogar SOS</p>`
     );
   } catch (e) {
-    console.error('[auth.forgotPassword] Fallo al enviar el email por SMTP:', e);
-    return res.status(500).json({ error: 'No se pudo enviar el email', code: 'AUTH_RESET_EMAIL_SEND_FAILED' });
+    const codigoFirebase = (e as { code?: string })?.code?.replace('auth/', '');
+    // 'user-not-found' no es un error de verdad aquí — es el caso
+    // esperado de que el email no tiene cuenta, y no se distingue del
+    // éxito real en la respuesta. Cualquier otro fallo si se registra
+    // como tal, para poder detectarlo en los logs.
+    if (codigoFirebase !== 'user-not-found') {
+      console.error(`[auth.forgotPassword] Fallo al procesar la recuperación para ${email}:`, e);
+    }
   }
 
   return res.json({ success: true });
