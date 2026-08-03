@@ -320,8 +320,8 @@ router.get('/terminos', (_req, res) => {
         texto: 'Debes dar información veraz al registrarte. Eres responsable de mantener segura tu cuenta. Los profesionales deben superar un proceso de verificación (documento de identidad y, si aplica, certificados/seguro) antes de poder aceptar solicitudes.',
       },
       {
-        titulo: '3. Pagos y comisión',
-        texto: 'El pago de un servicio se autoriza a través de Stripe al aceptar el trabajo, pero no se cobra hasta que el profesional marca el servicio como completado. Hogar SOS retiene una comisión sobre el precio final del servicio; el resto se transfiere al profesional. Los precios los fija el profesional o se acuerdan entre ambas partes por chat.',
+        titulo: '3. Pagos y gastos de gestión',
+        texto: 'El pago de un servicio se autoriza a través de Stripe al aceptar el trabajo, pero no se cobra hasta que el profesional marca el servicio como completado. Hogar SOS aplica unos gastos de gestión sobre el precio del servicio, que incluyen la verificación de identidad del profesional, el pago protegido hasta la finalización del trabajo y el soporte de Hogar SOS en caso de incidencias; el resto se transfiere al profesional. Los precios los fija el profesional o se acuerdan entre ambas partes por chat.',
       },
       {
         titulo: '4. Cancelaciones y reembolsos',
