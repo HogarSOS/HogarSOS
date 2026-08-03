@@ -1,11 +1,12 @@
 import { Router } from 'express';
 
 /**
- * Página propia de "restablecer contraseña" — sustituye a la página
- * genérica que Firebase sirve por defecto en
- * `https://hogarsos.firebaseapp.com/__/auth/action` (configurado en
- * Firebase Console → Authentication → Plantillas → Restablecer
- * contraseña → "URL de acción").
+ * Página propia de "restablecer contraseña" a la que llegan los
+ * usuarios desde el email que envía `auth.controller.ts#forgotPassword`
+ * (enlace `https://hogarsos.es/auth/reset-password?mode=resetPassword&oobCode=...`
+ * construido a mano ahí, no vía el ajuste "URL de acción" de Firebase
+ * Console — ese ajuste devuelve un error interno de Firebase al
+ * guardar, `EMAIL_TEMPLATE_UPDATE_NOT_ALLOWED`, ajeno a este código).
  *
  * BUG 001 (QA, 2026-08-03): "el email llega, la contraseña se cambia
  * correctamente, pero después no permite iniciar sesión con la nueva
@@ -17,8 +18,8 @@ import { Router } from 'express';
  * escrito. La causa real es que la página POR DEFECTO de Firebase solo
  * tiene UN campo de contraseña, sin "confirmar contraseña" — cualquier
  * error de tecleo (autocorrección del móvil, un dedo de más) se guarda
- * tal cual, Firebase confirma "Password changed" iguialmente, y el
- * usuario quesa convencido de que su contraseña es una cuando en
+ * tal cual, Firebase confirma "Password changed" igualmente, y el
+ * usuario queda convencido de que su contraseña es una cuando en
  * realidad guardó otra. Esta página añade el campo de confirmación que
  * faltaba y valida que coincidan ANTES de enviar nada a Firebase.
  *
@@ -112,12 +113,11 @@ function paginaResetPassword(): string {
     const oobCode = params.get('oobCode');
     const modo = params.get('mode');
 
-    // La URL de acción personalizada de Firebase es GLOBAL: se aplica a
-    // TODAS las plantillas (verificar email, cambiar email, restablecer
-    // contraseña), no solo a esta última. Esta página solo sabe manejar
-    // "resetPassword" — cualquier otro modo se redirige tal cual a la
-    // página por defecto de Firebase, para no romper la verificación de
-    // email (que ya funcionaba bien) al arreglar el reseteo de contraseña.
+    // Esta página solo sabe manejar "resetPassword" (es el único modo
+    // que le envía forgotPassword() en el backend). Por si alguien
+    // llega aquí con otro modo — enlace mal copiado, bookmark viejo —
+    // se redirige a la página por defecto de Firebase en vez de mostrar
+    // un formulario que no le corresponde.
     if (modo !== 'resetPassword') {
       window.location.replace('https://hogarsos.firebaseapp.com/__/auth/action' + window.location.search);
     }
@@ -179,6 +179,20 @@ function paginaResetPassword(): string {
 }
 
 router.get('/', (_req, res) => {
+  // `helmet()` (index.ts) pone por defecto `script-src 'self'` (sin
+  // 'unsafe-inline') y `connect-src` heredado de `default-src 'self'`.
+  // Verificado en un navegador real (no solo con REST/Admin SDK): con
+  // esa CSP el <script> de esta página ni siquiera se ejecuta, y aunque
+  // se ejecutara, el fetch() a identitytoolkit.googleapis.com quedaría
+  // bloqueado — la página se queda colgada para siempre en "Comprobando
+  // el enlace…", indistinguible de un oobCode inválido para el usuario.
+  // Se sobrescribe la cabecera solo en esta ruta con lo mínimo que
+  // necesita: permitir el script inline y las llamadas a Identity
+  // Toolkit.
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; connect-src 'self' https://identitytoolkit.googleapis.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'"
+  );
   res.send(paginaResetPassword());
 });
 

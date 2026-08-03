@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { login, register, refreshToken, updateFcmToken, updateIdioma } from '../controllers/auth.controller';
+import { login, register, refreshToken, updateFcmToken, updateIdioma, forgotPassword } from '../controllers/auth.controller';
 import { authMiddleware } from '../middlewares/auth.middleware';
 import { asyncHandler } from '../utils/asyncHandler';
 
@@ -8,6 +8,7 @@ const router = Router();
 router.post('/register', asyncHandler(register));
 router.post('/login', asyncHandler(login));
 router.post('/refresh', asyncHandler(refreshToken));
+router.post('/forgot-password', asyncHandler(forgotPassword));
 router.patch('/me/fcm-token', authMiddleware(), asyncHandler(updateFcmToken));
 router.patch('/me/idioma', authMiddleware(), asyncHandler(updateIdioma));
 

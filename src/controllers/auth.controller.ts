@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { firebaseAuth } from '../config/firebase';
 import { prisma } from '../config/prisma';
+import { enviarEmail } from '../services/email.service';
 import {
   generateAccessToken,
   generateRefreshToken,
@@ -165,6 +166,70 @@ export async function login(req: Request, res: Response) {
     refreshToken: generateRefreshToken(payload),
     usuario: { id: usuario.id, nombre: usuario.nombre, role: usuario.role },
   });
+}
+
+const forgotPasswordSchema = z.object({
+  email: z.string().email(),
+});
+
+/**
+ * BUG 001 (QA, 2026-08-03): "el email llega, la contraseña se cambia
+ * correctamente, pero después no permite iniciar sesión con la nueva
+ * contraseña". La causa real era la página de Firebase (un solo campo,
+ * sin "confirmar contraseña" — ver passwordReset.routes.ts). La
+ * solución iba a ser configurar la "URL de acción personalizada" en
+ * Firebase Console para que el email de Firebase apuntara a nuestra
+ * propia página, pero la consola devuelve un error interno al guardar
+ * ese ajuste (`EMAIL_TEMPLATE_UPDATE_NOT_ALLOWED`, HTTP 400 en
+ * identitytoolkit.clients6.google.com — reproducido varias veces,
+ * ajeno a este código). Por eso este endpoint evita ese ajuste por
+ * completo: generamos el enlace con el Admin SDK, nos quedamos solo
+ * con el oobCode (lo único que de verdad valida Identity Toolkit — el
+ * dominio que lo aloja es irrelevante) y enviamos NOSOTROS el email
+ * con nuestra propia página como destino, por el SMTP de IONOS ya
+ * configurado (soporte@hogarsos.es).
+ */
+export async function forgotPassword(req: Request, res: Response) {
+  const parsed = forgotPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Introduce un email válido', code: 'VALIDATION_INVALID' });
+  }
+
+  const { email } = parsed.data;
+
+  let link: string;
+  try {
+    link = await firebaseAuth.generatePasswordResetLink(email);
+  } catch (e) {
+    const codigoFirebase = (e as { code?: string })?.code?.replace('auth/', '') ?? 'unexpected';
+    console.log(`[auth.forgotPassword] No se pudo generar el enlace para ${email}: ${codigoFirebase}`);
+    return res.status(400).json({ error: 'No se pudo generar el enlace de recuperación', code: codigoFirebase });
+  }
+
+  const oobCode = new URL(link).searchParams.get('oobCode');
+  if (!oobCode) {
+    console.error('[auth.forgotPassword] El enlace generado por Firebase no trae oobCode:', link);
+    return res.status(500).json({ error: 'Error interno', code: 'AUTH_RESET_LINK_INVALID' });
+  }
+
+  const enlacePropio = `https://hogarsos.es/auth/reset-password?mode=resetPassword&oobCode=${encodeURIComponent(oobCode)}`;
+
+  try {
+    await enviarEmail(
+      email,
+      'Restablece tu contraseña de Hogar SOS',
+      `<p>Hola,</p>
+       <p>Hemos recibido una solicitud para restablecer la contraseña de tu cuenta de Hogar SOS.</p>
+       <p><a href="${enlacePropio}">Restablecer mi contraseña</a></p>
+       <p>Si no has pedido este cambio, puedes ignorar este correo.</p>
+       <p>Equipo de Hogar SOS</p>`
+    );
+  } catch (e) {
+    console.error('[auth.forgotPassword] Fallo al enviar el email por SMTP:', e);
+    return res.status(500).json({ error: 'No se pudo enviar el email', code: 'AUTH_RESET_EMAIL_SEND_FAILED' });
+  }
+
+  return res.json({ success: true });
 }
 
 const fcmTokenSchema = z.object({

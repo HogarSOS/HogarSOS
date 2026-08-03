@@ -146,8 +146,8 @@ app.use('/stripe/onboarding', stripeOnboardingRoutes);
 // Página propia de restablecer contraseña — sustituye a la página
 // genérica de Firebase (sin campo de "confirmar contraseña", causa
 // real del BUG 001 de QA: un simple error de tecleo pasaba
-// desapercibido). Configurado como "URL de acción" en Firebase Console
-// → Authentication → Plantillas → Restablecer contraseña.
+// desapercibido). El email que trae hasta aquí lo manda el propio
+// backend (ver /api/auth/forgot-password), no Firebase.
 app.use('/auth/reset-password', passwordResetRoutes);
 
 // API
