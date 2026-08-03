@@ -86,6 +86,13 @@ model Professional {
   presupuestos          Presupuesto[]
 
   @@index([ubicacionActual], map: "idx_professionals_ubicacion_actual", type: Gist)
+  // disponible y estadoVerificacion: filtrados en CADA búsqueda de
+  // profesionales cercanos (searchProfessionals) y en el aviso a
+  // profesionales cercanos al crear una solicitud (notificarProfesionalesCercanos)
+  // — sin índice, ambos filtros caían en sequential scan sobre toda la
+  // tabla professionals en cuanto creciera más allá de un puñado de filas.
+  @@index([disponible])
+  @@index([estadoVerificacion])
   @@map("professionals")
 }
 
@@ -96,6 +103,10 @@ model ProfessionalCategory {
   professional   Professional    @relation(fields: [professionalId], references: [userId], onDelete: Cascade)
 
   @@id([professionalId, categoryId])
+  // La PK (professionalId, categoryId) no sirve para buscar por
+  // categoryId sola (no es la columna líder) — y notificarProfesionalesCercanos
+  // hace justo eso en cada solicitud nueva (JOIN ... WHERE pc.category_id = X).
+  @@index([categoryId])
   @@map("professional_categories")
 }
 
@@ -132,6 +143,18 @@ model ServiceRequest {
   profesional    Professional?            @relation(fields: [profesionalId], references: [userId])
 
   @@index([ubicacion], map: "idx_service_requests_ubicacion", type: Gist)
+  // clienteId/profesionalId: sin índice, "mis solicitudes" (cliente) y
+  // "mis trabajos asignados" (profesional) hacían sequential scan sobre
+  // toda la tabla — esta segunda además se sondea cada 10s desde
+  // home_profesional_screen.dart mientras la pestaña está abierta, la
+  // consulta más frecuente de toda la app.
+  @@index([clienteId])
+  @@index([profesionalId])
+  // (estado, categoryId): cubre la otra consulta sondeada cada 10s —
+  // solicitudes pendientes cercanas de la categoría del profesional
+  // (notificarProfesionalesCercanos / listNearbyRequests). Se combina
+  // con el índice espacial GiST de arriba vía bitmap AND.
+  @@index([estado, categoryId])
   @@map("service_requests")
 }
 
@@ -181,6 +204,10 @@ model Review {
   serviceRequest   ServiceRequest @relation(fields: [serviceRequestId], references: [id])
 
   @@unique([serviceRequestId, autorId])
+  // destinatarioId: sin índice, listar "mis valoraciones" (getProfile,
+  // getPublicProfile, getMisValoraciones — los tres filtran solo por
+  // este campo) hacía sequential scan sobre toda la tabla reviews.
+  @@index([destinatarioId])
   @@map("reviews")
 }
 
@@ -198,6 +225,7 @@ model Dispute {
   resueltaAt       DateTime?         @map("resuelta_at")
   serviceRequest   ServiceRequest    @relation(fields: [serviceRequestId], references: [id])
 
+  @@index([serviceRequestId])
   @@map("disputes")
 }
 
@@ -294,6 +322,7 @@ model CierreHoras {
   resueltaAt       DateTime?         @map("resuelta_at")
   serviceRequest   ServiceRequest    @relation(fields: [serviceRequestId], references: [id])
 
+  @@index([serviceRequestId])
   @@map("cierres_horas")
 }
 
