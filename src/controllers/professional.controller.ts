@@ -305,9 +305,23 @@ export async function updateMyCategories(req: Request, res: Response) {
 }
 
 /**
- * Inicia el onboarding de Stripe Connect para que el profesional pueda
- * recibir transferencias. Devuelve una URL de Stripe (hosted onboarding)
- * a la que la app debe redirigir/abrir en un WebView.
+ * Inicia el onboarding de Stripe Connect (o abre el flujo de edición si
+ * la cuenta ya está configurada) para que el profesional pueda recibir
+ * transferencias. Devuelve una URL de Stripe (hosted) a la que la app
+ * debe redirigir/abrir en un WebView.
+ *
+ * BUG 003 (QA, 2026-08-03): "una vez configurada la cuenta de cobro no
+ * puede modificarse". No era una limitación real de Stripe Connect —
+ * el backend SIEMPRE generaba un accountLink `type: 'account_onboarding'`,
+ * pensado para completar requisitos pendientes. Con una cuenta ya
+ * `charges_enabled`/`payouts_enabled` no queda ningún requisito
+ * pendiente, así que Stripe no muestra ningún campo editable con ese
+ * tipo de enlace — solo confirma que ya está lista y vuelve. El tipo
+ * correcto para dejar cambiar datos ya enviados (cuenta bancaria,
+ * datos personales) es `account_update`. El otro problema, real y
+ * mayor, era que el frontend ni siquiera mostraba esta tarjeta una vez
+ * `configurada` — sin ningún botón, daba igual qué tipo de enlace
+ * generase el backend (ver mi_perfil_profesional_screen.dart).
  */
 export async function startStripeOnboarding(req: Request, res: Response) {
   const userId = req.user!.userId;
@@ -338,12 +352,14 @@ export async function startStripeOnboarding(req: Request, res: Response) {
     await prisma.professional.update({ where: { userId }, data: { stripeAccountId: accountId } });
   }
 
+  const yaConfigurada = derivarEstadoCuentaStripe(profesional) === 'configurada';
+
   const appBaseUrl = process.env.APP_BASE_URL || 'https://hogarsos.com';
   const accountLink = await stripe.accountLinks.create({
     account: accountId,
     refresh_url: `${appBaseUrl}/stripe/onboarding/refresh`,
     return_url: `${appBaseUrl}/stripe/onboarding/completado`,
-    type: 'account_onboarding',
+    type: yaConfigurada ? 'account_update' : 'account_onboarding',
   });
 
   return res.json({ onboardingUrl: accountLink.url });
