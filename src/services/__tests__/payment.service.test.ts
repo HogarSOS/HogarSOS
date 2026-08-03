@@ -337,7 +337,7 @@ describe('obtenerResumenPagos', () => {
         id: 'pago-1',
         montoProfesional: 95,
         liberadoAt: new Date('2026-08-01T10:00:00Z'),
-        serviceRequest: { categoria: { nombre: 'Fontanería' }, descripcion: 'Fuga en el baño' },
+        serviceRequest: { categoria: { nombre: 'Fontanería' }, descripcion: 'Fuga en el baño', cliente: { nombre: 'Juan Pérez' } },
       },
     ]);
 
@@ -350,7 +350,7 @@ describe('obtenerResumenPagos', () => {
       })
     );
     expect(resumen.historial).toEqual([
-      { id: 'pago-1', monto: 95, fecha: new Date('2026-08-01T10:00:00Z'), categoria: 'Fontanería', descripcion: 'Fuga en el baño' },
+      { id: 'pago-1', monto: 95, fecha: new Date('2026-08-01T10:00:00Z'), categoria: 'Fontanería', descripcion: 'Fuga en el baño', nombreCliente: 'Juan Pérez' },
     ]);
   });
 

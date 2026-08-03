@@ -255,6 +255,7 @@ export interface ResumenPagoHistorial {
   fecha: Date;
   categoria: string;
   descripcion: string;
+  nombreCliente: string;
 }
 
 export interface ResumenPagos {
@@ -309,15 +310,22 @@ export async function obtenerResumenPagos(userId: string): Promise<ResumenPagos>
     where: { estado: 'liberado', serviceRequest: { profesionalId: userId } },
     orderBy: { liberadoAt: 'desc' },
     take: 50,
-    include: { serviceRequest: { include: { categoria: true } } },
+    include: { serviceRequest: { include: { categoria: true, cliente: true } } },
   });
 
+  // BUG 005 (QA, 2026-08-03): el historial solo mostraba la categoría
+  // ("Electricista") — con varios cobros de la misma categoría no había
+  // forma de distinguir uno de otro de un vistazo. El nombre del cliente
+  // (ya disponible vía la relación `cliente` de ServiceRequest, no hacía
+  // falta ningún dato nuevo) es mucho más identificable que repetir la
+  // categoría en cada fila.
   const historial: ResumenPagoHistorial[] = pagosLiberados.map((p) => ({
     id: p.id,
     monto: Number(p.montoProfesional),
     fecha: p.liberadoAt!,
     categoria: p.serviceRequest.categoria.nombre,
     descripcion: p.serviceRequest.descripcion,
+    nombreCliente: p.serviceRequest.cliente.nombre,
   }));
 
   return { estadoCuentaStripe, pendiente, disponible, moneda: 'eur', historial };

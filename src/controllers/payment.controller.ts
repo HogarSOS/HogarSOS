@@ -186,6 +186,7 @@ export async function getPaymentsSummary(req: Request, res: Response) {
       fecha: h.fecha,
       categoria: h.categoria,
       descripcion: h.descripcion,
+      nombreCliente: h.nombreCliente,
     })),
   });
 }
