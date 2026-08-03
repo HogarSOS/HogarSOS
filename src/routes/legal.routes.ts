@@ -351,6 +351,39 @@ router.get('/terminos', (_req, res) => {
   );
 });
 
+/**
+ * Página pública de eliminación de cuenta — requisito de la política
+ * de datos de usuario de Google Play (obligatoria desde abril de
+ * 2024): cualquier app que permita crear cuenta debe ofrecer una vía
+ * de eliminación tanto dentro de la app (Perfil → Eliminar cuenta,
+ * mismo endpoint DELETE /api/users/me) como por un enlace accesible
+ * sin instalar la app — esta página es esa segunda vía, y su URL es
+ * la que se declara en el formulario de seguridad de datos de Play
+ * Console.
+ */
+router.get('/eliminar-cuenta', (_req, res) => {
+  res.send(
+    pagina('Eliminar tu cuenta', [
+      {
+        titulo: 'Desde la app (inmediato)',
+        texto: 'Abre Hogar SOS → Perfil → Eliminar cuenta. La eliminación es inmediata y no se puede deshacer: se borra tu acceso y se anonimizan tus datos personales (nombre, email, teléfono, foto y, si eres profesional, tus documentos de verificación).',
+      },
+      {
+        titulo: 'Sin acceso a la app',
+        texto: 'Escríbenos a soporte@hogarsos.es desde el email de tu cuenta indicando que quieres eliminarla. Confirmaremos tu identidad y la eliminaremos en un plazo máximo de 30 días.',
+      },
+      {
+        titulo: 'Qué se elimina',
+        texto: 'Tu nombre, email, teléfono, foto de perfil y (si eres profesional) tus documentos de identidad/certificados/seguro. Tu cuenta de acceso (Firebase) se borra por completo — no podrás volver a iniciar sesión con ella.',
+      },
+      {
+        titulo: 'Qué se conserva',
+        texto: 'El historial de solicitudes, reseñas y pagos en los que participaste se conserva de forma anonimizada, porque forma parte del historial de la otra persona con la que trabajaste y, en el caso de los pagos, de nuestras obligaciones legales de contabilidad. Ya no está asociado a tu nombre, email ni teléfono.',
+      },
+    ], '/eliminar-cuenta')
+  );
+});
+
 router.get('/robots.txt', (_req, res) => {
   res.type('text/plain').send(`User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${SITIO_URL}/sitemap.xml`);
 });
@@ -362,6 +395,7 @@ router.get('/sitemap.xml', (_req, res) => {
   <url><loc>${SITIO_URL}/</loc></url>
   <url><loc>${SITIO_URL}/privacidad</loc></url>
   <url><loc>${SITIO_URL}/terminos</loc></url>
+  <url><loc>${SITIO_URL}/eliminar-cuenta</loc></url>
 </urlset>`
   );
 });
