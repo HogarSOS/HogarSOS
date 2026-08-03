@@ -110,6 +110,17 @@ function paginaResetPassword(): string {
     const API_KEY = '${FIREBASE_WEB_API_KEY}';
     const params = new URLSearchParams(window.location.search);
     const oobCode = params.get('oobCode');
+    const modo = params.get('mode');
+
+    // La URL de acción personalizada de Firebase es GLOBAL: se aplica a
+    // TODAS las plantillas (verificar email, cambiar email, restablecer
+    // contraseña), no solo a esta última. Esta página solo sabe manejar
+    // "resetPassword" — cualquier otro modo se redirige tal cual a la
+    // página por defecto de Firebase, para no romper la verificación de
+    // email (que ya funcionaba bien) al arreglar el reseteo de contraseña.
+    if (modo !== 'resetPassword') {
+      window.location.replace('https://hogarsos.firebaseapp.com/__/auth/action' + window.location.search);
+    }
 
     const el = (id) => document.getElementById(id);
     const mostrar = (id) => { ['cargando', 'formulario', 'exito', 'fallo'].forEach((otro) => el(otro).classList.toggle('oculto', otro !== id)); };
@@ -161,7 +172,7 @@ function paginaResetPassword(): string {
       }
     }
 
-    comprobarEnlace();
+    if (modo === 'resetPassword') comprobarEnlace();
   </script>
 </body>
 </html>`;
