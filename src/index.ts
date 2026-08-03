@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -55,6 +56,14 @@ app.use(
     credentials: true,
   })
 );
+
+// Comprime toda respuesta JSON (gzip) — antes cada búsqueda de
+// profesionales, lista de solicitudes, etc. viajaba sin comprimir.
+// Solo afecta al cuerpo de la RESPUESTA, no a cómo se parsea el
+// cuerpo de la petición — no interfiere con express.raw() del
+// webhook de Stripe, que necesita el body crudo de la petición
+// entrante, algo completamente distinto.
+app.use(compression());
 
 // Stripe Webhook (debe ir antes de express.json())
 app.post(
