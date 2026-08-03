@@ -194,7 +194,15 @@ const verificationSchema = z.object({
   certificadosUrl: z.array(z.string().url()).optional(),
   seguroRcUrl: z.string().url().optional(),
   categoriaIds: z.array(z.number().int()).min(1),
-  tarifaBase: z.number().positive(),
+  // Opcional desde la revisión de UX pre-lanzamiento: con el sistema de
+  // presupuestos por solicitud (cerrado/por_horas, ver payment.service.ts)
+  // el precio real ya no depende de esta tarifa declarada en el perfil —
+  // exigirla en la verificación era una fricción heredada de un modelo de
+  // precios que ya no existe. Se conserva porque el cliente todavía puede
+  // filtrar profesionales por "precio máximo" en la búsqueda (ver
+  // searchProfessionals más abajo), así que quien la rellene sigue
+  // beneficiándose de aparecer en ese filtro.
+  tarifaBase: z.number().positive().optional(),
   // Roadmap económico punto 4: HogarSOS no decide ni verifica esta
   // situación, solo registra lo que el profesional declara — por eso
   // no hay validación adicional más allá de que sea uno de los 3
@@ -405,6 +413,7 @@ export async function searchProfessionals(req: Request, res: Response) {
         p.user_id AS "userId", u.nombre, p.tarifa_base::double precision AS "tarifaBase",
         p.valoracion_media::double precision AS "valoracionMedia", p.total_trabajos AS "totalTrabajos",
         p.disponible, p.foto_perfil_url AS "fotoPerfilUrl", p.estado_verificacion AS "estadoVerificacion",
+        p.tipo_profesional AS "tipoProfesional",
         ST_Distance(p.ubicacion_actual, ST_SetSRID(ST_MakePoint(${longitud}, ${latitud}), 4326)::geography) AS "distanciaMetros"
       FROM professionals p
       JOIN users u ON u.id = p.user_id
@@ -439,6 +448,7 @@ export async function searchProfessionals(req: Request, res: Response) {
     disponible: p.disponible,
     fotoPerfilUrl: p.fotoPerfilUrl,
     estadoVerificacion: p.estadoVerificacion,
+    tipoProfesional: p.tipoProfesional,
     categorias: p.categorias.map((c) => c.category.nombre),
   }));
 
@@ -504,6 +514,7 @@ export async function getPublicProfile(req: Request, res: Response) {
     descripcion: profesional.descripcion,
     fotoPerfilUrl: profesional.fotoPerfilUrl,
     estadoVerificacion: profesional.estadoVerificacion,
+    tipoProfesional: profesional.tipoProfesional,
     categorias: profesional.categorias.map((c) => c.category.nombre),
     reviews: reviews.map((r) => ({
       autor: r.autor.nombre,

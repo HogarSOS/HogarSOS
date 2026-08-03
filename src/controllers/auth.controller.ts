@@ -81,7 +81,7 @@ export async function register(req: Request, res: Response) {
       `(id=${existente.id}, creado=${existente.createdAt.toISOString()}, firebaseUid=${existente.firebaseUid})`
     );
     return res.status(409).json({
-      error: 'Ya existe un usuario en la base de datos de hogarSOS con este email o teléfono', code: 'AUTH_USER_ALREADY_EXISTS',
+      error: 'Ya existe un usuario en la base de datos de Hogar SOS con este email o teléfono', code: 'AUTH_USER_ALREADY_EXISTS',
     });
   }
 
