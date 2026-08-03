@@ -28,6 +28,10 @@ model User {
   // la app antes de añadir soporte a inglés.
   idioma                   Idioma           @default(es)
   fotoPerfilUrl            String?          @map("foto_perfil_url")
+  // Solo se usa para clientes (Customer de Stripe para recordar tarjetas
+  // vía Payment Sheet con Ephemeral Key) — se crea de forma perezosa en
+  // el primer pago, no al registrarse.
+  stripeCustomerId         String?          @map("stripe_customer_id")
   valoracionMedia          Decimal          @default(0.00) @map("valoracion_media")
   totalValoraciones        Int              @default(0) @map("total_valoraciones")
   activo                   Boolean          @default(true)

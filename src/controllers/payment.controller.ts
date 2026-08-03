@@ -5,6 +5,8 @@ import { prisma } from '../config/prisma';
 import {
   createEscrowPaymentIntent,
   obtenerResumenPagos,
+  obtenerOCrearStripeCustomerId,
+  crearEphemeralKey,
   COMISION_CLIENTE_PORCENTAJE,
   COMISION_PROFESIONAL_PORCENTAJE,
 } from '../services/payment.service';
@@ -85,6 +87,12 @@ export async function createPaymentIntent(req: Request, res: Response) {
 
   const pagoInicial = solicitud.pagos.find((p) => p.presupuestoId === presupuesto.id && !p.ampliacionId);
 
+  // Se resuelve una sola vez por petición — los reintentos de abajo lo
+  // reutilizan para generar una Ephemeral Key fresca (siempre de un
+  // solo uso, no se puede reutilizar la de un intento de Payment Sheet
+  // anterior) sin volver a crear el Customer.
+  const stripeCustomerId = await obtenerOCrearStripeCustomerId(clienteId);
+
   let montoBase: number;
   let ampliacionId: string | undefined;
 
@@ -102,6 +110,8 @@ export async function createPaymentIntent(req: Request, res: Response) {
         montoBase: Number(pagoInicial.montoBase),
         montoTotal: Number(pagoInicial.montoTotal),
         comisionPlataforma: Number(pagoInicial.comisionPlataforma),
+        customerId: stripeCustomerId,
+        ephemeralKeySecret: await crearEphemeralKey(stripeCustomerId),
       });
     }
 
@@ -118,6 +128,8 @@ export async function createPaymentIntent(req: Request, res: Response) {
           montoBase: Number(ultimoPagoAmpliacion.montoBase),
           montoTotal: Number(ultimoPagoAmpliacion.montoTotal),
           comisionPlataforma: Number(ultimoPagoAmpliacion.comisionPlataforma),
+          customerId: stripeCustomerId,
+          ephemeralKeySecret: await crearEphemeralKey(stripeCustomerId),
         });
       }
       return res.status(409).json({ error: 'No hay nada pendiente de autorizar para esta solicitud', code: 'PAYMENT_NOTHING_PENDING' });
@@ -129,11 +141,12 @@ export async function createPaymentIntent(req: Request, res: Response) {
         : Number(ampliacionSinAutorizar.horasAdicionales) * Number(presupuesto.tarifaHora);
   }
 
-  const { pago, clientSecret } = await createEscrowPaymentIntent({
+  const { pago, clientSecret, customerId, ephemeralKeySecret } = await createEscrowPaymentIntent({
     serviceRequestId,
     presupuestoId: presupuesto.id,
     ampliacionId,
     montoBase,
+    clienteStripeCustomerId: stripeCustomerId,
   });
 
   return res.status(201).json({
@@ -142,6 +155,8 @@ export async function createPaymentIntent(req: Request, res: Response) {
     montoBase: Number(pago.montoBase),
     montoTotal: Number(pago.montoTotal),
     comisionPlataforma: Number(pago.comisionPlataforma),
+    customerId,
+    ephemeralKeySecret,
   });
 }
 

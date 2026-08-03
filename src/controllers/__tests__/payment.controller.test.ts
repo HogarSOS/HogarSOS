@@ -8,14 +8,22 @@ jest.mock('../../config/prisma', () => ({
 
 jest.mock('../../services/payment.service', () => ({
   createEscrowPaymentIntent: jest.fn(),
+  obtenerOCrearStripeCustomerId: jest.fn(),
+  crearEphemeralKey: jest.fn(),
 }));
 
 import { prisma } from '../../config/prisma';
-import { createEscrowPaymentIntent } from '../../services/payment.service';
+import {
+  createEscrowPaymentIntent,
+  obtenerOCrearStripeCustomerId,
+  crearEphemeralKey,
+} from '../../services/payment.service';
 import { createPaymentIntent } from '../payment.controller';
 
 const mockPrisma = prisma as any;
 const mockCreateEscrow = createEscrowPaymentIntent as jest.Mock;
+const mockObtenerCustomerId = obtenerOCrearStripeCustomerId as jest.Mock;
+const mockCrearEphemeralKey = crearEphemeralKey as jest.Mock;
 
 function fakeRes(): Response {
   const res: any = {};
@@ -53,7 +61,11 @@ describe('createPaymentIntent', () => {
     mockCreateEscrow.mockResolvedValue({
       pago: { id: 'pago-1', montoBase: 95.24, montoTotal: 100, comisionPlataforma: 10 },
       clientSecret: 'secret_123',
+      customerId: 'cus_123',
+      ephemeralKeySecret: 'ek_123',
     });
+    mockObtenerCustomerId.mockResolvedValue('cus_123');
+    mockCrearEphemeralKey.mockResolvedValue('ek_123');
   });
 
   it('usa el monto del presupuesto cerrado aceptado (autorización inicial)', async () => {

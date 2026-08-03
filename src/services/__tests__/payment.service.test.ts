@@ -3,6 +3,7 @@ jest.mock('../../config/prisma', () => ({
     payment: { findMany: jest.fn(), update: jest.fn(), create: jest.fn() },
     serviceRequest: { findUnique: jest.fn() },
     professional: { findUnique: jest.fn(), update: jest.fn() },
+    user: { findUniqueOrThrow: jest.fn(), update: jest.fn() },
   },
 }));
 
@@ -12,12 +13,22 @@ jest.mock('../../config/stripe', () => ({
     transfers: { create: jest.fn() },
     accounts: { retrieve: jest.fn() },
     balance: { retrieve: jest.fn() },
+    customers: { create: jest.fn() },
+    ephemeralKeys: { create: jest.fn() },
   },
 }));
 
 import { prisma } from '../../config/prisma';
 import { stripe } from '../../config/stripe';
-import { releasePayments, refundPayment, calcularDesglose, obtenerResumenPagos } from '../payment.service';
+import {
+  releasePayments,
+  refundPayment,
+  calcularDesglose,
+  obtenerResumenPagos,
+  obtenerOCrearStripeCustomerId,
+  crearEphemeralKey,
+  createEscrowPaymentIntent,
+} from '../payment.service';
 
 const mockPrisma = prisma as any;
 const mockStripe = stripe as any;
@@ -29,6 +40,74 @@ describe('calcularDesglose', () => {
     expect(montoTotalCliente).toBe(105);
     expect(montoProfesional).toBe(95);
     expect(comisionPlataforma).toBe(10);
+  });
+});
+
+describe('obtenerOCrearStripeCustomerId', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('reutiliza el stripeCustomerId ya guardado sin llamar a Stripe', async () => {
+    mockPrisma.user.findUniqueOrThrow.mockResolvedValue({ id: 'u1', stripeCustomerId: 'cus_existente' });
+
+    const result = await obtenerOCrearStripeCustomerId('u1');
+
+    expect(result).toBe('cus_existente');
+    expect(mockStripe.customers.create).not.toHaveBeenCalled();
+    expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('crea el Customer en Stripe y lo persiste si el usuario no tiene uno todavía', async () => {
+    mockPrisma.user.findUniqueOrThrow.mockResolvedValue({
+      id: 'u1',
+      nombre: 'Ana Sánchez',
+      email: 'ana@example.com',
+      telefono: null,
+      stripeCustomerId: null,
+    });
+    mockStripe.customers.create.mockResolvedValue({ id: 'cus_nuevo' });
+
+    const result = await obtenerOCrearStripeCustomerId('u1');
+
+    expect(result).toBe('cus_nuevo');
+    expect(mockStripe.customers.create).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'Ana Sánchez', email: 'ana@example.com', metadata: { userId: 'u1' } })
+    );
+    expect(mockPrisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'u1' },
+      data: { stripeCustomerId: 'cus_nuevo' },
+    });
+  });
+});
+
+describe('createEscrowPaymentIntent', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockStripe.ephemeralKeys.create.mockResolvedValue({ secret: 'ek_test_123' });
+    mockStripe.paymentIntents.create.mockResolvedValue({ id: 'pi_nuevo', client_secret: 'secret_nuevo' });
+    mockPrisma.payment.create.mockResolvedValue({ id: 'pago-1', montoBase: 100, montoTotal: 105, comisionPlataforma: 10 });
+  });
+
+  it('asocia el Customer y activa setup_future_usage sin tocar capture_method manual', async () => {
+    const { customerId, ephemeralKeySecret } = await createEscrowPaymentIntent({
+      serviceRequestId: 'sr-1',
+      presupuestoId: 'pres-1',
+      montoBase: 100,
+      clienteStripeCustomerId: 'cus_123',
+    });
+
+    expect(mockStripe.ephemeralKeys.create).toHaveBeenCalledWith({ customer: 'cus_123' }, { apiVersion: '2024-04-10' });
+    expect(mockStripe.paymentIntents.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customer: 'cus_123',
+        setup_future_usage: 'off_session',
+        capture_method: 'manual',
+        payment_method_types: ['card'],
+      })
+    );
+    expect(customerId).toBe('cus_123');
+    expect(ephemeralKeySecret).toBe('ek_test_123');
   });
 });
 

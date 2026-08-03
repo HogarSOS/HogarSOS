@@ -56,15 +56,44 @@ export function calcularDesglose(montoBase: number) {
   return { montoBase, montoTotalCliente, montoProfesional, comisionPlataforma };
 }
 
+/**
+ * Devuelve el Customer de Stripe del cliente, creándolo la primera vez
+ * (perezoso: no se crea al registrarse, solo en su primer pago real).
+ * Necesario para que Payment Sheet pueda ofrecer "recordar esta tarjeta"
+ * (`setup_future_usage`) y mostrarla en pagos futuros.
+ */
+export async function obtenerOCrearStripeCustomerId(userId: string): Promise<string> {
+  const usuario = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+  if (usuario.stripeCustomerId) return usuario.stripeCustomerId;
+
+  const customer = await stripe.customers.create({
+    name: usuario.nombre,
+    email: usuario.email ?? undefined,
+    phone: usuario.telefono ?? undefined,
+    metadata: { userId },
+  });
+
+  await prisma.user.update({ where: { id: userId }, data: { stripeCustomerId: customer.id } });
+  return customer.id;
+}
+
+/** Ephemeral Key de un solo uso para que Payment Sheet lea los métodos de pago guardados de este Customer. */
+export async function crearEphemeralKey(customerId: string): Promise<string> {
+  const ephemeralKey = await stripe.ephemeralKeys.create({ customer: customerId }, { apiVersion: '2024-04-10' });
+  return ephemeralKey.secret!;
+}
+
 export async function createEscrowPaymentIntent(params: {
   serviceRequestId: string;
   presupuestoId: string;
   ampliacionId?: string;
   montoBase: number;
-  clienteStripeCustomerId?: string;
+  clienteStripeCustomerId: string;
 }) {
   const { serviceRequestId, presupuestoId, ampliacionId, montoBase, clienteStripeCustomerId } = params;
   const { montoTotalCliente, montoProfesional, comisionPlataforma } = calcularDesglose(montoBase);
+
+  const ephemeralKeySecret = await crearEphemeralKey(clienteStripeCustomerId);
 
   const paymentIntent = await stripe.paymentIntents.create({
     amount: Math.round(montoTotalCliente * 100), // Stripe trabaja en céntimos
@@ -79,6 +108,12 @@ export async function createEscrowPaymentIntent(params: {
     // para un pago retenido de días.
     payment_method_types: ['card'],
     customer: clienteStripeCustomerId,
+    // Guarda la tarjeta en el Customer tras la autorización para que
+    // Payment Sheet la ofrezca en el próximo pago (presupuesto,
+    // ampliación o un trabajo distinto). No afecta al modelo de captura
+    // manual/escrow: solo decide qué pasa con el método de pago
+    // DESPUÉS de que este PaymentIntent se autorice.
+    setup_future_usage: 'off_session',
     metadata: { serviceRequestId, presupuestoId, ...(ampliacionId ? { ampliacionId } : {}) },
   });
 
@@ -96,7 +131,12 @@ export async function createEscrowPaymentIntent(params: {
     },
   });
 
-  return { pago, clientSecret: paymentIntent.client_secret };
+  return {
+    pago,
+    clientSecret: paymentIntent.client_secret,
+    customerId: clienteStripeCustomerId,
+    ephemeralKeySecret,
+  };
 }
 
 /**
