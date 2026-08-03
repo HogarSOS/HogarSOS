@@ -30,7 +30,7 @@ const CATEGORIAS = [
   'Carpintería',
   'Albañilería',
   'Tejados y cubiertas',
-  'Cristalería',
+  'Instalación de cristales',
   'Carpintería metálica',
   'Antenas y telecomunicaciones',
   'Sistemas de seguridad',

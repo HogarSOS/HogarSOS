@@ -63,8 +63,11 @@ const CATEGORIAS: Record<string, { es: string; en: string }> = {
   albañilería: { es: 'albañilería', en: 'masonry' },
   albanileria: { es: 'albañilería', en: 'masonry' },
   'tejados y cubiertas': { es: 'tejados y cubiertas', en: 'roofing' },
-  cristalería: { es: 'cristalería', en: 'glazing' },
-  cristaleria: { es: 'cristalería', en: 'glazing' },
+  'instalación de cristales': { es: 'instalación de cristales', en: 'glass installation' },
+  'instalacion de cristales': { es: 'instalación de cristales', en: 'glass installation' },
+  // Nombre anterior de esta categoría, por si queda algún dato viejo:
+  cristalería: { es: 'instalación de cristales', en: 'glass installation' },
+  cristaleria: { es: 'instalación de cristales', en: 'glass installation' },
   'carpintería metálica': { es: 'carpintería metálica', en: 'metalwork' },
   'carpinteria metalica': { es: 'carpintería metálica', en: 'metalwork' },
   'antenas y telecomunicaciones': { es: 'antenas y telecomunicaciones', en: 'antenna & telecom services' },
