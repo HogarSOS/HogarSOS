@@ -73,7 +73,7 @@ const CATEGORIAS: Record<string, { es: string; en: string }> = {
   'limpieza de cristales': { es: 'limpieza de cristales', en: 'window cleaning' },
   piscinas: { es: 'piscinas', en: 'pool services' },
   'control de plagas': { es: 'control de plagas', en: 'pest control' },
-  'veterinaria a domicilio': { es: 'veterinaria a domicilio', en: 'home veterinary services' },
+  'pet sitter': { es: 'pet sitter', en: 'pet sitter' },
   'técnico de telefonía': { es: 'técnico de telefonía', en: 'a phone technician' },
   'tecnico de telefonia': { es: 'técnico de telefonía', en: 'a phone technician' },
   'masajes a domicilio': { es: 'masajes a domicilio', en: 'home massage' },

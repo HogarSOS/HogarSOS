@@ -38,7 +38,7 @@ const CATEGORIAS = [
   'Limpieza de cristales',
   'Piscinas',
   'Control de plagas',
-  'Veterinaria a domicilio',
+  'Pet sitter',
   'Técnico de telefonía',
 ];
 
