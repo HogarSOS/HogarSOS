@@ -17,6 +17,7 @@ import reviewRoutes from './routes/review.routes';
 import uploadRoutes from './routes/upload.routes';
 import legalRoutes, { paginaInicio } from './routes/legal.routes';
 import stripeOnboardingRoutes from './routes/stripeOnboarding.routes';
+import passwordResetRoutes from './routes/passwordReset.routes';
 import { stripeWebhook } from './controllers/payment.controller';
 import { asyncHandler } from './utils/asyncHandler';
 
@@ -141,6 +142,13 @@ app.use('/', legalRoutes);
 // return_url/refresh_url los abre un navegador externo sin sesión de la
 // app, igual que las páginas legales de arriba.
 app.use('/stripe/onboarding', stripeOnboardingRoutes);
+
+// Página propia de restablecer contraseña — sustituye a la página
+// genérica de Firebase (sin campo de "confirmar contraseña", causa
+// real del BUG 001 de QA: un simple error de tecleo pasaba
+// desapercibido). Configurado como "URL de acción" en Firebase Console
+// → Authentication → Plantillas → Restablecer contraseña.
+app.use('/auth/reset-password', passwordResetRoutes);
 
 // API
 app.use('/api/auth', authRoutes);
