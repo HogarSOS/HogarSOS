@@ -123,6 +123,15 @@ export function validarConfiguracion(): ResultadoValidacion {
     errores.push('STRIPE_SECRET_KEY no empieza por "sk_test" ni por "sk_live". ¿Has pegado una clave publicable (pk_) o restringida (rk_) por error?');
   }
 
+  // Un espacio o salto de línea sobrante (típico al pegar en el dashboard
+  // de Render) no cambia el prefijo, así que las dos comprobaciones de
+  // arriba lo dejan pasar — pero Node revienta con ERR_INVALID_CHAR en la
+  // primera petición real a Stripe. Mejor detectarlo aquí que en el primer
+  // pago de un cliente real.
+  if (claveStripe && claveStripe !== claveStripe.trim()) {
+    errores.push('STRIPE_SECRET_KEY tiene espacios o saltos de línea sobrantes al principio o al final. Vuelve a pegarla en Render sin espacios extra.');
+  }
+
   if (esProduccion() && esClaveTest) {
     // Escotilla explícita para el caso legítimo de un entorno de staging
     // que corre con NODE_ENV=production contra Stripe de pruebas.
@@ -143,6 +152,9 @@ export function validarConfiguracion(): ResultadoValidacion {
   const secretoWebhook = process.env.STRIPE_WEBHOOK_SECRET ?? '';
   if (secretoWebhook && !secretoWebhook.startsWith('whsec_')) {
     errores.push('STRIPE_WEBHOOK_SECRET no empieza por "whsec_". Debe ser el "Signing secret" del endpoint, no su ID (we_...) ni la clave de API.');
+  }
+  if (secretoWebhook && secretoWebhook !== secretoWebhook.trim()) {
+    errores.push('STRIPE_WEBHOOK_SECRET tiene espacios o saltos de línea sobrantes al principio o al final. Vuelve a pegarlo en Render sin espacios extra.');
   }
 
   // --- APP_BASE_URL ---

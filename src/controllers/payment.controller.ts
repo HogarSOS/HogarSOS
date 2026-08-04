@@ -245,7 +245,7 @@ export async function stripeWebhook(req: Request, res: Response) {
     event = stripe.webhooks.constructEvent(
       req.body,
       signature as string,
-      process.env.STRIPE_WEBHOOK_SECRET as string
+      (process.env.STRIPE_WEBHOOK_SECRET as string).trim()
     );
   } catch (err) {
     return res.status(400).send(`Firma de webhook inválida: ${(err as Error).message}`);
