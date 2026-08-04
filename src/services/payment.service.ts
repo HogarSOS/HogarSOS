@@ -2,7 +2,12 @@ import Stripe from 'stripe';
 import { Payment, Prisma } from '@prisma/client';
 import { stripe } from '../config/stripe';
 import { prisma } from '../config/prisma';
-import { sincronizarEstadoCuentaStripe, derivarEstadoCuentaStripe, EstadoCuentaStripe } from './professional.service';
+import {
+  sincronizarEstadoCuentaStripe,
+  derivarEstadoCuentaStripe,
+  invalidarCuentaStripeSiEsDeOtroModo,
+  EstadoCuentaStripe,
+} from './professional.service';
 
 export const COMISION_CLIENTE_PORCENTAJE = Number(process.env.PLATFORM_COMMISSION_CLIENT_PERCENT ?? 5);
 export const COMISION_PROFESIONAL_PORCENTAJE = Number(process.env.PLATFORM_COMMISSION_PROFESSIONAL_PERCENT ?? 5);
@@ -854,7 +859,7 @@ export async function obtenerResumenPagos(userId: string): Promise<ResumenPagos>
   const profesional = await prisma.professional.findUnique({ where: { userId } });
   if (!profesional) throw new Error('PROFESSIONAL_NOT_FOUND');
 
-  const estadoCuentaStripe = derivarEstadoCuentaStripe(profesional);
+  let estadoCuentaStripe = derivarEstadoCuentaStripe(profesional);
 
   let pendiente = 0;
   let disponible = 0;
@@ -862,9 +867,18 @@ export async function obtenerResumenPagos(userId: string): Promise<ResumenPagos>
   // Sin cuenta Stripe todavía (ni siquiera empezó el onboarding) no hay
   // nada que consultar — 0/0 es el estado correcto, no un error.
   if (profesional.stripeAccountId) {
-    const balance = await stripe.balance.retrieve({ stripeAccount: profesional.stripeAccountId });
-    pendiente = _sumarImporteEur(balance.pending);
-    disponible = _sumarImporteEur(balance.available);
+    try {
+      const balance = await stripe.balance.retrieve({ stripeAccount: profesional.stripeAccountId });
+      pendiente = _sumarImporteEur(balance.pending);
+      disponible = _sumarImporteEur(balance.available);
+    } catch (err) {
+      // Cuenta Connect de un modo (test/live) distinto al de la clave
+      // actual — no es un fallo de Stripe, es un dato inválido en BD.
+      // Se limpia y se responde 0/0 + 'pendiente' en vez de un 500, así
+      // el profesional ve el botón para rehacer el onboarding.
+      if (!(await invalidarCuentaStripeSiEsDeOtroModo(userId, err))) throw err;
+      estadoCuentaStripe = 'pendiente';
+    }
   }
 
   const pagosLiberados = await prisma.payment.findMany({

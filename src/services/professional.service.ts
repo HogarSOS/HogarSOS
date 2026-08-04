@@ -5,6 +5,40 @@ import { Professional } from '@prisma/client';
 export type EstadoCuentaStripe = 'configurada' | 'pendiente' | 'requiere_actualizacion';
 
 /**
+ * Cuentas Connect creadas en modo test (antes de pasar Stripe a Live el
+ * 2026-08-04) quedan con un `stripeAccountId` que la clave live no
+ * puede resolver — Stripe rechaza CUALQUIER operación sobre ellas
+ * (accounts.retrieve, balance.retrieve, transfers...) con este mismo
+ * mensaje fijo, sin importar el endpoint. Se distingue de un fallo
+ * transitorio de Stripe para no tratarlo como "reintentar más tarde":
+ * nunca va a dejar de fallar, el profesional tiene que rehacer el alta.
+ */
+function esCuentaStripeDeOtroModo(err: unknown): boolean {
+  return err instanceof Error && /was a (test|live) account created with a (test|live)mode key/.test(err.message);
+}
+
+/**
+ * Si el error es el de arriba, limpia la cuenta Connect inválida para
+ * que `derivarEstadoCuentaStripe` vuelva a 'pendiente' y el profesional
+ * pueda rehacer el onboarding desde cero (botón "Configurar cuenta de
+ * cobro" en el Centro de Pagos). Devuelve si lo hizo, para que el
+ * llamador sepa si ya quedó resuelto o si debe relanzar el error tal cual.
+ */
+export async function invalidarCuentaStripeSiEsDeOtroModo(userId: string, err: unknown): Promise<boolean> {
+  if (!esCuentaStripeDeOtroModo(err)) return false;
+  await prisma.professional.update({
+    where: { userId },
+    data: {
+      stripeAccountId: null,
+      stripeDetailsSubmitted: false,
+      stripeChargesEnabled: false,
+      stripePayoutsEnabled: false,
+    },
+  });
+  return true;
+}
+
+/**
  * Deriva el estado visible al usuario a partir de los 3 flags que
  * Stripe reporta para una cuenta Connect. `stripeAccountId` nulo (nunca
  * empezó el onboarding) también cuenta como 'pendiente'.
@@ -80,7 +114,15 @@ export async function intentarAprobacionAutomatica(profesional: Professional): P
  * dispara la comprobación sin tener que tocarlos uno a uno.
  */
 export async function sincronizarEstadoCuentaStripe(userId: string, accountId: string) {
-  const account = await stripe.accounts.retrieve(accountId);
+  let account;
+  try {
+    account = await stripe.accounts.retrieve(accountId);
+  } catch (err) {
+    if (await invalidarCuentaStripeSiEsDeOtroModo(userId, err)) {
+      return prisma.professional.findUniqueOrThrow({ where: { userId } });
+    }
+    throw err;
+  }
 
   const actualizado = await prisma.professional.update({
     where: { userId },
