@@ -121,6 +121,24 @@ export function calcularDesglose(montoBase: number) {
 }
 
 /**
+ * Un stripeCustomerId guardado deja de existir si se creó contra una
+ * cuenta/modo de Stripe distinto al actual — el caso real fue el cambio de
+ * test a live: los Customer de test no existen en live (son espacios
+ * completamente separados), así que todo usuario que ya hubiera pagado
+ * antes del cambio se quedaba con un id que Stripe rechaza con
+ * resource_missing en CADA intento de pago futuro.
+ */
+async function stripeCustomerExiste(customerId: string): Promise<boolean> {
+  try {
+    const customer = await stripe.customers.retrieve(customerId);
+    return !customer.deleted;
+  } catch (err) {
+    if (err instanceof Stripe.errors.StripeInvalidRequestError && err.code === 'resource_missing') return false;
+    throw err;
+  }
+}
+
+/**
  * Devuelve el Customer de Stripe del cliente, creándolo la primera vez
  * (perezoso: no se crea al registrarse, solo en su primer pago real).
  * Necesario para que Payment Sheet pueda ofrecer "recordar esta tarjeta"
@@ -128,7 +146,9 @@ export function calcularDesglose(montoBase: number) {
  */
 export async function obtenerOCrearStripeCustomerId(userId: string): Promise<string> {
   const usuario = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
-  if (usuario.stripeCustomerId) return usuario.stripeCustomerId;
+  if (usuario.stripeCustomerId && (await stripeCustomerExiste(usuario.stripeCustomerId))) {
+    return usuario.stripeCustomerId;
+  }
 
   const customer = await stripe.customers.create({
     name: usuario.nombre,

@@ -20,11 +20,12 @@ jest.mock('../../config/stripe', () => ({
     refunds: { create: jest.fn() },
     accounts: { retrieve: jest.fn() },
     balance: { retrieve: jest.fn() },
-    customers: { create: jest.fn() },
+    customers: { create: jest.fn(), retrieve: jest.fn() },
     ephemeralKeys: { create: jest.fn() },
   },
 }));
 
+import Stripe from 'stripe';
 import { prisma } from '../../config/prisma';
 import { stripe } from '../../config/stripe';
 import {
@@ -57,14 +58,37 @@ describe('obtenerOCrearStripeCustomerId', () => {
     jest.clearAllMocks();
   });
 
-  it('reutiliza el stripeCustomerId ya guardado sin llamar a Stripe', async () => {
+  it('reutiliza el stripeCustomerId ya guardado si Stripe confirma que existe', async () => {
     mockPrisma.user.findUniqueOrThrow.mockResolvedValue({ id: 'u1', stripeCustomerId: 'cus_existente' });
+    mockStripe.customers.retrieve.mockResolvedValue({ id: 'cus_existente', deleted: false });
 
     const result = await obtenerOCrearStripeCustomerId('u1');
 
     expect(result).toBe('cus_existente');
     expect(mockStripe.customers.create).not.toHaveBeenCalled();
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
+  });
+
+  it('crea un Customer nuevo si el guardado ya no existe en Stripe (p.ej. se creó en modo test y ahora corre en live)', async () => {
+    mockPrisma.user.findUniqueOrThrow.mockResolvedValue({
+      id: 'u1',
+      nombre: 'Ana Sánchez',
+      email: 'ana@example.com',
+      telefono: null,
+      stripeCustomerId: 'cus_de_test',
+    });
+    mockStripe.customers.retrieve.mockRejectedValue(
+      new Stripe.errors.StripeInvalidRequestError({ code: 'resource_missing', param: 'customer' })
+    );
+    mockStripe.customers.create.mockResolvedValue({ id: 'cus_nuevo' });
+
+    const result = await obtenerOCrearStripeCustomerId('u1');
+
+    expect(result).toBe('cus_nuevo');
+    expect(mockPrisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'u1' },
+      data: { stripeCustomerId: 'cus_nuevo' },
+    });
   });
 
   it('crea el Customer en Stripe y lo persiste si el usuario no tiene uno todavía', async () => {
