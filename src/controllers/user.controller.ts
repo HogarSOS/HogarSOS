@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { firebaseAuth } from '../config/firebase';
+import { marcarArchivosDeUsuarioParaBorrado } from '../services/archivo.service';
 
 function serializarUsuario(usuario: {
   id: string;
@@ -106,6 +107,20 @@ export async function deleteMe(req: Request, res: Response) {
       console.error(`[user.deleteMe] No se pudo borrar el usuario de Firebase (${usuario.firebaseUid}) para ${userId}:`, e);
     }
   }
+
+  // RGPD Art. 17 (auditoría B4). Antes esto solo ponía las URLs a NULL en
+  // la base de datos: el JPEG del documento de identidad seguía en el
+  // disco de Render, servido públicamente en su URL, para siempre. Es
+  // decir, se le decía al usuario que sus datos estaban borrados cuando
+  // su DNI seguía accesible.
+  //
+  // Borrado LÓGICO aquí (marca `eliminadoAt`) y físico en la tarea
+  // programada `limpiar-archivos-huerfanos`: así el borrado de cuenta
+  // responde al instante y un fallo de disco no deja la operación a
+  // medias. En cuanto se marca, `servirArchivo` ya devuelve 404 — el
+  // acceso se corta de inmediato, no cuando pase la tarea.
+  const archivosMarcados = await marcarArchivosDeUsuarioParaBorrado(userId);
+  console.log(`[user.deleteMe] ${archivosMarcados} archivo(s) de ${userId} marcados para borrado.`);
 
   await prisma.$transaction(async (tx) => {
     await tx.user.update({

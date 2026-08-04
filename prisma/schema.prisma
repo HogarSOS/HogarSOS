@@ -41,6 +41,7 @@ model User {
   reviewsEscritas          Review[]         @relation("AutorReview")
   reviewsRecibidas         Review[]         @relation("DestinatarioReview")
   serviceRequestsAsCliente ServiceRequest[] @relation("ClienteRequests")
+  archivos                 ArchivoSubido[]
 
   @@map("users")
 }
@@ -181,11 +182,57 @@ model Payment {
   stripeTransferId      String?        @map("stripe_transfer_id")
   createdAt             DateTime       @default(now()) @map("created_at")
   liberadoAt            DateTime?      @map("liberado_at")
+
+  // --- Liberación en dos fases (captura -> transferencia) ---
+  //
+  // releasePayments hace tres efectos por fila que no pueden ser
+  // atómicos entre sí (capture en Stripe, transfer en Stripe, escritura
+  // aquí). Estas columnas son el registro write-ahead que permite saber
+  // en cuál de los tres se quedó si el proceso muere en medio, y
+  // reanudar sin repetir lo ya hecho ni perder el dinero capturado.
+  //
+  // El PLAN (cuánto de esta autorización se va a consumir) se congela
+  // aquí ANTES de llamar a Stripe. Es deliberadamente independiente de
+  // montoBase/montoTotal/montoProfesional, que siguen guardando lo
+  // AUTORIZADO y no se tocan hasta el final: si se sobrescribieran al
+  // empezar, un reintento ya no tendría con qué re-planificar.
+  capturadoBase         Decimal?       @map("capturado_base")
+  capturadoTotal        Decimal?       @map("capturado_total")
+  capturadoProfesional  Decimal?       @map("capturado_profesional")
+  // El ch_... que devuelve la captura. Imprescindible para el
+  // source_transaction del transfer si hay que reintentar en otra
+  // ejecución distinta a la que capturó.
+  stripeChargeId        String?        @map("stripe_charge_id")
+  capturadoAt           DateTime?      @map("capturado_at")
+  // Lease de exclusión mutua entre ejecuciones concurrentes de
+  // releasePayments sobre la misma solicitud. Con expiración (no es un
+  // lock permanente) para que un reinicio de Render en pleno vuelo no
+  // deje el pago bloqueado para siempre.
+  liberacionEnCursoAt   DateTime?      @map("liberacion_en_curso_at")
+  intentosLiberacion    Int            @default(0) @map("intentos_liberacion")
+  ultimoErrorLiberacion String?        @map("ultimo_error_liberacion")
+  // Distinto de liberacionEnCursoAt (que se pone a null al soltar el
+  // lease): este NO se limpia nunca, así que es el que permite calcular
+  // el backoff exponencial del reintento automático — sin él, la tarea
+  // programada no podría distinguir "falló hace 10 segundos" de "falló
+  // hace dos días" y martillearía Stripe cada 10 minutos.
+  ultimoIntentoLiberacionAt DateTime?  @map("ultimo_intento_liberacion_at")
+  // Marca de que ya se avisó a cliente y profesional de que esta
+  // autorización está a punto de caducar (~7 días es el máximo que
+  // Stripe mantiene un cargo autorizado sin capturar). Evita repetir el
+  // aviso en cada pasada de la tarea programada.
+  avisoCaducidadEnviadoAt DateTime?    @map("aviso_caducidad_enviado_at")
+
   serviceRequest        ServiceRequest @relation(fields: [serviceRequestId], references: [id])
   presupuesto           Presupuesto    @relation(fields: [presupuestoId], references: [id])
   ampliacion            Ampliacion?    @relation(fields: [ampliacionId], references: [id])
 
   @@index([serviceRequestId])
+  // Cola de pagos atascados (GET /admin/payments/stuck): filtra por
+  // estado sobre toda la tabla payments. Sin índice sería sequential
+  // scan, y es justo la consulta que un admin ejecuta cuando algo va
+  // mal y necesita respuesta rápida.
+  @@index([estado])
   @@map("payments")
 }
 
@@ -330,6 +377,73 @@ model CierreHoras {
   @@map("cierres_horas")
 }
 
+// Registro de cada archivo subido (auditoría B4).
+//
+// LA PIEZA QUE FALTABA: antes, `uploadPhoto` escribía `<uuid>.jpg` en
+// disco y devolvía una URL, y a partir de ahí el servidor ya no podía
+// distinguir un DNI escaneado de la foto de una cocina. Sin esa
+// información no había forma de aplicar reglas de acceso distintas, ni
+// de borrar los archivos de un usuario al eliminar su cuenta, ni de
+// saber qué había quedado huérfano en el disco. De esa única carencia
+// salían los tres problemas: sin control de acceso, sin borrado
+// (incumpliendo el RGPD Art. 17) y sin auditoría.
+//
+// Clasificar al ESCRIBIR es lo que permite verificar al LEER.
+model ArchivoSubido {
+  id            String      @id @default(uuid())
+  // Nombre en disco (`<uuid>.jpg`). Es la clave por la que entra
+  // `GET /uploads/:archivo`, de ahí el @unique.
+  nombreArchivo String      @unique @map("nombre_archivo")
+  tipo          TipoArchivo
+  propietarioId String      @map("propietario_id")
+  // Las fotos se suben ANTES de que exista la solicitud (el asistente
+  // sube y luego crea), así que esto se rellena al crear la solicitud o
+  // la reclamación. Es lo que permite comprobar "¿eres participante?"
+  // con una consulta indexada exacta en vez de un LIKE sobre un array.
+  serviceRequestId String?  @map("service_request_id")
+  bytes         Int         @default(0)
+  createdAt     DateTime    @default(now()) @map("created_at")
+  // Borrado lógico: la fila se marca aquí y la tarea programada
+  // `limpiar-archivos-huerfanos` borra el fichero del disco después. Así
+  // el borrado de cuenta responde al instante y el trabajo de disco (que
+  // puede fallar) no bloquea al usuario ni deja la BD inconsistente.
+  eliminadoAt   DateTime?   @map("eliminado_at")
+
+  propietario   User        @relation(fields: [propietarioId], references: [id])
+
+  @@index([propietarioId])
+  @@index([serviceRequestId])
+  // La tarea de limpieza filtra por esto en cada pasada.
+  @@index([eliminadoAt])
+  @@map("archivos_subidos")
+}
+
+// Estado persistido de cada tarea programada (ver src/jobs/). Una fila
+// por tarea, creada sola la primera vez que se ejecuta.
+//
+// El calendario vive AQUÍ y no en la memoria del proceso a propósito:
+// "¿le toca correr a esta tarea?" se calcula desde `ultimaEjecucionAt`,
+// así que un redeploy de Render (que reinicia el proceso varias veces al
+// día) no vuelve a disparar todas las tareas desde cero. Y `bloqueadoHasta`
+// es lo que impide que dos instancias del backend ejecuten la misma tarea
+// a la vez si algún día se escala horizontalmente — mismo patrón de lease
+// con expiración que la liberación de pagos, no un mecanismo distinto.
+model TareaProgramada {
+  nombre             String    @id
+  bloqueadoHasta     DateTime? @map("bloqueado_hasta")
+  ultimaEjecucionAt  DateTime? @map("ultima_ejecucion_at")
+  // Resumen legible de la última pasada, para el panel de admin
+  // (ej. "3 pagos reintentados, 1 fallo").
+  ultimoResultado    String?   @map("ultimo_resultado")
+  ultimoError        String?   @map("ultimo_error")
+  ejecuciones        Int       @default(0)
+  // Se reinicia a 0 en cada ejecución correcta — un valor alto es la
+  // señal de que algo lleva roto tiempo, no de un fallo puntual.
+  fallosConsecutivos Int       @default(0) @map("fallos_consecutivos")
+
+  @@map("tareas_programadas")
+}
+
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model spatial_ref_sys {
   srid      Int     @id
@@ -337,6 +451,25 @@ model spatial_ref_sys {
   auth_srid Int?
   srtext    String? @db.VarChar(2048)
   proj4text String? @db.VarChar(2048)
+}
+
+// Qué es cada archivo subido (auditoría B4). El orden va de menos a
+// más sensible, y determina quién puede leerlo — ver `puedeVerArchivo`
+// en archivo.controller.ts.
+enum TipoArchivo {
+  // Visible para cualquier usuario autenticado: los perfiles de
+  // profesional son navegables por diseño, es una foto que su dueño
+  // publica a propósito.
+  foto_perfil
+  // Solo los participantes de esa solicitud (y un admin): son fotos del
+  // interior de la casa de alguien.
+  foto_solicitud
+  foto_disputa
+  // SOLO el propietario y un admin. Nunca nadie más, bajo ningún
+  // concepto. Un DNI o un NIE es un dato de identificación nacional.
+  documento_identidad
+  certificado
+  seguro_rc
 }
 
 enum UserRole {
@@ -378,6 +511,14 @@ enum EstadoSolicitud {
 
 enum EstadoPago {
   retenido
+  // Estado intermedio real que antes no se representaba: el dinero YA
+  // salió de la tarjeta del cliente (captura hecha en Stripe) pero
+  // todavía no ha llegado a la cuenta Connect del profesional. Antes
+  // este estado existía en la realidad pero era invisible para el
+  // sistema — y es exactamente donde se perdía el dinero cuando el
+  // transfer fallaba. Ahora es consultable (GET /admin/payments/stuck)
+  // y reanudable.
+  capturado
   liberado
   reembolsado
   fallido

@@ -6,6 +6,10 @@ jest.mock('../../config/prisma', () => ({
   },
 }));
 
+jest.mock('../../config/stripe', () => ({
+  stripe: { paymentIntents: { retrieve: jest.fn() } },
+}));
+
 jest.mock('../../services/payment.service', () => ({
   createEscrowPaymentIntent: jest.fn(),
   obtenerOCrearStripeCustomerId: jest.fn(),
@@ -13,6 +17,7 @@ jest.mock('../../services/payment.service', () => ({
 }));
 
 import { prisma } from '../../config/prisma';
+import { stripe } from '../../config/stripe';
 import {
   createEscrowPaymentIntent,
   obtenerOCrearStripeCustomerId,
@@ -21,6 +26,7 @@ import {
 import { createPaymentIntent } from '../payment.controller';
 
 const mockPrisma = prisma as any;
+const mockStripe = stripe as any;
 const mockCreateEscrow = createEscrowPaymentIntent as jest.Mock;
 const mockObtenerCustomerId = obtenerOCrearStripeCustomerId as jest.Mock;
 const mockCrearEphemeralKey = crearEphemeralKey as jest.Mock;
@@ -191,6 +197,83 @@ describe('createPaymentIntent', () => {
     );
 
     const res = fakeRes();
+    await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(mockCreateEscrow).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * REVISIÓN FINAL PRE-LANZAMIENTO (2026-08-04): 3D Secure.
+ *
+ * En modo test las tarjetas no disparan 3DS salvo que se usen las
+ * específicas, así que este escenario casi no aparecía. En Stripe Live,
+ * la mayoría de tarjetas europeas SÍ lo disparan por PSD2/SCA — pasa a
+ * ser el caso normal, no la excepción.
+ */
+describe('createPaymentIntent — reintento tras 3D Secure', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockObtenerCustomerId.mockResolvedValue('cus_1');
+    mockCrearEphemeralKey.mockResolvedValue('ek_1');
+  });
+
+  const pagoPendiente = {
+    id: 'pago-1',
+    presupuestoId: 'pres-1',
+    ampliacionId: null,
+    stripePaymentIntentId: 'pi_1',
+    montoBase: 180,
+    montoTotal: 189,
+    comisionPlataforma: 9,
+  };
+
+  /**
+   * El cliente abrió el 3DS de su banco y cerró la app. Antes de este
+   * arreglo, el endpoint no consideraba `requires_action` reintentable y
+   * acababa devolviendo 409 "No hay nada pendiente de autorizar" — el
+   * cliente se quedaba sin poder pagar, con un mensaje que decía justo
+   * lo contrario de lo que pasaba.
+   */
+  it('deja retomar el pago si el 3DS quedó a medias (requires_action)', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitud({ pagos: [pagoPendiente] }));
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({
+      status: 'requires_action',
+      client_secret: 'secret_retomar',
+    });
+    const res = fakeRes();
+
+    await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
+
+    expect(res.status).toHaveBeenCalledWith(201);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ clientSecret: 'secret_retomar', paymentId: 'pago-1' })
+    );
+    // Se reutiliza el MISMO PaymentIntent: crear uno nuevo dejaría el
+    // anterior colgando y podría acabar en doble autorización.
+    expect(mockCreateEscrow).not.toHaveBeenCalled();
+  });
+
+  it('también deja retomar si quedó en requires_confirmation', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitud({ pagos: [pagoPendiente] }));
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({
+      status: 'requires_confirmation',
+      client_secret: 'secret_confirmar',
+    });
+    const res = fakeRes();
+
+    await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
+
+    expect(res.status).toHaveBeenCalledWith(201);
+  });
+
+  /** Una autorización YA confirmada no debe poder reintentarse: eso sí sería doble cobro. */
+  it('NO deja reintentar una autorización ya confirmada (requires_capture)', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitud({ pagos: [pagoPendiente] }));
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_capture', client_secret: 'x' });
+    const res = fakeRes();
+
     await createPaymentIntent(fakeReq('cliente-1', { serviceRequestId: SR_ID }), res);
 
     expect(res.status).toHaveBeenCalledWith(409);

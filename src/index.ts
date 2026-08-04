@@ -20,8 +20,19 @@ import stripeOnboardingRoutes from './routes/stripeOnboarding.routes';
 import passwordResetRoutes from './routes/passwordReset.routes';
 import { stripeWebhook } from './controllers/payment.controller';
 import { asyncHandler } from './utils/asyncHandler';
+import { servirArchivo } from './controllers/archivo.controller';
+import { authMiddleware } from './middlewares/auth.middleware';
+import { prisma } from './config/prisma';
+import { TAREAS, iniciarScheduler, detenerScheduler } from './jobs';
+import { validarConfiguracionOAbortar } from './config/validateEnv';
 
 dotenv.config();
+
+// Antes de nada: si la configuración es inconsistente, mejor no arrancar
+// (auditoría B1). Va aquí, antes de abrir el puerto, para que un
+// despliegue mal configurado falle en Render y mantenga en pie la
+// versión anterior en vez de servir una versión que finge cobrar.
+validarConfiguracionOAbortar();
 
 // Sin esto, un error async no capturado en cualquier controlador mata
 // el proceso de Node completo (Node 15+, incluido tu Node 22 lo hace
@@ -122,14 +133,24 @@ app.get('/', (_req, res) => {
   res.status(200).send(paginaInicio());
 });
 
-// Fotos subidas por los clientes (ver upload.controller.ts) — servidas
-// como archivos estáticos directamente.
-app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
+// Archivos subidos (auditoría B4). ANTES esto era
+// `express.static(path.join(process.cwd(), 'uploads'))`, es decir:
+// cualquiera con la URL leía el fichero sin sesión — y por esta MISMA
+// ruta pasan los documentos de identidad y los seguros de RC de los
+// profesionales, no solo fotos de cocinas.
+//
+// La ruta se mantiene idéntica a propósito, para no tener que reescribir
+// ninguna de las URLs ya guardadas en la base de datos (que es la parte
+// que sí podría romper datos históricos). Lo único que cambia es que
+// ahora exige sesión y comprueba permisos según el tipo de archivo — ver
+// services/archivo.service.ts.
+app.get('/uploads/:archivo', authMiddleware(), asyncHandler(servirArchivo));
 
-// Favicon + imagen de vista previa (og-image) de la página web pública
-// — mismo patrón que /uploads: process.cwd() y no __dirname, porque
-// tsc no copia public/ a dist/ y en producción el proceso arranca
-// desde la raíz del repo.
+// Favicon + imagen de vista previa (og-image) de la página web pública.
+// Este SÍ sigue siendo estático y público a propósito: son recursos de
+// la web pública (hogarsos.es), no contenido subido por usuarios.
+// process.cwd() y no __dirname, porque tsc no copia public/ a dist/ y en
+// producción el proceso arranca desde la raíz del repo.
 app.use('/public', express.static(path.join(process.cwd(), 'public')));
 
 // Páginas legales públicas — en la raíz (no bajo /api) para que la URL
@@ -196,7 +217,7 @@ app.use(
 );
 
 // Escuchar en todas las interfaces
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('========================================');
   console.log(`🚀 hogarSOS API iniciada`);
@@ -204,4 +225,58 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 http://0.0.0.0:${PORT}`);
   console.log(`❤️  Health: http://localhost:${PORT}/health`);
   console.log('========================================');
+
+  // Tareas programadas (reintento de pagos atascados, autorizaciones a
+  // punto de caducar — ver src/jobs/). Van dentro del propio servicio
+  // web, no en un Render Cron aparte, con lock en BD para que sea seguro
+  // aunque algún día haya más de una instancia (ver jobs/scheduler.ts).
+  //
+  // SCHEDULER_ENABLED=false permite arrancar el backend sin ellas: útil
+  // en local para no tocar Stripe sin querer mientras se desarrolla otra
+  // cosa.
+  if (process.env.SCHEDULER_ENABLED !== 'false') {
+    iniciarScheduler(TAREAS);
+  } else {
+    console.log('[scheduler] Desactivado por SCHEDULER_ENABLED=false');
+  }
 });
+
+/**
+ * Cierre ordenado. Render manda SIGTERM en cada despliegue y en cada
+ * reinicio; sin esto, las peticiones en vuelo se cortaban en seco — y
+ * una petición de pago cortada a medias es justo el escenario que deja
+ * dinero a medio liberar (auditoría B2).
+ *
+ * El orden importa: primero se para el scheduler (para no EMPEZAR
+ * trabajo nuevo), después se deja de aceptar conexiones nuevas y se
+ * espera a que terminen las que ya estaban, y solo al final se suelta la
+ * conexión a la base de datos.
+ */
+let cerrando = false;
+
+async function cerrarOrdenadamente(senal: string) {
+  if (cerrando) return;
+  cerrando = true;
+  console.log(`[shutdown] ${senal} recibido — cerrando ordenadamente...`);
+
+  detenerScheduler();
+
+  // Tope duro: si algo se queda colgado, Render mataría el proceso de
+  // todas formas a los ~30s. Mejor salir nosotros antes, de forma
+  // controlada y dejando constancia en el log.
+  const plazo = setTimeout(() => {
+    console.error('[shutdown] Las peticiones en vuelo no terminaron a tiempo. Saliendo igualmente.');
+    process.exit(1);
+  }, 15000);
+  plazo.unref();
+
+  server.close(async () => {
+    await prisma.$disconnect().catch((e) => console.error('[shutdown] Error al desconectar Prisma:', e));
+    console.log('[shutdown] Cierre completado.');
+    clearTimeout(plazo);
+    process.exit(0);
+  });
+}
+
+process.on('SIGTERM', () => void cerrarOrdenadamente('SIGTERM'));
+process.on('SIGINT', () => void cerrarOrdenadamente('SIGINT'));

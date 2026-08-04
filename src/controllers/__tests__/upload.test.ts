@@ -5,7 +5,16 @@ jest.mock('fs/promises', () => ({
   writeFile: jest.fn().mockResolvedValue(undefined),
 }));
 
+// Desde B4, uploadPhoto clasifica y REGISTRA cada subida: sin fila en
+// `archivos_subidos` el archivo sería inaccesible (servirArchivo no puede
+// autorizar lo que no sabe qué es).
+jest.mock('../../services/archivo.service', () => ({
+  registrarArchivo: jest.fn().mockResolvedValue({ id: 'arch-1' }),
+  borrarDelDisco: jest.fn().mockResolvedValue(true),
+}));
+
 import { writeFile } from 'fs/promises';
+import { registrarArchivo, borrarDelDisco } from '../../services/archivo.service';
 import { uploadPhoto } from '../upload.controller';
 
 function mockRes() {
@@ -22,7 +31,7 @@ describe('uploadPhoto', () => {
   });
 
   it('devuelve 400 si no llega ningún archivo', async () => {
-    const req = { file: undefined } as unknown as Request;
+    const req = { file: undefined, body: {}, user: { userId: 'u-1', role: 'cliente' } } as unknown as Request;
     const res = mockRes();
 
     await uploadPhoto(req, res);
@@ -42,13 +51,21 @@ describe('uploadPhoto', () => {
 
     const req = {
       file: { buffer: original, mimetype: 'image/jpeg', originalname: 'foto.jpg' },
+      body: {},
+      user: { userId: 'u-1', role: 'cliente' },
     } as unknown as Request;
     const res = mockRes();
 
     await uploadPhoto(req, res);
 
     expect(res.status).toHaveBeenCalledWith(201);
-    expect(res.json).toHaveBeenCalledWith({ url: expect.stringMatching(/^https:\/\/hogarsos\.es\/uploads\/.+\.jpg$/) });
+    expect(res.json).toHaveBeenCalledWith({
+      url: expect.stringMatching(/^https:\/\/hogarsos\.es\/uploads\/.+\.jpg$/),
+      // Sin `tipo` en el cuerpo se asume el menos permisivo de los no
+      // sensibles (ver TIPO_POR_DEFECTO): compatibilidad con las
+      // versiones de la beta anteriores a B4.
+      tipo: 'foto_solicitud',
+    });
 
     expect(writeFile).toHaveBeenCalledTimes(1);
     const bufferGuardado = (writeFile as jest.Mock).mock.calls[0][1] as Buffer;
@@ -73,6 +90,8 @@ describe('uploadPhoto', () => {
 
     const req = {
       file: { buffer: original, mimetype: 'image/jpeg', originalname: 'pequena.jpg' },
+      body: {},
+      user: { userId: 'u-1', role: 'cliente' },
     } as unknown as Request;
     const res = mockRes();
 
@@ -85,9 +104,74 @@ describe('uploadPhoto', () => {
     expect(metadata.height).toBe(300);
   });
 
+  /**
+   * AUDITORÍA B4: el `tipo` no es informativo, decide quién podrá ver el
+   * archivo después. Un documento de identidad clasificado como
+   * `foto_perfil` quedaría visible para cualquier usuario.
+   */
+  it('registra el archivo con el tipo declarado y su propietario', async () => {
+    const original = await sharp({ create: { width: 100, height: 100, channels: 3, background: { r: 0, g: 0, b: 0 } } })
+      .jpeg()
+      .toBuffer();
+    const req = {
+      file: { buffer: original, mimetype: 'image/jpeg', originalname: 'dni.jpg' },
+      body: { tipo: 'documento_identidad' },
+      user: { userId: 'prof-1', role: 'profesional' },
+    } as unknown as Request;
+    const res = mockRes();
+
+    await uploadPhoto(req, res);
+
+    expect(registrarArchivo).toHaveBeenCalledWith(
+      expect.objectContaining({ tipo: 'documento_identidad', propietarioId: 'prof-1' })
+    );
+  });
+
+  it('rechaza un tipo que no existe en vez de guardarlo sin clasificar', async () => {
+    const original = await sharp({ create: { width: 50, height: 50, channels: 3, background: { r: 0, g: 0, b: 0 } } })
+      .jpeg()
+      .toBuffer();
+    const req = {
+      file: { buffer: original, mimetype: 'image/jpeg', originalname: 'x.jpg' },
+      body: { tipo: 'lo_que_sea' },
+      user: { userId: 'u-1', role: 'cliente' },
+    } as unknown as Request;
+    const res = mockRes();
+
+    await uploadPhoto(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(writeFile).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Un fichero en disco sin fila es un huérfano inaccesible; si además
+   * era un DNI, es un documento de identidad conservado sin base legal.
+   * Mejor descartarlo que dejarlo.
+   */
+  it('borra el fichero del disco si no se puede registrar, para no dejar un huérfano', async () => {
+    (registrarArchivo as jest.Mock).mockRejectedValueOnce(new Error('BD caída'));
+    const original = await sharp({ create: { width: 50, height: 50, channels: 3, background: { r: 0, g: 0, b: 0 } } })
+      .jpeg()
+      .toBuffer();
+    const req = {
+      file: { buffer: original, mimetype: 'image/jpeg', originalname: 'x.jpg' },
+      body: { tipo: 'documento_identidad' },
+      user: { userId: 'prof-1', role: 'profesional' },
+    } as unknown as Request;
+    const res = mockRes();
+
+    await uploadPhoto(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(borrarDelDisco).toHaveBeenCalled();
+  });
+
   it('responde 400 si el buffer no es una imagen válida', async () => {
     const req = {
       file: { buffer: Buffer.from('esto no es una imagen'), mimetype: 'image/jpeg', originalname: 'raro.jpg' },
+      body: {},
+      user: { userId: 'u-1', role: 'cliente' },
     } as unknown as Request;
     const res = mockRes();
 

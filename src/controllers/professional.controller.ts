@@ -360,7 +360,12 @@ export async function startStripeOnboarding(req: Request, res: Response) {
     await prisma.professional.update({ where: { userId }, data: { stripeAccountId: accountId } });
   }
 
-  const appBaseUrl = process.env.APP_BASE_URL || 'https://hogarsos.com';
+  // El fallback anterior era 'https://hogarsos.com' — dominio equivocado
+  // (.com en vez de .es), así que sin APP_BASE_URL definida el retorno del
+  // onboarding de Stripe iba a un sitio que ni siquiera controlamos.
+  // Ahora validateEnv.ts exige APP_BASE_URL en producción, y el fallback
+  // solo cubre desarrollo local.
+  const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:3000';
   const accountLink = await stripe.accountLinks.create({
     account: accountId,
     refresh_url: `${appBaseUrl}/stripe/onboarding/refresh`,

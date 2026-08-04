@@ -20,6 +20,8 @@ export type NotificationKey =
   | 'cierre_horas_aceptado'
   | 'reclamacion_abierta'
   | 'pago_autorizado'
+  | 'autorizacion_por_caducar'
+  | 'autorizacion_caducada'
   | 'valoracion_recibida';
 
 export interface NotificationParams {
@@ -223,6 +225,30 @@ const MENSAJES: Record<NotificationKey, Record<Idioma, Constructor>> = {
     en: () => ({
       title: 'Payment authorized',
       body: "The client has authorized the payment — the amount is held until the job is completed",
+    }),
+  },
+  // B5: Stripe solo mantiene un cargo autorizado sin capturar unos 7
+  // días. Estos dos avisos van a AMBAS partes: el cliente es quien debe
+  // volver a autorizar, pero el profesional necesita saberlo porque su
+  // cobro depende de ello.
+  autorizacion_por_caducar: {
+    es: () => ({
+      title: 'El pago retenido caduca pronto',
+      body: 'La autorización de este servicio caduca en unos días. Si el trabajo ya está hecho, ciérralo; si no, habrá que volver a autorizar el pago.',
+    }),
+    en: () => ({
+      title: 'Held payment expires soon',
+      body: 'The authorisation for this service expires in a few days. If the job is done, close it; otherwise the payment will need authorising again.',
+    }),
+  },
+  autorizacion_caducada: {
+    es: () => ({
+      title: 'La autorización de pago ha caducado',
+      body: 'El importe retenido se ha liberado en la tarjeta del cliente. Para continuar con este servicio hay que autorizar el pago de nuevo.',
+    }),
+    en: () => ({
+      title: 'Payment authorisation expired',
+      body: "The held amount has been released back to the client's card. To continue with this service, the payment must be authorised again.",
     }),
   },
   valoracion_recibida: {

@@ -5,6 +5,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { firestore } from '../config/firebase';
 import { releasePayments, refundPayment } from '../services/payment.service';
+import { asociarArchivosASolicitud } from '../services/archivo.service';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
 import { enviarNotificacion, enviarNotificacionMasiva, enviarNotificacionCruda } from '../services/notification.service';
 
@@ -199,6 +200,13 @@ export async function createServiceRequest(req: Request, res: Response) {
     )
     RETURNING id
   `;
+
+  // Las fotos se subieron ANTES de que esta solicitud existiera (el
+  // asistente sube y luego crea), así que este es el primer momento en
+  // que se puede saber a qué pertenecen. Sin esta asociación no habría
+  // forma de comprobar después si quien pide ver la foto es participante
+  // de la solicitud (auditoría B4).
+  await asociarArchivosASolicitud(fotosUrls ?? [], solicitud.id, 'foto_solicitud');
 
   // Aviso a los profesionales disponibles de esa categoría, cerca de la
   // solicitud — "fire and forget", nunca debe bloquear ni fallar la
@@ -663,6 +671,16 @@ export async function markChatRead(req: Request, res: Response) {
 // cliente entre varias candidaturas, no por el primer profesional que
 // pulsa un botón.
 
+// El texto anterior ("...la liberación del pago falló y se reintentará")
+// era falso: no existía ninguna cola de reintento, así que un pago que
+// fallaba aquí no se recuperaba nunca sin intervención manual en el
+// dashboard de Stripe. Ahora la liberación es reanudable desde el punto
+// exacto en que se quedó y hay endpoints de admin para forzarla
+// (GET /api/admin/payments/stuck, POST /api/admin/payments/:id/retry),
+// así que el aviso ya describe lo que de verdad ocurre.
+const AVISO_LIBERACION_PENDIENTE =
+  'Servicio completado. El cobro no ha podido completarse todavía y ha quedado en la cola de reintento — el importe no se pierde.';
+
 const completeRequestSchema = z.object({
   // Solo obligatorio si el presupuesto aceptado es "por_horas" — se
   // valida más abajo, una vez se sabe el tipo (no lo elige el cliente
@@ -711,7 +729,15 @@ export async function completeServiceRequest(req: Request, res: Response) {
     return res.status(409).json({ error: 'La solicitud no está en un estado válido para completarse', code: 'REQUEST_INVALID_STATE_COMPLETE' });
   }
 
-  const pagoExistente = await prisma.payment.findFirst({ where: { serviceRequestId: id, estado: 'retenido' } });
+  // 'capturado' cuenta igual que 'retenido': es una autorización que el
+  // cliente SÍ confirmó y de la que ya se cobró, pero cuya transferencia
+  // al profesional se quedó a medias en un intento anterior. Sin
+  // incluirlo aquí, un trabajo con la liberación a medio terminar
+  // respondería "el cliente aún no ha autorizado el pago", que es falso
+  // y justo lo contrario de lo que pasa.
+  const pagoExistente = await prisma.payment.findFirst({
+    where: { serviceRequestId: id, estado: { in: ['retenido', 'capturado'] } },
+  });
   if (!pagoExistente) {
     return res.status(409).json({
       error: 'El cliente aún no ha autorizado el pago de este servicio', code: 'PAYMENT_NOT_AUTHORIZED',
@@ -792,7 +818,7 @@ export async function completeServiceRequest(req: Request, res: Response) {
       estado: 'completada',
       aviso: pagoSinConfirmar
         ? 'Servicio completado, pero el cliente todavía no ha confirmado el pago en la app'
-        : 'Servicio completado, pero la liberación del pago falló y se reintentará',
+        : AVISO_LIBERACION_PENDIENTE,
     });
   }
 }
@@ -888,7 +914,7 @@ export async function responderCierreHoras(req: Request, res: Response) {
       estado: 'aceptado',
       aviso: pagoSinConfirmar
         ? 'Horas confirmadas, pero el cliente todavía no ha confirmado el pago en la app'
-        : 'Horas confirmadas, pero la liberación del pago falló y se reintentará',
+        : AVISO_LIBERACION_PENDIENTE,
     });
   }
 }

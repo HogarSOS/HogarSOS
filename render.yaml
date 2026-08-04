@@ -42,14 +42,29 @@ services:
         value: 15m
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
+      # Decisión de producto definitiva: el CLIENTE paga un 5% sobre el
+      # presupuesto ("Gastos de gestión"), el PROFESIONAL no paga nada y
+      # recibe el 100% de lo que cotizó. Declaradas aquí con valor
+      # explícito (no sync:false) a propósito: así el blueprint es la
+      # fuente de verdad y nadie puede dejarlas a 0 sin querer en el
+      # dashboard, que era el riesgo real (plataforma sin ingresos).
       - key: PLATFORM_COMMISSION_CLIENT_PERCENT
-        value: "0"
+        value: "5"
       - key: PLATFORM_COMMISSION_PROFESSIONAL_PERCENT
         value: "0"
       - key: REQUIRE_PROFESSIONAL_VERIFICATION
         value: "true"
       # Rellenar a mano en el dashboard de Render (Environment ->
-      # "Add Environment Variable"), nunca commitear estos valores:
+      # "Add Environment Variable"), nunca commitear estos valores.
+      #
+      # src/config/validateEnv.ts comprueba TODAS estas al arrancar y
+      # aborta si falta alguna de las que corrompen el comportamiento —
+      # así un despliegue mal configurado falla en Render y deja en pie
+      # la versión anterior, en vez de servir una que finge cobrar.
+      #
+      # APP_BASE_URL: https://hogarsos.es (sin barra final). Sin ella,
+      # el retorno del onboarding de Stripe Connect y las URLs de las
+      # fotos subidas apuntan a localhost.
       - key: APP_BASE_URL
         sync: false
       - key: FIREBASE_PROJECT_ID
@@ -58,7 +73,30 @@ services:
         sync: false
       - key: FIREBASE_PRIVATE_KEY
         sync: false
+      # LANZAMIENTO (auditoría B1): debe ser la clave sk_live_... de la
+      # cuenta real. Con NODE_ENV=production y una sk_test, el arranque
+      # aborta a propósito (usa ALLOW_STRIPE_TEST_IN_PRODUCTION=true si
+      # algún día quieres un staging contra Stripe de pruebas).
       - key: STRIPE_SECRET_KEY
         sync: false
+      # OJO: el "Signing secret" (whsec_...) del endpoint de webhook es
+      # DISTINTO en test y en live. Al pasar a live hay que crear el
+      # endpoint en el dashboard en modo Live y copiar SU secreto — el de
+      # test haría que todos los eventos se rechazaran por firma inválida.
       - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      # Correo transaccional (IONOS, soporte@hogarsos.es). Sin estas, la
+      # recuperación de contraseña responde {success:true} sin enviar
+      # nada — el arranque avisa muy visiblemente pero no aborta.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_SECURE
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
         sync: false

@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { enviarNotificacion } from '../services/notification.service';
+import { asociarArchivosASolicitud } from '../services/archivo.service';
 
 const createDisputeSchema = z.object({
   motivo: z.enum([
@@ -59,6 +60,11 @@ export async function createDispute(req: Request, res: Response) {
     await tx.serviceRequest.update({ where: { id }, data: { estado: 'disputada' } });
     return creada;
   });
+
+  // Igual que en createServiceRequest: las capturas adjuntas se subieron
+  // antes de que existiera la reclamación, así que se clasifican aquí
+  // como prueba de ESTA solicitud (auditoría B4).
+  await asociarArchivosASolicitud(datos.fotosUrls ?? [], id, 'foto_disputa');
 
   const otraParteId = solicitud.clienteId === userId ? solicitud.profesionalId : solicitud.clienteId;
   if (otraParteId) {

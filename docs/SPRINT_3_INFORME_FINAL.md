@@ -1,5 +1,7 @@
 # hogarSOS — Informe final Sprint 3
 
+> **Nota (2026-08-04, auditoría B3):** este informe es un registro histórico del Sprint 3 y se conserva tal cual. La comisión del **18%** que menciona **ya no es la vigente**: el modelo definitivo es 5% al cliente ("Gastos de gestión") y 0% al profesional, con dos variables de entorno independientes (`PLATFORM_COMMISSION_CLIENT_PERCENT` / `PLATFORM_COMMISSION_PROFESSIONAL_PERCENT`). La variable única `PLATFORM_COMMISSION_PERCENT` ya no existe.
+
 **Fecha:** 2026-07-29
 **Alcance del sprint:** Validación end-to-end del flujo de pago escrow (Stripe Connect) y corrección de un bug crítico que impedía liberar pagos a los profesionales.
 

@@ -11,6 +11,7 @@ import {
   COMISION_PROFESIONAL_PORCENTAJE,
 } from '../services/payment.service';
 import { enviarNotificacion } from '../services/notification.service';
+import { enviarEmail } from '../services/email.service';
 import { sincronizarEstadoCuentaStripe } from '../services/professional.service';
 
 const createIntentSchema = z.object({
@@ -31,7 +32,31 @@ const createIntentSchema = z.object({
  * no es una autorización real — se deja reintentar reutilizando el
  * mismo PaymentIntent en vez de crear uno nuevo.
  */
-const ESTADOS_STRIPE_ABANDONABLES = new Set(['requires_payment_method', 'canceled']);
+/**
+ * `requires_action` y `requires_confirmation` son CRÍTICOS al pasar a
+ * Stripe Live (revisión final pre-lanzamiento). En modo test las tarjetas
+ * no disparan 3D Secure salvo que se usen las específicas, así que este
+ * caso casi no aparecía; en producción, la mayoría de tarjetas europeas
+ * SÍ lo disparan por PSD2/SCA.
+ *
+ * Escenario real: el cliente pulsa pagar, se abre el 3DS de su banco y
+ * cierra la app (o se le acaba el tiempo). El PaymentIntent se queda en
+ * `requires_action`. Sin incluirlo aquí, al volver a pulsar "pagar" el
+ * endpoint no lo consideraba reintentable, seguía buscando ampliaciones
+ * pendientes y acababa devolviendo 409 "No hay nada pendiente de
+ * autorizar" — dejando al cliente sin poder pagar y con un mensaje que
+ * dice justo lo contrario de lo que pasa.
+ *
+ * Devolver el mismo `client_secret` permite al Payment Sheet retomar la
+ * autenticación donde se quedó, que es el comportamiento que Stripe
+ * espera.
+ */
+const ESTADOS_STRIPE_ABANDONABLES = new Set([
+  'requires_payment_method',
+  'canceled',
+  'requires_action',
+  'requires_confirmation',
+]);
 
 async function intentoAbandonado(pago: { stripePaymentIntentId: string | null }) {
   if (!pago.stripePaymentIntentId) return null;
@@ -271,6 +296,82 @@ export async function stripeWebhook(req: Request, res: Response) {
     // restringida, etc.) — sin esto, `getProfile` es la única vía de
     // refresco (ver comentario en professional.controller.ts) y solo se
     // actualiza cuando el propio profesional abre su perfil.
+    /**
+     * Contracargo: el cliente ha reclamado a SU BANCO, no a nosotros.
+     *
+     * Riesgo real al pasar a Live (en test esto no ocurre nunca): Stripe
+     * retira del saldo de la plataforma el importe reclamado MÁS ~15 € de
+     * comisión de disputa, de forma inmediata y sin preguntar. Como el
+     * profesional ya cobró su parte vía transfer, ese dinero sale
+     * íntegramente del bolsillo de HogarSOS — y con una comisión del 5%,
+     * un solo contracargo se come el margen de muchos trabajos.
+     *
+     * Aquí NO se automatiza ninguna respuesta a propósito: responder a
+     * una disputa requiere aportar pruebas concretas (chat, fotos,
+     * confirmación del cliente) y decidir si merece la pena pelearla.
+     * Eso es un juicio humano con plazo legal, no algo que deba hacer un
+     * webhook. Lo que sí es imperdonable es ENTERARSE TARDE: Stripe da
+     * un plazo limitado para responder y, si se pasa, la disputa se
+     * pierde automáticamente.
+     */
+    case 'charge.dispute.created': {
+      const disputa = event.data.object as {
+        id: string;
+        amount: number;
+        currency: string;
+        reason?: string;
+        payment_intent?: string;
+        evidence_details?: { due_by?: number };
+      };
+
+      const importe = (disputa.amount / 100).toFixed(2);
+      const limite = disputa.evidence_details?.due_by
+        ? new Date(disputa.evidence_details.due_by * 1000).toISOString()
+        : 'sin fecha indicada';
+
+      // Log a nivel error para que destaque entre el ruido de Render.
+      console.error(
+        `[stripeWebhook] ⚠️ CONTRACARGO ${disputa.id}: ${importe} ${disputa.currency.toUpperCase()} ` +
+        `(motivo: ${disputa.reason ?? 'no indicado'}, PaymentIntent: ${disputa.payment_intent ?? 'desconocido'}). ` +
+        `Plazo para aportar pruebas: ${limite}. Responder desde el dashboard de Stripe.`
+      );
+
+      // El pago afectado se marca para que no pase desapercibido en el
+      // Centro de Pagos ni en la cola de admin.
+      if (disputa.payment_intent) {
+        await prisma.payment
+          .updateMany({
+            where: { stripePaymentIntentId: disputa.payment_intent },
+            data: { ultimoErrorLiberacion: `CONTRACARGO ${disputa.id} (${importe} EUR)` },
+          })
+          .catch((e) => console.error(`[stripeWebhook] No se pudo marcar el pago del contracargo ${disputa.id}:`, e));
+      }
+
+      // Aviso por correo a soporte. "Fire and forget" con captura: un
+      // fallo de SMTP no debe hacer que devolvamos 500 y que Stripe
+      // reintente el webhook en bucle.
+      const destinatario = process.env.SMTP_USER;
+      if (destinatario) {
+        enviarEmail(
+          destinatario,
+          `⚠️ Contracargo de ${importe} € en Hogar SOS`,
+          `<p>Se ha abierto un contracargo en Stripe.</p>
+           <ul>
+             <li><strong>Importe:</strong> ${importe} ${disputa.currency.toUpperCase()}</li>
+             <li><strong>Motivo:</strong> ${disputa.reason ?? 'no indicado'}</li>
+             <li><strong>PaymentIntent:</strong> ${disputa.payment_intent ?? 'desconocido'}</li>
+             <li><strong>Plazo para aportar pruebas:</strong> ${limite}</li>
+           </ul>
+           <p>Stripe ya ha retirado el importe más la comisión de disputa del saldo de la plataforma.
+              Si no se responde antes del plazo, la disputa se pierde automáticamente.</p>
+           <p>Responder desde el dashboard de Stripe → Payments → Disputes.</p>`
+        ).catch((e) => console.error(`[stripeWebhook] No se pudo avisar por correo del contracargo ${disputa.id}:`, e));
+      } else {
+        console.error('[stripeWebhook] SMTP_USER sin definir: el aviso de contracargo solo queda en el log.');
+      }
+      break;
+    }
+
     case 'account.updated': {
       const account = event.data.object as { id: string };
       const profesional = await prisma.professional.findFirst({
