@@ -559,12 +559,17 @@ Buscar `⚠️ CONTRACARGO` en el log (nivel error) y revisar el correo enviado 
 
 ### Punto de partida de esta fase
 
-| Repositorio | Commit base |
-|---|---|
-| `HogarSOS/HogarSOS` (backend) | `d9b1c36` — *Añade Stripe Customer + Ephemeral Key para que Payment Sheet recuerde la tarjeta* |
-| `HogarSOS/hogarSOS-frontend` | `c117866` — *Cambia el applicationId de com.example.hogarsos a es.hogarsos.app* |
+| Repositorio | Commit base (antes de esta fase) | Commit de entrega |
+|---|---|---|
+| `HogarSOS/HogarSOS` (backend) | `d9b1c36` — *Añade Stripe Customer + Ephemeral Key…* | **`89d5294`** — *Cierra los 5 bloqueantes de la auditoría pre-lanzamiento (B1-B5)* |
+| `HogarSOS/hogarSOS-frontend` | `c117866` — *Cambia el applicationId a es.hogarsos.app* | **`18d3f11`** — *Adapta la app al cierre de los bloqueantes B1-B4* |
 
-Todo lo descrito en este documento se entrega en el commit **inmediatamente posterior** a esos dos en cada repositorio.
+Toda esta fase cabe en **un commit por repositorio**. Para ver el cambio completo:
+
+```bash
+git diff d9b1c36..89d5294   # backend
+git diff c117866..18d3f11   # frontend
+```
 
 ### Migraciones de esta fase
 
