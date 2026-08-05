@@ -316,6 +316,10 @@ model Presupuesto {
   tarifaHora       Decimal?          @map("tarifa_hora") // solo tipo=por_horas
   horasEstimadas   Decimal?          @map("horas_estimadas") // solo tipo=por_horas
   mensaje          String?
+  // Declarativo: el profesional indica si su precio ya incluye IVA.
+  // No afecta a ningún cálculo de comisión, es solo informativo para
+  // el cliente en el desglose de pago.
+  incluyeIva       Boolean           @default(false) @map("incluye_iva")
   estado           EstadoPresupuesto @default(pendiente)
   createdAt        DateTime          @default(now()) @map("created_at")
   resueltaAt       DateTime?         @map("resuelta_at")

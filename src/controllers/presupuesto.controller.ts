@@ -9,12 +9,14 @@ const createPresupuestoSchema = z.discriminatedUnion('tipo', [
     tipo: z.literal('cerrado'),
     monto: z.number().positive(),
     mensaje: z.string().trim().max(200).optional(),
+    incluyeIva: z.boolean().optional().default(false),
   }),
   z.object({
     tipo: z.literal('por_horas'),
     tarifaHora: z.number().positive(),
     horasEstimadas: z.number().positive(),
     mensaje: z.string().trim().max(200).optional(),
+    incluyeIva: z.boolean().optional().default(false),
   }),
 ]);
 
@@ -69,7 +71,14 @@ export async function createPresupuesto(req: Request, res: Response) {
   const presupuesto = await prisma.presupuesto.create({
     data:
       datos.tipo === 'cerrado'
-        ? { serviceRequestId: id, profesionalId, tipo: 'cerrado', monto: datos.monto, mensaje: datos.mensaje }
+        ? {
+            serviceRequestId: id,
+            profesionalId,
+            tipo: 'cerrado',
+            monto: datos.monto,
+            mensaje: datos.mensaje,
+            incluyeIva: datos.incluyeIva,
+          }
         : {
             serviceRequestId: id,
             profesionalId,
@@ -77,6 +86,7 @@ export async function createPresupuesto(req: Request, res: Response) {
             tarifaHora: datos.tarifaHora,
             horasEstimadas: datos.horasEstimadas,
             mensaje: datos.mensaje,
+            incluyeIva: datos.incluyeIva,
           },
   });
 

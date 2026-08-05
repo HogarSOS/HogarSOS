@@ -32,6 +32,7 @@ function serializarPresupuesto(p: {
   tarifaHora: Prisma.Decimal | null;
   horasEstimadas: Prisma.Decimal | null;
   mensaje: string | null;
+  incluyeIva: boolean;
   estado: string;
   createdAt: Date;
 } | undefined) {
@@ -43,6 +44,7 @@ function serializarPresupuesto(p: {
     tarifaHora: p.tarifaHora ? Number(p.tarifaHora) : null,
     horasEstimadas: p.horasEstimadas ? Number(p.horasEstimadas) : null,
     mensaje: p.mensaje,
+    incluyeIva: p.incluyeIva,
     estado: p.estado,
     createdAt: p.createdAt,
   };
