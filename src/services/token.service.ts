@@ -56,7 +56,7 @@ export function verifyRefreshToken(token: string): TokenPayload {
     throw new Error('JWT_SECRET no está definido');
   }
 
-  const decoded = jwt.verify(token, JWT_SECRET) as TokenPayload & {
+  const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as TokenPayload & {
     type?: string;
   };
 
