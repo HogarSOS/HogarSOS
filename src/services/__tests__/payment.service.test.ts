@@ -6,6 +6,7 @@ jest.mock('../../config/prisma', () => ({
       create: jest.fn(),
       updateMany: jest.fn(),
       count: jest.fn(),
+      findUniqueOrThrow: jest.fn(),
     },
     serviceRequest: { findUnique: jest.fn() },
     professional: { findUnique: jest.fn(), update: jest.fn() },
@@ -137,10 +138,43 @@ describe('createEscrowPaymentIntent', () => {
         setup_future_usage: 'off_session',
         capture_method: 'manual',
         payment_method_types: ['card'],
-      })
+      }),
+      { idempotencyKey: 'intent_pre_pres-1' }
     );
     expect(customerId).toBe('cus_123');
     expect(ephemeralKeySecret).toBe('ek_test_123');
+  });
+
+  it('usa una clave de idempotencia distinta para la autorización de una ampliación', async () => {
+    await createEscrowPaymentIntent({
+      serviceRequestId: 'sr-1',
+      presupuestoId: 'pres-1',
+      ampliacionId: 'amp-1',
+      montoBase: 50,
+      clienteStripeCustomerId: 'cus_123',
+    });
+
+    expect(mockStripe.paymentIntents.create).toHaveBeenCalledWith(
+      expect.anything(),
+      { idempotencyKey: 'intent_amp_amp-1' }
+    );
+  });
+
+  it('adopta la fila existente si el insert choca por PaymentIntent ya registrado (doble tap concurrente)', async () => {
+    mockPrisma.payment.create.mockRejectedValue({ code: 'P2002' });
+    mockPrisma.payment.findUniqueOrThrow.mockResolvedValue({ id: 'pago-existente', montoBase: 100 });
+
+    const { pago } = await createEscrowPaymentIntent({
+      serviceRequestId: 'sr-1',
+      presupuestoId: 'pres-1',
+      montoBase: 100,
+      clienteStripeCustomerId: 'cus_123',
+    });
+
+    expect(mockPrisma.payment.findUniqueOrThrow).toHaveBeenCalledWith({
+      where: { stripePaymentIntentId: 'pi_nuevo' },
+    });
+    expect(pago).toEqual({ id: 'pago-existente', montoBase: 100 });
   });
 });
 
@@ -842,6 +876,45 @@ describe('refundPayment', () => {
     // debe poder distinguir este caso de un fallo real de Stripe.
     mockPrisma.payment.findMany.mockResolvedValue([]);
     await expect(refundPayment('sr-sin-pago')).rejects.toThrow('PAGO_NO_ENCONTRADO');
+  });
+
+  it('reembolsa (sin reverse_transfer) un pago "capturado" que nunca llegó a transferirse', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([
+      { id: 'pago-1', estado: 'capturado', stripePaymentIntentId: 'pi_1' },
+    ]);
+    mockStripe.refunds.create.mockResolvedValue({ id: 're_1' });
+
+    await refundPayment('sr-1');
+
+    expect(mockStripe.refunds.create).toHaveBeenCalledWith(
+      { payment_intent: 'pi_1', metadata: { paymentId: 'pago-1', serviceRequestId: 'sr-1' } },
+      { idempotencyKey: 'ref_pago-1' }
+    );
+  });
+
+  // Hallazgo #4 de la auditoría: antes 'liberado' quedaba fuera de
+  // refundPayment por completo, así que una disputa a favor del cliente
+  // sobre un trabajo ya completado no tenía forma de resolverse.
+  it('reembolsa CON reverse_transfer un pago ya "liberado" al profesional (disputa tras completar)', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([
+      { id: 'pago-1', estado: 'liberado', stripePaymentIntentId: 'pi_1' },
+    ]);
+    mockStripe.refunds.create.mockResolvedValue({ id: 're_1' });
+
+    await refundPayment('sr-1');
+
+    expect(mockStripe.refunds.create).toHaveBeenCalledWith(
+      {
+        payment_intent: 'pi_1',
+        reverse_transfer: true,
+        metadata: { paymentId: 'pago-1', serviceRequestId: 'sr-1' },
+      },
+      { idempotencyKey: 'ref_pago-1' }
+    );
+    expect(mockPrisma.payment.update).toHaveBeenCalledWith({
+      where: { id: 'pago-1' },
+      data: { estado: 'reembolsado', liberacionEnCursoAt: null },
+    });
   });
 });
 

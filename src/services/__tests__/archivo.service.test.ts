@@ -196,16 +196,16 @@ describe('asociarArchivosASolicitud', () => {
   it('asocia por nombre de fichero extraído de la URL completa', async () => {
     mockPrisma.archivoSubido.updateMany.mockResolvedValue({ count: 1 });
 
-    await asociarArchivosASolicitud([`https://hogarsos.es/uploads/${UUID}.jpg`], 'sr-1', 'foto_solicitud');
+    await asociarArchivosASolicitud([`https://hogarsos.es/uploads/${UUID}.jpg`], 'sr-1', 'foto_solicitud', 'u-1');
 
     expect(mockPrisma.archivoSubido.updateMany).toHaveBeenCalledWith({
-      where: { nombreArchivo: { in: [`${UUID}.jpg`] } },
+      where: { nombreArchivo: { in: [`${UUID}.jpg`] }, propietarioId: 'u-1' },
       data: { serviceRequestId: 'sr-1', tipo: 'foto_solicitud' },
     });
   });
 
   it('descarta URLs con forma inválida sin lanzar', async () => {
-    await asociarArchivosASolicitud(['https://evil.com/../../.env'], 'sr-1', 'foto_solicitud');
+    await asociarArchivosASolicitud(['https://evil.com/../../.env'], 'sr-1', 'foto_solicitud', 'u-1');
 
     expect(mockPrisma.archivoSubido.updateMany).not.toHaveBeenCalled();
   });

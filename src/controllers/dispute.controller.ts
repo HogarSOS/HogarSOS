@@ -64,7 +64,7 @@ export async function createDispute(req: Request, res: Response) {
   // Igual que en createServiceRequest: las capturas adjuntas se subieron
   // antes de que existiera la reclamación, así que se clasifican aquí
   // como prueba de ESTA solicitud (auditoría B4).
-  await asociarArchivosASolicitud(datos.fotosUrls ?? [], id, 'foto_disputa');
+  await asociarArchivosASolicitud(datos.fotosUrls ?? [], id, 'foto_disputa', userId);
 
   const otraParteId = solicitud.clienteId === userId ? solicitud.profesionalId : solicitud.clienteId;
   if (otraParteId) {

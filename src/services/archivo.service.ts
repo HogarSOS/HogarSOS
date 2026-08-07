@@ -107,6 +107,14 @@ export async function registrarArchivo(params: {
  * pertenecen — y sin esa asociación no hay forma de comprobar después si
  * quien pide la foto es participante.
  *
+ * `propietarioId` en el `where` (auditoría, hallazgo #7): sin él, alguien
+ * que mandara en `fotosUrls` el nombre de un archivo AJENO conseguiría
+ * reetiquetarlo como propio de su solicitud/disputa y verlo vía
+ * `puedeVerArchivo` (participante de esa solicitud). El nombre es un UUID
+ * aleatorio no enumerable, así que ya hacía falta conocerlo de antemano
+ * para explotarlo — pero filtrar por dueño cierra el hueco del todo, no
+ * solo lo dificulta.
+ *
  * Best-effort a propósito: que una foto no quede asociada no debe
  * impedir crear la solicitud. El coste de fallar es que esa foto solo la
  * vea su propietario, no que se filtre.
@@ -114,7 +122,8 @@ export async function registrarArchivo(params: {
 export async function asociarArchivosASolicitud(
   urls: string[],
   serviceRequestId: string,
-  tipo: TipoArchivo
+  tipo: TipoArchivo,
+  propietarioId: string
 ): Promise<void> {
   const nombres = urls
     .map((u) => normalizarNombreArchivo(u))
@@ -123,7 +132,7 @@ export async function asociarArchivosASolicitud(
 
   await prisma.archivoSubido
     .updateMany({
-      where: { nombreArchivo: { in: nombres } },
+      where: { nombreArchivo: { in: nombres }, propietarioId },
       data: { serviceRequestId, tipo },
     })
     .catch((e) => console.error(`[archivo.service] No se pudieron asociar archivos a ${serviceRequestId}:`, e));

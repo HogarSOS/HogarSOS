@@ -208,7 +208,7 @@ export async function createServiceRequest(req: Request, res: Response) {
   // que se puede saber a qué pertenecen. Sin esta asociación no habría
   // forma de comprobar después si quien pide ver la foto es participante
   // de la solicitud (auditoría B4).
-  await asociarArchivosASolicitud(fotosUrls ?? [], solicitud.id, 'foto_solicitud');
+  await asociarArchivosASolicitud(fotosUrls ?? [], solicitud.id, 'foto_solicitud', clienteId);
 
   // Aviso a los profesionales disponibles de esa categoría, cerca de la
   // solicitud — "fire and forget", nunca debe bloquear ni fallar la

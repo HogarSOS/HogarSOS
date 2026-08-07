@@ -5,6 +5,9 @@ import { UserRole } from '@prisma/client';
 interface JwtPayload {
   userId: string;
   role: UserRole;
+  // Solo presente en un refresh token (ver token.service.ts). Un access
+  // token nunca lo lleva.
+  type?: string;
 }
 
 declare global {
@@ -35,7 +38,23 @@ export function authMiddleware(allowedRoles?: JwtPayload['role'][]) {
     const token = authHeader.split(' ')[1];
 
     try {
-      const payload = jwt.verify(token, process.env.JWT_SECRET as string) as JwtPayload;
+      // algorithms fijado: sin esto, jwt.verify acepta cualquier
+      // algoritmo que el propio token declare en su cabecera — jsonwebtoken
+      // en concreto es vulnerable a la confusión RS256/HS256 si alguna vez
+      // se introduce una clave pública en otro sitio del código. Fijarlo
+      // aquí es defensa en profundidad barata (auditoría, hallazgo #2).
+      const payload = jwt.verify(token, process.env.JWT_SECRET as string, { algorithms: ['HS256'] }) as JwtPayload;
+
+      // Un refresh token (30 días) lleva `type: 'refresh'` y firma con el
+      // MISMO secreto que el access token (ver token.service.ts) — sin
+      // este chequeo, cualquiera con un refresh token podía usarlo
+      // directamente como access token, saltándose por completo la
+      // expiración corta de 15 min pensada para la API (auditoría,
+      // hallazgo #8).
+      if (payload.type === 'refresh') {
+        return res.status(401).json({ error: 'Token inválido o expirado', code: 'AUTH_TOKEN_INVALID' });
+      }
+
       req.user = payload;
 
       if (allowedRoles && !allowedRoles.includes(payload.role)) {

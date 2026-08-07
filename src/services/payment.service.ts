@@ -105,6 +105,16 @@ const LEASE_LIBERACION_MS = 5 * 60 * 1000;
 /** Estados de los que una liberación todavía puede (y debe) avanzar. */
 const ESTADOS_LIBERABLES = ['retenido', 'capturado'] as const;
 
+/**
+ * Estados de los que `refundPayment` todavía puede deshacer algo
+ * (auditoría, hallazgo #4). Superconjunto de ESTADOS_LIBERABLES: incluye
+ * 'liberado' porque una disputa puede resolverse a favor del cliente
+ * DESPUÉS de que el trabajo ya se completara y el pago ya se transfiriera
+ * al profesional — antes ese caso quedaba fuera por completo y
+ * `resolveDispute` no tenía ninguna forma de cerrar la disputa.
+ */
+const ESTADOS_REEMBOLSABLES = ['retenido', 'capturado', 'liberado'] as const;
+
 /** Redondeo a céntimos en el dominio decimal, para no arrastrar el error binario de coma flotante entre pasos. */
 function redondear2(n: number): number {
   return Number(n.toFixed(2));
@@ -184,41 +194,69 @@ export async function createEscrowPaymentIntent(params: {
 
   const ephemeralKeySecret = await crearEphemeralKey(clienteStripeCustomerId);
 
-  const paymentIntent = await stripe.paymentIntents.create({
-    amount: Math.round(montoTotalCliente * 100), // Stripe trabaja en céntimos
-    currency: 'eur',
-    capture_method: 'manual', // clave del modelo escrow: autoriza sin capturar
-    // Solo tarjeta: la cuenta tiene activados por defecto métodos como
-    // Klarna/Amazon Pay/Satispay que NO soportan captura manual, y con
-    // automatic_payment_methods habilitado (el default de la cuenta) el
-    // Payment Sheet del móvil falla al inicializarse por esos métodos
-    // incompatibles antes de que el cliente llegue a ver el formulario
-    // de tarjeta. Tarjeta es además el único método que tiene sentido
-    // para un pago retenido de días.
-    payment_method_types: ['card'],
-    customer: clienteStripeCustomerId,
-    // Guarda la tarjeta en el Customer tras la autorización para que
-    // Payment Sheet la ofrezca en el próximo pago (presupuesto,
-    // ampliación o un trabajo distinto). No afecta al modelo de captura
-    // manual/escrow: solo decide qué pasa con el método de pago
-    // DESPUÉS de que este PaymentIntent se autorice.
-    setup_future_usage: 'off_session',
-    metadata: { serviceRequestId, presupuestoId, ...(ampliacionId ? { ampliacionId } : {}) },
-  });
+  // Clave de idempotencia determinista (auditoría, hallazgo #3): dos
+  // peticiones casi simultáneas para la MISMA autorización (doble tap en
+  // "Pagar", reintento de red tras un timeout) calculan el mismo
+  // presupuestoId/ampliacionId antes de llegar aquí. Sin esto, cada una
+  // creaba su propio PaymentIntent — dos retenciones distintas en la
+  // tarjeta del cliente por el mismo trabajo. Con la misma clave, Stripe
+  // devuelve el MISMO PaymentIntent a ambas peticiones.
+  const idempotencyKey = ampliacionId ? `intent_amp_${ampliacionId}` : `intent_pre_${presupuestoId}`;
 
-  const pago = await prisma.payment.create({
-    data: {
-      serviceRequestId,
-      presupuestoId,
-      ampliacionId,
-      montoBase,
-      montoTotal: montoTotalCliente,
-      comisionPlataforma,
-      montoProfesional,
-      estado: 'retenido',
-      stripePaymentIntentId: paymentIntent.id,
+  const paymentIntent = await stripe.paymentIntents.create(
+    {
+      amount: Math.round(montoTotalCliente * 100), // Stripe trabaja en céntimos
+      currency: 'eur',
+      capture_method: 'manual', // clave del modelo escrow: autoriza sin capturar
+      // Solo tarjeta: la cuenta tiene activados por defecto métodos como
+      // Klarna/Amazon Pay/Satispay que NO soportan captura manual, y con
+      // automatic_payment_methods habilitado (el default de la cuenta) el
+      // Payment Sheet del móvil falla al inicializarse por esos métodos
+      // incompatibles antes de que el cliente llegue a ver el formulario
+      // de tarjeta. Tarjeta es además el único método que tiene sentido
+      // para un pago retenido de días.
+      payment_method_types: ['card'],
+      customer: clienteStripeCustomerId,
+      // Guarda la tarjeta en el Customer tras la autorización para que
+      // Payment Sheet la ofrezca en el próximo pago (presupuesto,
+      // ampliación o un trabajo distinto). No afecta al modelo de captura
+      // manual/escrow: solo decide qué pasa con el método de pago
+      // DESPUÉS de que este PaymentIntent se autorice.
+      setup_future_usage: 'off_session',
+      metadata: { serviceRequestId, presupuestoId, ...(ampliacionId ? { ampliacionId } : {}) },
     },
-  });
+    { idempotencyKey }
+  );
+
+  // La fila Payment tiene stripePaymentIntentId como @unique. Si dos
+  // peticiones concurrentes reutilizaron el mismo PaymentIntent (arriba),
+  // solo una de las dos consigue insertar aquí — la otra choca contra ese
+  // unique (P2002), no porque haya un error real, sino porque la primera
+  // ya dejó constancia de la misma autorización. Se adopta esa fila en
+  // vez de propagar el error, para que ambas peticiones devuelvan la
+  // misma respuesta al cliente.
+  let pago;
+  try {
+    pago = await prisma.payment.create({
+      data: {
+        serviceRequestId,
+        presupuestoId,
+        ampliacionId,
+        montoBase,
+        montoTotal: montoTotalCliente,
+        comisionPlataforma,
+        montoProfesional,
+        estado: 'retenido',
+        stripePaymentIntentId: paymentIntent.id,
+      },
+    });
+  } catch (e) {
+    if ((e as { code?: string })?.code === 'P2002') {
+      pago = await prisma.payment.findUniqueOrThrow({ where: { stripePaymentIntentId: paymentIntent.id } });
+    } else {
+      throw e;
+    }
+  }
 
   return {
     pago,
@@ -684,33 +722,44 @@ async function ejecutarLiberacion(serviceRequestId: string, baseFinal: number) {
  * llama al cancelarse antes de completarse, y al resolver una disputa a
  * favor del cliente.
  *
- * Distingue los dos casos posibles, porque no se deshacen igual:
+ * Distingue tres casos, porque no se deshacen igual:
  *
  * - 'retenido': el dinero nunca salió de la tarjeta. Basta con cancelar
  *   la autorización.
  * - 'capturado': el dinero YA salió (una liberación anterior capturó
  *   pero no llegó a transferir). Una autorización capturada no se puede
- *   cancelar — hay que reembolsar el cargo. Antes este caso ni se
- *   contemplaba: `refundPayment` solo miraba 'retenido', así que una
- *   disputa a favor del cliente sobre un pago a medio liberar lanzaba
- *   PAGO_NO_ENCONTRADO y la disputa no se podía cerrar nunca.
+ *   cancelar — hay que reembolsar el cargo.
+ * - 'liberado' (auditoría, hallazgo #4): el dinero salió de la tarjeta
+ *   Y ya se transfirió a la cuenta Connect del profesional. Antes este
+ *   caso ni se contemplaba: `refundPayment` solo miraba 'retenido'/
+ *   'capturado', así que una disputa a favor del cliente sobre un
+ *   trabajo YA completado y liberado lanzaba PAGO_NO_ENCONTRADO y la
+ *   disputa no se podía cerrar nunca — sin ninguna vía en la app para
+ *   devolver ese dinero. `reverse_transfer: true` le pide a Stripe que
+ *   recupere el importe del saldo del profesional ANTES de reembolsar
+ *   al cliente, en la misma llamada. Si el profesional ya no tiene
+ *   saldo suficiente (lo retiró, por ejemplo), Stripe rechaza la
+ *   operación — límite real de Stripe, no de este código; ese caso llega
+ *   al admin como fallo explícito (ver resolveDispute) en vez de fingir
+ *   que se resolvió.
  *
- * Ambas operaciones llevan clave de idempotencia determinista, así que
- * reintentar tras un timeout no cancela ni reembolsa dos veces.
+ * Todas las operaciones llevan clave de idempotencia determinista, así
+ * que reintentar tras un timeout no cancela ni reembolsa dos veces.
  */
 export async function refundPayment(serviceRequestId: string) {
   const pagos = await prisma.payment.findMany({
-    where: { serviceRequestId, estado: { in: [...ESTADOS_LIBERABLES] } },
+    where: { serviceRequestId, estado: { in: [...ESTADOS_REEMBOLSABLES] } },
   });
   if (pagos.length === 0) throw new Error('PAGO_NO_ENCONTRADO');
 
   for (const pago of pagos) {
     if (!pago.stripePaymentIntentId) continue;
 
-    if (pago.estado === 'capturado') {
+    if (pago.estado === 'capturado' || pago.estado === 'liberado') {
       await stripe.refunds.create(
         {
           payment_intent: pago.stripePaymentIntentId,
+          ...(pago.estado === 'liberado' ? { reverse_transfer: true } : {}),
           metadata: { paymentId: pago.id, serviceRequestId },
         },
         { idempotencyKey: `ref_${pago.id}` }

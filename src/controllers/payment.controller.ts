@@ -272,10 +272,18 @@ export async function stripeWebhook(req: Request, res: Response) {
       }
       break;
     }
+    // `estado: 'retenido'` en el `where` de los dos casos de abajo
+    // (auditoría, hallazgo #6): Stripe no garantiza el orden de entrega
+    // de los webhooks. Sin esta precondición, un evento antiguo o
+    // reintentado que llega DESPUÉS de que releasePayments ya capturó o
+    // liberó esta misma autorización podía degradarla a 'fallido' o
+    // 'reembolsado' — dejando un pago ya cobrado y transferido marcado
+    // como si nunca hubiera ocurrido. Solo tiene sentido aplicar estos
+    // dos eventos sobre una autorización que sigue tal cual se creó.
     case 'payment_intent.payment_failed': {
       const intent = event.data.object as { id: string };
       await prisma.payment.updateMany({
-        where: { stripePaymentIntentId: intent.id },
+        where: { stripePaymentIntentId: intent.id, estado: 'retenido' },
         data: { estado: 'fallido' },
       });
       break;
@@ -283,7 +291,7 @@ export async function stripeWebhook(req: Request, res: Response) {
     case 'payment_intent.canceled': {
       const intent = event.data.object as { id: string };
       await prisma.payment.updateMany({
-        where: { stripePaymentIntentId: intent.id },
+        where: { stripePaymentIntentId: intent.id, estado: 'retenido' },
         data: { estado: 'reembolsado' },
       });
       break;
