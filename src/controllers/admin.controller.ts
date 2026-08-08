@@ -9,6 +9,7 @@ import {
 } from '../services/payment.service';
 import { agregarPagos } from './serviceRequest.controller';
 import { TAREAS, ejecutarTareaAhora } from '../jobs';
+import { registrarAccionAdmin, listarAccionesAdmin } from '../services/adminAction.service';
 
 /**
  * Estado de las tareas programadas (ver src/jobs/). Sin esto, saber si
@@ -200,6 +201,16 @@ export async function approveProfessional(req: Request, res: Response) {
   // TODO: disparar notificación push/email al profesional con el resultado
   // (y el motivoRechazo si aplica) — pendiente de integrar servicio de notificaciones.
 
+  await registrarAccionAdmin({
+    adminId,
+    accion: parsed.data.aprobar ? 'aprobar_profesional' : 'rechazar_profesional',
+    entidadTipo: 'professional',
+    entidadId: professionalId,
+    estadoAnterior: 'pendiente',
+    estadoNuevo: actualizado.estadoVerificacion,
+    detalle: parsed.data.motivoRechazo ?? null,
+  });
+
   return res.json({
     userId: actualizado.userId,
     estadoVerificacion: actualizado.estadoVerificacion,
@@ -325,6 +336,16 @@ export async function resolveDispute(req: Request, res: Response) {
     },
   });
 
+  await registrarAccionAdmin({
+    adminId,
+    accion: 'resolver_disputa',
+    entidadTipo: 'dispute',
+    entidadId: id,
+    estadoAnterior: disputa.estado,
+    estadoNuevo: actualizada.estado,
+    detalle: notas,
+  });
+
   return res.json(actualizada);
 }
 
@@ -389,10 +410,6 @@ export async function getUserForAdmin(req: Request, res: Response) {
  *    sigan activos en ESE momento, no de un número fijo.
  * 3. No se puede "activar" una cuenta que el propio usuario borró
  *    (RGPD) — ver el comentario de `cuentaEliminada` arriba.
- *
- * TODO(Bloque 4 del panel admin): registrar esta acción en la auditoría
- * centralizada (AdminAction: adminId, accion, usuarioId, estado
- * anterior/nuevo, fecha) en cuanto exista esa tabla.
  */
 export async function toggleUserActive(req: Request, res: Response) {
   const { id } = req.params;
@@ -432,5 +449,31 @@ export async function toggleUserActive(req: Request, res: Response) {
     data: { activo: !usuario.activo },
   });
 
+  await registrarAccionAdmin({
+    adminId,
+    accion: actualizado.activo ? 'activar_usuario' : 'bloquear_usuario',
+    entidadTipo: 'user',
+    entidadId: id,
+    estadoAnterior: String(usuario.activo),
+    estadoNuevo: String(actualizado.activo),
+  });
+
   return res.json(serializarUsuarioAdmin(actualizado));
+}
+
+/**
+ * Historial de auditoría del panel admin (Bloque 4). Sin filtros, el
+ * global más reciente; con `entidadTipo`+`entidadId`, el historial de
+ * una entidad concreta (ej. todas las acciones sobre un usuario).
+ */
+export async function listAdminActions(req: Request, res: Response) {
+  const { entidadTipo, entidadId, adminId } = req.query;
+
+  const acciones = await listarAccionesAdmin({
+    entidadTipo: typeof entidadTipo === 'string' ? entidadTipo : undefined,
+    entidadId: typeof entidadId === 'string' ? entidadId : undefined,
+    adminId: typeof adminId === 'string' ? adminId : undefined,
+  });
+
+  return res.json({ acciones });
 }

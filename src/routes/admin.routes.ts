@@ -12,6 +12,7 @@ import {
   runJob,
   getUserForAdmin,
   toggleUserActive,
+  listAdminActions,
 } from '../controllers/admin.controller';
 
 const router = Router();
@@ -38,5 +39,8 @@ router.post('/jobs/:nombre/run', authMiddleware(['admin']), asyncHandler(runJob)
 // estado, ambos protegidos exclusivamente para admin.
 router.get('/users/:id', authMiddleware(['admin']), asyncHandler(getUserForAdmin));
 router.patch('/users/:id/toggle-active', authMiddleware(['admin']), asyncHandler(toggleUserActive));
+
+// Auditoría centralizada (Bloque 4 del panel admin).
+router.get('/actions', authMiddleware(['admin']), asyncHandler(listAdminActions));
 
 export default router;

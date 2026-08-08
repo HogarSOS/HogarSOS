@@ -448,6 +448,30 @@ model TareaProgramada {
   @@map("tareas_programadas")
 }
 
+// Auditoría centralizada del panel admin (Bloque 4). `adminId`/`entidadId`
+// son strings sueltos, no relaciones — mismo patrón que `creadoPor`/
+// `resueltoPor` en Dispute o `verificadoPor` en Professional: no vale la
+// pena una FK para un campo que solo se lee, nunca se hace join sobre él.
+// `estadoAnterior`/`estadoNuevo` son nullable porque no toda acción tiene
+// una transición de estado clara (ej. una futura acción que solo lee).
+model AdminAction {
+  id             String   @id @default(uuid())
+  adminId        String   @map("admin_id")
+  accion         String
+  entidadTipo    String   @map("entidad_tipo")
+  entidadId      String   @map("entidad_id")
+  estadoAnterior String?  @map("estado_anterior")
+  estadoNuevo    String?  @map("estado_nuevo")
+  detalle        String?
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  // Consultas reales del panel: "qué hizo este admin" y "qué le pasó a
+  // esta entidad", en ese orden de frecuencia esperada.
+  @@index([adminId, createdAt])
+  @@index([entidadTipo, entidadId])
+  @@map("admin_actions")
+}
+
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model spatial_ref_sys {
   srid      Int     @id

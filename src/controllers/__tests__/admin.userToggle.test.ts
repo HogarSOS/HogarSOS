@@ -26,10 +26,17 @@ jest.mock('../../jobs', () => ({
   ejecutarTareaAhora: jest.fn(),
 }));
 
+jest.mock('../../services/adminAction.service', () => ({
+  registrarAccionAdmin: jest.fn(),
+  listarAccionesAdmin: jest.fn(),
+}));
+
 import { prisma } from '../../config/prisma';
+import { registrarAccionAdmin } from '../../services/adminAction.service';
 import { getUserForAdmin, toggleUserActive } from '../admin.controller';
 
 const mockPrisma = prisma as any;
+const mockRegistrarAccionAdmin = registrarAccionAdmin as jest.Mock;
 
 function fakeRes(): Response {
   const res: any = {};
@@ -106,6 +113,16 @@ describe('toggleUserActive', () => {
       data: { activo: false },
     });
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ activo: false }));
+    expect(mockRegistrarAccionAdmin).toHaveBeenCalledWith(
+      expect.objectContaining({
+        adminId: 'admin-1',
+        accion: 'bloquear_usuario',
+        entidadTipo: 'user',
+        entidadId: 'user-1',
+        estadoAnterior: 'true',
+        estadoNuevo: 'false',
+      })
+    );
   });
 
   it('activa a un usuario bloqueado (activo: false -> true) si no fue una cuenta autoeliminada', async () => {
@@ -120,6 +137,9 @@ describe('toggleUserActive', () => {
       data: { activo: true },
     });
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ activo: true }));
+    expect(mockRegistrarAccionAdmin).toHaveBeenCalledWith(
+      expect.objectContaining({ accion: 'activar_usuario', estadoAnterior: 'false', estadoNuevo: 'true' })
+    );
   });
 
   it('devuelve 404 si el usuario no existe', async () => {
@@ -131,6 +151,7 @@ describe('toggleUserActive', () => {
     expect(res.status).toHaveBeenCalledWith(404);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'USER_NOT_FOUND' }));
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    expect(mockRegistrarAccionAdmin).not.toHaveBeenCalled();
   });
 
   // Regla explícita del bloque: un admin no puede cambiar el estado de
@@ -144,6 +165,7 @@ describe('toggleUserActive', () => {
     expect(res.status).toHaveBeenCalledWith(409);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'ADMIN_CANNOT_TOGGLE_SELF' }));
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    expect(mockRegistrarAccionAdmin).not.toHaveBeenCalled();
   });
 
   // Regla explícita del bloque: no se puede dejar la plataforma sin
@@ -162,6 +184,7 @@ describe('toggleUserActive', () => {
     expect(res.status).toHaveBeenCalledWith(409);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'ADMIN_CANNOT_BLOCK_LAST_ADMIN' }));
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    expect(mockRegistrarAccionAdmin).not.toHaveBeenCalled();
   });
 
   it('permite desactivar a un admin si hay más de un administrador activo', async () => {
@@ -199,5 +222,6 @@ describe('toggleUserActive', () => {
       expect.objectContaining({ code: 'ADMIN_CANNOT_REACTIVATE_DELETED_ACCOUNT' })
     );
     expect(mockPrisma.user.update).not.toHaveBeenCalled();
+    expect(mockRegistrarAccionAdmin).not.toHaveBeenCalled();
   });
 });
