@@ -98,17 +98,23 @@ export function agregarPagos(
     montoProfesional: Prisma.Decimal;
   }[]
 ) {
-  if (pagos.length === 0) return null;
+  // 'pendiente' (PaymentIntent creado, cliente todavía no confirmó el
+  // Payment Sheet) no cuenta como un pago real todavía — mostrarlo aquí
+  // es justo el bug que hacía ver una solicitud como "pagada"/"autorizada"
+  // sin que Stripe hubiera confirmado nada. Si solo hay filas 'pendiente',
+  // se trata igual que si no hubiera ningún pago.
+  const pagosConfirmados = pagos.filter((p) => p.estado !== 'pendiente');
+  if (pagosConfirmados.length === 0) return null;
 
-  const estado = pagos.some((p) => p.estado === 'retenido')
+  const estado = pagosConfirmados.some((p) => p.estado === 'retenido')
     ? 'retenido'
-    : pagos.some((p) => p.estado === 'liberado')
+    : pagosConfirmados.some((p) => p.estado === 'liberado')
       ? 'liberado'
-      : pagos.some((p) => p.estado === 'fallido')
+      : pagosConfirmados.some((p) => p.estado === 'fallido')
         ? 'fallido'
         : 'reembolsado';
 
-  const relevantes = pagos.filter((p) => p.estado === 'retenido' || p.estado === 'liberado');
+  const relevantes = pagosConfirmados.filter((p) => p.estado === 'retenido' || p.estado === 'liberado');
   const sumar = (clave: 'montoBase' | 'montoTotal' | 'comisionPlataforma' | 'montoProfesional') =>
     Number(relevantes.reduce((acc, p) => acc + Number(p[clave]), 0).toFixed(2));
 
@@ -128,16 +134,22 @@ export function agregarPagos(
  * pago", sea la primera vez o tras una ampliación, sin tener que
  * distinguir los dos casos por su cuenta.
  */
-function calcularPagoPendienteDeAutorizar(
+export function calcularPagoPendienteDeAutorizar(
   presupuesto: { id: string; estado: string } | undefined,
   ampliacion: { id: string; estado: string } | undefined,
-  pagos: { presupuestoId: string; ampliacionId: string | null }[]
+  pagos: { presupuestoId: string; ampliacionId: string | null; estado: string }[]
 ): boolean {
   if (!presupuesto || presupuesto.estado !== 'aceptado') return false;
-  const tienePagoInicial = pagos.some((p) => p.presupuestoId === presupuesto.id && !p.ampliacionId);
+  // 'pendiente' no cuenta como "ya autorizado" (ver agregarPagos más
+  // arriba) — si el único Payment que hay para este presupuesto/
+  // ampliación se quedó en 'pendiente' (Payment Sheet abandonado o
+  // fallido antes de confirmarse), el botón "Autorizar pago" debe seguir
+  // visible para que el cliente pueda reintentarlo.
+  const confirmados = pagos.filter((p) => p.estado !== 'pendiente');
+  const tienePagoInicial = confirmados.some((p) => p.presupuestoId === presupuesto.id && !p.ampliacionId);
   if (!tienePagoInicial) return true;
   if (ampliacion && ampliacion.estado === 'aceptado') {
-    const tienePagoAmpliacion = pagos.some((p) => p.ampliacionId === ampliacion.id);
+    const tienePagoAmpliacion = confirmados.some((p) => p.ampliacionId === ampliacion.id);
     if (!tienePagoAmpliacion) return true;
   }
   return false;

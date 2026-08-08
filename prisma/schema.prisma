@@ -514,6 +514,16 @@ enum EstadoSolicitud {
 }
 
 enum EstadoPago {
+  // PaymentIntent ya creado en Stripe pero el cliente todavía no ha
+  // confirmado el Payment Sheet (o lo canceló/falló antes de confirmar).
+  // Antes esta fila nacía directamente como 'retenido', lo que hacía que
+  // la solicitud apareciera como "pagada" para cliente y profesional aun
+  // cuando Stripe nunca llegó a autorizar nada real (comprobado: el
+  // PaymentIntent se quedaba en 'requires_payment_method'/'Incompleto'
+  // sin método de pago adjunto). Solo pasa a 'retenido' cuando el webhook
+  // payment_intent.amount_capturable_updated confirma la autorización de
+  // verdad — ver createEscrowPaymentIntent y stripeWebhook.
+  pendiente
   retenido
   // Estado intermedio real que antes no se representaba: el dinero YA
   // salió de la tarjeta del cliente (captura hecha en Stripe) pero

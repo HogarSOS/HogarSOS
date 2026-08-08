@@ -20,17 +20,16 @@ const createIntentSchema = z.object({
 
 /**
  * `payment.service.createEscrowPaymentIntent` crea la fila Payment (con
- * estado 'retenido') en el mismo momento en que se crea el PaymentIntent
- * en Stripe — ANTES de que el cliente confirme nada con el Payment
- * Sheet. Si esa confirmación nunca llega a completarse (el SDK de Stripe
- * falla al inicializarse, el usuario cierra la app, se cae la conexión a
- * mitad...) la fila se queda ahí para siempre y bloquea cualquier
- * reintento — el bug real detrás de "no se pudo procesar el pago,
- * inténtalo de nuevo" seguido de "no hay nada pendiente de autorizar".
- * Antes de tratar un pago existente como bloqueante, se comprueba su
- * estado real en Stripe: si nunca llegó a confirmarse (o se canceló),
- * no es una autorización real — se deja reintentar reutilizando el
- * mismo PaymentIntent en vez de crear uno nuevo.
+ * estado 'pendiente', no 'retenido' — ver el enum EstadoPago) en el mismo
+ * momento en que se crea el PaymentIntent en Stripe — ANTES de que el
+ * cliente confirme nada con el Payment Sheet. Si esa confirmación nunca
+ * llega a completarse (el SDK de Stripe falla al inicializarse, el
+ * usuario cierra la app, se cae la conexión a mitad...) la fila se queda
+ * en 'pendiente' (o pasa a 'fallido'/'reembolsado' vía webhook) y no
+ * bloquea ningún reintento — pero, antes de tratar un pago existente
+ * como bloqueante, igualmente se comprueba su estado real en Stripe: si
+ * nunca llegó a confirmarse (o se canceló), se deja reintentar
+ * reutilizando el mismo PaymentIntent en vez de crear uno nuevo.
  */
 /**
  * `requires_action` y `requires_confirmation` son CRÍTICOS al pasar a
@@ -261,29 +260,41 @@ export async function stripeWebhook(req: Request, res: Response) {
     // está retenido.
     case 'payment_intent.amount_capturable_updated': {
       const intent = event.data.object as { id: string };
-      const pago = await prisma.payment.findUnique({
-        where: { stripePaymentIntentId: intent.id },
-        include: { serviceRequest: { select: { profesionalId: true } } },
+      // Solo esta transición (pendiente -> retenido) representa que
+      // Stripe confirmó de verdad la autorización — ver comentario del
+      // enum EstadoPago en el schema. `count` en 0 significa que ya se
+      // procesó antes (reintento del webhook) o que la fila no existe;
+      // en ambos casos no hay nada que notificar de nuevo.
+      const { count } = await prisma.payment.updateMany({
+        where: { stripePaymentIntentId: intent.id, estado: 'pendiente' },
+        data: { estado: 'retenido' },
       });
-      if (pago?.serviceRequest.profesionalId) {
-        enviarNotificacion(pago.serviceRequest.profesionalId, 'pago_autorizado', {}, {
-          solicitudId: pago.serviceRequestId,
-        }).catch((e) => console.error(`[stripeWebhook] Error al notificar pago autorizado de ${pago.id}:`, e));
+      if (count > 0) {
+        const pago = await prisma.payment.findUnique({
+          where: { stripePaymentIntentId: intent.id },
+          include: { serviceRequest: { select: { profesionalId: true } } },
+        });
+        if (pago?.serviceRequest.profesionalId) {
+          enviarNotificacion(pago.serviceRequest.profesionalId, 'pago_autorizado', {}, {
+            solicitudId: pago.serviceRequestId,
+          }).catch((e) => console.error(`[stripeWebhook] Error al notificar pago autorizado de ${pago.id}:`, e));
+        }
       }
       break;
     }
-    // `estado: 'retenido'` en el `where` de los dos casos de abajo
-    // (auditoría, hallazgo #6): Stripe no garantiza el orden de entrega
-    // de los webhooks. Sin esta precondición, un evento antiguo o
-    // reintentado que llega DESPUÉS de que releasePayments ya capturó o
-    // liberó esta misma autorización podía degradarla a 'fallido' o
-    // 'reembolsado' — dejando un pago ya cobrado y transferido marcado
-    // como si nunca hubiera ocurrido. Solo tiene sentido aplicar estos
-    // dos eventos sobre una autorización que sigue tal cual se creó.
+    // `estado: { in: ['pendiente', 'retenido'] }` en el `where` de los dos
+    // casos de abajo (auditoría, hallazgo #6, ampliado al añadir el
+    // estado 'pendiente'): Stripe no garantiza el orden de entrega de los
+    // webhooks. Sin esta precondición, un evento antiguo o reintentado
+    // que llega DESPUÉS de que releasePayments ya capturó o liberó esta
+    // misma autorización podía degradarla a 'fallido' o 'reembolsado' —
+    // dejando un pago ya cobrado y transferido marcado como si nunca
+    // hubiera ocurrido. 'pendiente' se incluye porque un intento puede
+    // fallar o cancelarse ANTES de llegar a confirmarse ('retenido').
     case 'payment_intent.payment_failed': {
       const intent = event.data.object as { id: string };
       await prisma.payment.updateMany({
-        where: { stripePaymentIntentId: intent.id, estado: 'retenido' },
+        where: { stripePaymentIntentId: intent.id, estado: { in: ['pendiente', 'retenido'] } },
         data: { estado: 'fallido' },
       });
       break;
@@ -291,7 +302,7 @@ export async function stripeWebhook(req: Request, res: Response) {
     case 'payment_intent.canceled': {
       const intent = event.data.object as { id: string };
       await prisma.payment.updateMany({
-        where: { stripePaymentIntentId: intent.id, estado: 'retenido' },
+        where: { stripePaymentIntentId: intent.id, estado: { in: ['pendiente', 'retenido'] } },
         data: { estado: 'reembolsado' },
       });
       break;

@@ -246,7 +246,11 @@ export async function createEscrowPaymentIntent(params: {
         montoTotal: montoTotalCliente,
         comisionPlataforma,
         montoProfesional,
-        estado: 'retenido',
+        // 'pendiente', no 'retenido': todavía no sabemos si el cliente
+        // va a confirmar el Payment Sheet. Ver comentario del enum
+        // EstadoPago en el schema — el webhook amount_capturable_updated
+        // es quien lo sube a 'retenido' cuando Stripe confirma de verdad.
+        estado: 'pendiente',
         stripePaymentIntentId: paymentIntent.id,
       },
     });

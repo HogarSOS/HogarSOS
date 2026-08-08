@@ -145,6 +145,23 @@ describe('createEscrowPaymentIntent', () => {
     expect(ephemeralKeySecret).toBe('ek_test_123');
   });
 
+  // Bug real de QA (2026-08-08): la fila nacía como 'retenido' aunque el
+  // cliente todavía no había confirmado nada con el Payment Sheet, lo que
+  // hacía que la solicitud apareciera como "pagada" sin que Stripe hubiera
+  // autorizado un cargo real. Ver comentario del enum EstadoPago.
+  it('crea la fila Payment en estado "pendiente", no "retenido" — solo el webhook de Stripe confirma la autorización real', async () => {
+    await createEscrowPaymentIntent({
+      serviceRequestId: 'sr-1',
+      presupuestoId: 'pres-1',
+      montoBase: 100,
+      clienteStripeCustomerId: 'cus_123',
+    });
+
+    expect(mockPrisma.payment.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ estado: 'pendiente' }),
+    });
+  });
+
   it('usa una clave de idempotencia distinta para la autorización de una ampliación', async () => {
     await createEscrowPaymentIntent({
       serviceRequestId: 'sr-1',
