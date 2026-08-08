@@ -49,6 +49,7 @@ export async function listJobs(_req: Request, res: Response) {
  */
 export async function runJob(req: Request, res: Response) {
   const { nombre } = req.params;
+  const adminId = req.user!.userId;
 
   const tarea = TAREAS.find((t) => t.nombre === nombre);
   if (!tarea) {
@@ -61,6 +62,13 @@ export async function runJob(req: Request, res: Response) {
 
   try {
     const resultado = await ejecutarTareaAhora(tarea);
+    await registrarAccionAdmin({
+      adminId,
+      accion: 'ejecutar_tarea_manual',
+      entidadTipo: 'job',
+      entidadId: nombre,
+      detalle: resultado,
+    });
     return res.json({ nombre, resultado });
   } catch (err) {
     const mensaje = err instanceof Error ? err.message : String(err);
@@ -104,9 +112,17 @@ export async function listStuckPayments(_req: Request, res: Response) {
  */
 export async function retryPaymentRelease(req: Request, res: Response) {
   const { serviceRequestId } = req.params;
+  const adminId = req.user!.userId;
 
   try {
     const pagos = await reintentarLiberacion(serviceRequestId);
+    await registrarAccionAdmin({
+      adminId,
+      accion: 'reintentar_liberacion_pago',
+      entidadTipo: 'service_request',
+      entidadId: serviceRequestId,
+      detalle: `${pagos.length} pago(s) liberado(s)`,
+    });
     return res.json({ serviceRequestId, liberados: pagos.length, pagos });
   } catch (err) {
     const mensaje = err instanceof Error ? err.message : String(err);
