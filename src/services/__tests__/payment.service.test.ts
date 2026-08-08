@@ -793,7 +793,12 @@ describe('listarPagosAtascados', () => {
         createdAt: new Date('2026-08-03T09:00:00Z'),
         intentosLiberacion: 2,
         ultimoErrorLiberacion: 'Stripe timeout',
-        serviceRequest: { estado: 'completada' },
+        serviceRequest: {
+          estado: 'completada',
+          categoria: { nombre: 'Aire acondicionado' },
+          cliente: { nombre: 'Ana Sánchez' },
+          profesional: { user: { nombre: 'José Fernández' } },
+        },
       },
       {
         id: 'pago-2',
@@ -805,7 +810,12 @@ describe('listarPagosAtascados', () => {
         createdAt: new Date('2026-08-03T10:00:00Z'),
         intentosLiberacion: 1,
         ultimoErrorLiberacion: null,
-        serviceRequest: { estado: 'completada' },
+        serviceRequest: {
+          estado: 'completada',
+          categoria: { nombre: 'Fontanería' },
+          cliente: { nombre: 'Luis Pérez' },
+          profesional: null,
+        },
       },
     ]);
 
@@ -813,7 +823,12 @@ describe('listarPagosAtascados', () => {
 
     expect(atascados[0].dineroRetenidoEnPlataforma).toBe(true);
     expect(atascados[0].ultimoError).toBe('Stripe timeout');
+    expect(atascados[0].categoria).toBe('Aire acondicionado');
+    expect(atascados[0].clienteNombre).toBe('Ana Sánchez');
+    expect(atascados[0].profesionalNombre).toBe('José Fernández');
     expect(atascados[1].dineroRetenidoEnPlataforma).toBe(false);
+    // profesional puede venir null (ver interfaz PagoAtascado) — no debe reventar.
+    expect(atascados[1].profesionalNombre).toBeNull();
   });
 });
 

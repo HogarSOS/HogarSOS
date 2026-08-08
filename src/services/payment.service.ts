@@ -786,6 +786,12 @@ export interface PagoAtascado {
   serviceRequestId: string;
   estado: string;
   estadoSolicitud: string;
+  categoria: string;
+  clienteNombre: string;
+  // Nullable: en teoría todo Payment cuelga de una solicitud ya aceptada
+  // por un profesional, pero no hay ninguna garantía en el schema de que
+  // profesionalId siga presente — más seguro no asumirlo.
+  profesionalNombre: string | null;
   montoProfesional: number;
   capturadoAt: Date | null;
   createdAt: Date;
@@ -815,7 +821,19 @@ export async function listarPagosAtascados(): Promise<PagoAtascado[]> {
       ],
     },
     orderBy: { createdAt: 'asc' },
-    include: { serviceRequest: { select: { estado: true } } },
+    include: {
+      // Solo para identificar el pago de un vistazo en el panel de
+      // admin (auditoría B2 original solo devolvía IDs) — no cambia
+      // nada de la lógica de captura/liberación de abajo.
+      serviceRequest: {
+        select: {
+          estado: true,
+          categoria: { select: { nombre: true } },
+          cliente: { select: { nombre: true } },
+          profesional: { select: { user: { select: { nombre: true } } } },
+        },
+      },
+    },
     take: 100,
   });
 
@@ -824,6 +842,9 @@ export async function listarPagosAtascados(): Promise<PagoAtascado[]> {
     serviceRequestId: p.serviceRequestId,
     estado: p.estado,
     estadoSolicitud: p.serviceRequest.estado,
+    categoria: p.serviceRequest.categoria.nombre,
+    clienteNombre: p.serviceRequest.cliente.nombre,
+    profesionalNombre: p.serviceRequest.profesional?.user.nombre ?? null,
     montoProfesional: Number(p.capturadoProfesional ?? p.montoProfesional),
     capturadoAt: p.capturadoAt,
     createdAt: p.createdAt,
