@@ -327,3 +327,110 @@ export async function resolveDispute(req: Request, res: Response) {
 
   return res.json(actualizada);
 }
+
+function serializarUsuarioAdmin(usuario: {
+  id: string;
+  nombre: string;
+  email: string | null;
+  telefono: string | null;
+  role: string;
+  activo: boolean;
+  firebaseUid: string | null;
+}) {
+  return {
+    id: usuario.id,
+    nombre: usuario.nombre,
+    email: usuario.email,
+    telefono: usuario.telefono,
+    role: usuario.role,
+    activo: usuario.activo,
+    // Una cuenta que se borró a sí misma (RGPD, ver deleteMe en
+    // user.controller.ts) también queda con activo:false, pero no es lo
+    // mismo que un bloqueo de admin: sus datos personales ya se
+    // anonimizaron y firebaseUid queda null (nunca más podrá iniciar
+    // sesión con esas credenciales, existan o no). El panel lo necesita
+    // para no ofrecer "Activar" sobre una cuenta que el propio usuario
+    // decidió eliminar.
+    cuentaEliminada: usuario.firebaseUid === null,
+  };
+}
+
+/**
+ * Localiza un usuario por ID para el panel de admin, antes de decidir
+ * si bloquearlo/activarlo. Deliberadamente NO es un listado — todavía
+ * no existe una pantalla de usuarios (fase 2 del roadmap del panel);
+ * esto es solo la búsqueda puntual mínima que hace falta para no
+ * operar a ciegas sobre un ID.
+ */
+export async function getUserForAdmin(req: Request, res: Response) {
+  const { id } = req.params;
+
+  const usuario = await prisma.user.findUnique({ where: { id } });
+  if (!usuario) {
+    return res.status(404).json({ error: 'Usuario no encontrado', code: 'USER_NOT_FOUND' });
+  }
+
+  return res.json(serializarUsuarioAdmin(usuario));
+}
+
+/**
+ * Bloquea o activa un usuario (invierte `User.activo`). El login
+ * (auth.controller.ts) y el refresh de token ya respetan este campo —
+ * no se toca nada de esa lógica aquí, solo quién puede cambiarlo.
+ *
+ * Tres reglas de seguridad, en este orden:
+ * 1. Un admin no puede cambiar el estado de su propia cuenta —
+ *    evita que se bloquee a sí mismo (o cualquier ambigüedad sobre
+ *    reactivarse) desde este endpoint.
+ * 2. No se puede desactivar al último administrador ACTIVO — sin esto,
+ *    la plataforma podría quedarse sin ningún admin capaz de revertirlo.
+ *    Se cuenta en cada llamada (no se cachea), a propósito: con más de
+ *    un admin en el futuro, la respuesta correcta depende de cuántos
+ *    sigan activos en ESE momento, no de un número fijo.
+ * 3. No se puede "activar" una cuenta que el propio usuario borró
+ *    (RGPD) — ver el comentario de `cuentaEliminada` arriba.
+ *
+ * TODO(Bloque 4 del panel admin): registrar esta acción en la auditoría
+ * centralizada (AdminAction: adminId, accion, usuarioId, estado
+ * anterior/nuevo, fecha) en cuanto exista esa tabla.
+ */
+export async function toggleUserActive(req: Request, res: Response) {
+  const { id } = req.params;
+  const adminId = req.user!.userId;
+
+  const usuario = await prisma.user.findUnique({ where: { id } });
+  if (!usuario) {
+    return res.status(404).json({ error: 'Usuario no encontrado', code: 'USER_NOT_FOUND' });
+  }
+
+  if (usuario.id === adminId) {
+    return res.status(409).json({
+      error: 'No puedes cambiar el estado de tu propia cuenta',
+      code: 'ADMIN_CANNOT_TOGGLE_SELF',
+    });
+  }
+
+  if (usuario.activo && usuario.role === 'admin') {
+    const adminsActivos = await prisma.user.count({ where: { role: 'admin', activo: true } });
+    if (adminsActivos <= 1) {
+      return res.status(409).json({
+        error: 'No puedes desactivar al único administrador activo',
+        code: 'ADMIN_CANNOT_BLOCK_LAST_ADMIN',
+      });
+    }
+  }
+
+  if (!usuario.activo && usuario.firebaseUid === null) {
+    return res.status(409).json({
+      error: 'Esta cuenta fue eliminada por el propio usuario y no se puede reactivar',
+      code: 'ADMIN_CANNOT_REACTIVATE_DELETED_ACCOUNT',
+    });
+  }
+
+  const actualizado = await prisma.user.update({
+    where: { id },
+    data: { activo: !usuario.activo },
+  });
+
+  return res.json(serializarUsuarioAdmin(actualizado));
+}

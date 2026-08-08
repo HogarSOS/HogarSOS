@@ -10,6 +10,8 @@ import {
   retryPaymentRelease,
   listJobs,
   runJob,
+  getUserForAdmin,
+  toggleUserActive,
 } from '../controllers/admin.controller';
 
 const router = Router();
@@ -30,5 +32,11 @@ router.post('/payments/:serviceRequestId/retry', authMiddleware(['admin']), asyn
 // esperar al siguiente ciclo.
 router.get('/jobs', authMiddleware(['admin']), asyncHandler(listJobs));
 router.post('/jobs/:nombre/run', authMiddleware(['admin']), asyncHandler(runJob));
+
+// Bloquear/activar usuarios (Bloque 3 del panel admin). No es un listado
+// general (no existe todavía) — solo localizar por ID y cambiar su
+// estado, ambos protegidos exclusivamente para admin.
+router.get('/users/:id', authMiddleware(['admin']), asyncHandler(getUserForAdmin));
+router.patch('/users/:id/toggle-active', authMiddleware(['admin']), asyncHandler(toggleUserActive));
 
 export default router;
