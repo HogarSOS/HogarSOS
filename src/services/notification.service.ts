@@ -26,6 +26,7 @@ async function despachar(
     await admin.messaging().send({
       token: usuario.fcmToken,
       notification: construirMensaje(usuario.idioma),
+      apns: { payload: { aps: { sound: 'default' } } },
       data,
     });
   } catch (e: any) {
