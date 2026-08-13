@@ -13,6 +13,12 @@ afterEach(() => {
 
 describe('token.service', () => {
   it('genera y verifica un refresh token válido', () => {
+    // require() a propósito, no un import estático: token.service lee
+    // JWT_SECRET en el top-level del módulo, así que necesita
+    // recargarse (jest.resetModules() en beforeEach) DESPUÉS de fijar
+    // el env var de este test — un import estático solo se ejecutaría
+    // una vez, con el JWT_SECRET del primer test que corra.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { generateRefreshToken, verifyRefreshToken } = require('../token.service');
     const token = generateRefreshToken({ userId: 'u1', role: 'cliente' });
 
@@ -22,6 +28,7 @@ describe('token.service', () => {
   });
 
   it('rechaza un access token (sin type: "refresh") pasado como refresh token', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { generateAccessToken, verifyRefreshToken } = require('../token.service');
     const accessToken = generateAccessToken({ userId: 'u1', role: 'cliente' });
 
@@ -32,6 +39,7 @@ describe('token.service', () => {
   // (auditoría, hallazgo #2/#8), pero en el otro punto de entrada que
   // verifica JWTs: el endpoint público POST /auth/refresh.
   it('rechaza un refresh token firmado con un algoritmo distinto de HS256', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { verifyRefreshToken } = require('../token.service');
     const tokenSinFirma = jwt.sign({ userId: 'u1', role: 'admin', type: 'refresh' }, '', { algorithm: 'none' });
 

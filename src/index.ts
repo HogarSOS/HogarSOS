@@ -46,6 +46,7 @@ process.on('uncaughtException', (err) => {
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const esProduccion = process.env.NODE_ENV === 'production';
 
 // Detrás del proxy de Render, sin esto Express ve todas las peticiones
 // como si vinieran de la IP interna del proxy en vez de la IP real del
@@ -61,10 +62,22 @@ app.use(
   })
 );
 
-// CORS
+// CORS — la app móvil (Dio) no está sujeta a CORS en absoluto: es un
+// navegador quien lo aplica, no un cliente HTTP nativo. Lo único que
+// esto protege es que una página web de OTRO dominio pueda leer
+// respuestas de esta API con las credenciales del usuario. Las únicas
+// páginas propias que sirve este mismo backend (legal, reset-password,
+// retorno de Stripe) son same-origin y no necesitan CORS.
+//
+// En producción se restringe a los dominios reales (auditoría de
+// cierre, 2026-08-13); fuera de producción se mantiene abierto para no
+// bloquear pruebas locales con orígenes variables (emulador, distintos
+// puertos, etc.).
+const ORIGENES_PERMITIDOS_PRODUCCION = ['https://hogarsos.es', 'https://www.hogarsos.es'];
+
 app.use(
   cors({
-    origin: true,
+    origin: esProduccion ? ORIGENES_PERMITIDOS_PRODUCCION : true,
     credentials: true,
   })
 );
@@ -196,6 +209,18 @@ app.use((_req, res) => {
 // (Dio) lee específicamente el campo `error`. Ahora se devuelven
 // ambos para que ningún error caído aquí se muestre como "undefined"
 // en la app.
+//
+// Este manejador es el último recurso: todos los errores de negocio
+// esperados (solicitud no encontrada, estado inválido...) ya se
+// capturan y responden dentro de cada controlador con su propio
+// {status, error, code} — ver p.ej. admin.controller.ts o
+// serviceRequest.controller.ts. Solo llega aquí una excepción
+// verdaderamente inesperada (un error crudo de Prisma, de Stripe, un
+// bug). Por eso en producción NO se reenvía `err.message` tal cual: ese
+// texto puede contener detalles internos (una query, una URL de
+// conexión, un stack de una librería) que no deberían salir del
+// servidor. Se sigue registrando completo en el log (auditoría de
+// cierre, 2026-08-13).
 app.use(
   (
     err: any,
@@ -205,7 +230,9 @@ app.use(
   ) => {
     console.error(`[${new Date().toISOString()}] Error en ${req.method} ${req.path}:`, err);
 
-    const mensaje = err?.message || 'Error interno del servidor';
+    const mensaje = esProduccion
+      ? 'Error interno del servidor'
+      : err?.message || 'Error interno del servidor';
 
     res.status(err.status || 500).json({
       success: false,
