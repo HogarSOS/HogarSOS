@@ -8,6 +8,11 @@ uploads/*
 !uploads/.gitkeep
 *.log
 .DS_Store
+.firebase/
+
+# Build de pruebas de Android servido en hogarsos.web.app — se
+# reemplaza en cada compilación nueva, no tiene sentido versionarlo.
+hosting/*.apk
 
 # Copia anidada accidental (duplicado idéntico de este mismo proyecto,
 # incluido su propio .env) — nunca debe entrar al repo.
