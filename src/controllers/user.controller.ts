@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
 import { firebaseAuth } from '../config/firebase';
+import { stripe } from '../config/stripe';
 import { marcarArchivosDeUsuarioParaBorrado } from '../services/archivo.service';
 
 function serializarUsuario(usuario: {
@@ -105,6 +106,27 @@ export async function deleteMe(req: Request, res: Response) {
       // el objetivo es que la cuenta quede eliminada, no que falle
       // aquí por un estado que ya estaba a medias.
       console.error(`[user.deleteMe] No se pudo borrar el usuario de Firebase (${usuario.firebaseUid}) para ${userId}:`, e);
+    }
+  }
+
+  // Auditoría de cierre (2026-08-13): el Customer de Stripe
+  // (obtenerOCrearStripeCustomerId, payment.service.ts) se crea con
+  // nombre/email/teléfono reales y nunca se tocaba desde aquí — una
+  // cuenta "eliminada" seguía con su PII completa visible en el
+  // dashboard de Stripe indefinidamente. No se borra el Customer
+  // (customers.del): igual que con la fila de User, hace falta que
+  // siga existiendo para la integridad de los pagos ya hechos
+  // (PaymentIntents/Charges lo referencian). Se anonimiza igual que
+  // Postgres, no se inventa una política nueva.
+  if (usuario.stripeCustomerId) {
+    try {
+      await stripe.customers.update(usuario.stripeCustomerId, {
+        name: 'Usuario eliminado',
+        email: '',
+        phone: '',
+      });
+    } catch (e) {
+      console.error(`[user.deleteMe] No se pudo anonimizar el Customer de Stripe (${usuario.stripeCustomerId}) para ${userId}:`, e);
     }
   }
 
