@@ -14,6 +14,7 @@ export type NotificationKey =
   | 'ampliacion_rechazada'
   | 'nueva_solicitud'
   | 'solicitud_cancelada'
+  | 'trabajo_en_curso'
   | 'cierre_horas_pendiente'
   | 'solicitud_completada'
   | 'cierre_horas_rechazado'
@@ -184,6 +185,14 @@ const MENSAJES: Record<NotificationKey, Record<Idioma, Constructor>> = {
   solicitud_cancelada: {
     es: () => ({ title: 'Solicitud cancelada', body: 'El cliente ha cancelado un trabajo que tenías asignado' }),
     en: () => ({ title: 'Request cancelled', body: 'The client has cancelled a job that was assigned to you' }),
+  },
+  // "En curso" (no "en progreso") a propósito — mismo término que ya usan
+  // los Términos de servicio (legalTerminosSec4Texto) para describir este
+  // mismo momento: una vez el profesional lo marca, la cancelación
+  // automática deja de estar disponible para el cliente.
+  trabajo_en_curso: {
+    es: () => ({ title: 'Trabajo en curso', body: 'El profesional ha empezado a trabajar en tu solicitud' }),
+    en: () => ({ title: 'Job in progress', body: 'The professional has started working on your request' }),
   },
   cierre_horas_pendiente: {
     es: () => ({ title: 'El profesional ha terminado el trabajo', body: 'Confirma las horas trabajadas para liberar el pago' }),

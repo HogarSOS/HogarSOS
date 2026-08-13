@@ -8,6 +8,8 @@ import {
   completeServiceRequest,
   responderCierreHoras,
   cancelServiceRequest,
+  startServiceRequest,
+  undoStartServiceRequest,
   deleteServiceRequest,
   archiveServiceRequest,
   listMyServiceRequests,
@@ -32,6 +34,8 @@ router.get('/:id', authMiddleware(), asyncHandler(getServiceRequestById));
 router.get('/nearby/list', authMiddleware(['profesional']), asyncHandler(listNearbyRequests));
 router.get('/assigned/mine', authMiddleware(['profesional']), asyncHandler(listMyAssignedRequests));
 router.patch('/:id/complete', authMiddleware(['profesional']), asyncHandler(completeServiceRequest));
+router.patch('/:id/start', authMiddleware(['profesional']), asyncHandler(startServiceRequest));
+router.patch('/:id/undo-start', authMiddleware(['profesional']), asyncHandler(undoStartServiceRequest));
 router.post('/:id/cierre-horas/:cierreId/responder', authMiddleware(['cliente']), asyncHandler(responderCierreHoras));
 router.patch('/:id/cancel', authMiddleware(['cliente']), asyncHandler(cancelServiceRequest));
 router.delete('/:id', authMiddleware(['cliente']), asyncHandler(deleteServiceRequest));

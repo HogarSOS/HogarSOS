@@ -132,7 +132,13 @@ describe('cancelServiceRequest', () => {
     );
   });
 
-  it('devuelve 409 si ya no se puede cancelar (en curso, completada o ya cancelada)', async () => {
+  /**
+   * "en_progreso" tiene su propio código de error (distinto del genérico
+   * de más abajo) porque aquí sí hay una vía real para el cliente — abrir
+   * una reclamación — que completada/cancelada no tienen. Si alguien
+   * fusiona esta rama con la genérica, este test lo detecta.
+   */
+  it('devuelve 409 con código específico si el trabajo ya está "en curso" (debe usar disputa)', async () => {
     mockPrisma.serviceRequest.findUnique.mockResolvedValue({
       id: 'sr-1',
       clienteId: 'cliente-1',
@@ -145,6 +151,54 @@ describe('cancelServiceRequest', () => {
     await cancelServiceRequest(fakeReq({ id: 'sr-1' }, 'cliente-1'), res);
 
     expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'REQUEST_IN_PROGRESS_USE_DISPUTE' })
+    );
+    expect(mockRefundPayment).not.toHaveBeenCalled();
+  });
+
+  it('devuelve 409 genérico si ya está completada o cancelada (sin vía de disputa)', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'completada',
+    });
+    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 0 });
+
+    const res = fakeRes();
+    await cancelServiceRequest(fakeReq({ id: 'sr-1' }, 'cliente-1'), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'REQUEST_CANNOT_CANCEL' }));
+    expect(mockRefundPayment).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Reproduce la carrera real: la primera lectura (antes del UPDATE
+   * atómico) todavía ve "aceptada" — el profesional pulsó "Iniciar
+   * trabajo" justo después — así que el UPDATE de cancelar falla
+   * (count: 0) por el motivo correcto, pero una foto vieja diría
+   * "aceptada", no "en_progreso". Si el código volviera a fiarse de esa
+   * foto vieja en vez de releer, este test detecta el mensaje
+   * incorrecto (REQUEST_CANNOT_CANCEL en vez de
+   * REQUEST_IN_PROGRESS_USE_DISPUTE) aunque la cancelación en sí ya se
+   * bloqueó bien en los dos casos.
+   */
+  it('da el mensaje correcto aunque el estado haya cambiado a en_progreso justo entre la primera lectura y el UPDATE fallido', async () => {
+    mockPrisma.serviceRequest.findUnique
+      .mockResolvedValueOnce({ id: 'sr-1', clienteId: 'cliente-1', profesionalId: 'pro-1', estado: 'aceptada' })
+      .mockResolvedValueOnce({ estado: 'en_progreso' });
+    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 0 });
+
+    const res = fakeRes();
+    await cancelServiceRequest(fakeReq({ id: 'sr-1' }, 'cliente-1'), res);
+
+    expect(mockPrisma.serviceRequest.findUnique).toHaveBeenCalledTimes(2);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'REQUEST_IN_PROGRESS_USE_DISPUTE' })
+    );
     expect(mockRefundPayment).not.toHaveBeenCalled();
   });
 

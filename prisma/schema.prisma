@@ -131,6 +131,12 @@ model ServiceRequest {
   estado         EstadoSolicitud          @default(pendiente)
   createdAt      DateTime                 @default(now()) @map("created_at")
   aceptadaAt     DateTime?                @map("aceptada_at")
+  // Cuándo el profesional pulsó "Iniciar trabajo" (aceptada -> en_progreso).
+  // Null si nunca se activó, o si se deshizo con "Deshacer inicio" — el
+  // hecho de que sea reversible es justo lo que impide que este campo por
+  // sí solo sirva como prueba legal, pero ayuda al admin a ver cuándo
+  // ocurrió en una disputa.
+  iniciadoAt     DateTime?                @map("iniciado_at")
   completadaAt   DateTime?                @map("completada_at")
   // Ocultar de la lista de cada parte sin borrar nada (pagos/chat/
   // reviews se conservan) — independientes porque cliente y profesional

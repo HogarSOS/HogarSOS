@@ -435,7 +435,20 @@ export async function cancelServiceRequest(req: Request, res: Response) {
       where: { id, clienteId, estado: { in: ['pendiente', 'aceptada'] } },
       data: { estado: 'cancelada' },
     });
-    if (count === 0) throw new Error('YA_NO_CANCELABLE');
+    if (count === 0) {
+      // Auditoría: `actual.estado` es una foto de ANTES del UPDATE
+      // atómico de arriba — si el profesional pulsó "Iniciar trabajo"
+      // justo en medio (aceptada -> en_progreso), esa foto sigue
+      // diciendo "aceptada" aunque el UPDATE ya haya fallado por el
+      // motivo correcto. Usarla aquí daría el mensaje genérico en vez
+      // de "abre una reclamación", aunque la propia cancelación ya se
+      // bloqueó bien. Una relectura de solo lectura (nunca un segundo
+      // WRITE, nunca toca Stripe, no compite con nada) es suficiente
+      // para acertar el mensaje sin tocar la atomicidad de la decisión
+      // real, que ya tomó el UPDATE de arriba.
+      const actualizado = await prisma.serviceRequest.findUnique({ where: { id }, select: { estado: true } });
+      throw new Error(actualizado?.estado === 'en_progreso' ? 'EN_CURSO_USAR_DISPUTA' : 'YA_NO_CANCELABLE');
+    }
 
     // En su propio try/catch, igual que la sincronización de Firestore
     // al aceptar: cancelar ya quedó confirmado en Postgres arriba, un
@@ -467,8 +480,95 @@ export async function cancelServiceRequest(req: Request, res: Response) {
     if (err instanceof Error && err.message === 'YA_NO_CANCELABLE') {
       return res.status(409).json({ error: 'Esta solicitud ya no se puede cancelar — el profesional ya empezó o ya se resolvió', code: 'REQUEST_CANNOT_CANCEL' });
     }
+    if (err instanceof Error && err.message === 'EN_CURSO_USAR_DISPUTA') {
+      return res.status(409).json({
+        error: 'El profesional ya ha marcado este trabajo como en curso — para cancelarlo ahora, abre una reclamación',
+        code: 'REQUEST_IN_PROGRESS_USE_DISPUTE',
+      });
+    }
     throw err;
   }
+}
+
+/**
+ * El profesional marca que ha empezado a trabajar de verdad —
+ * "aceptada" -> "en_progreso". Protege su cobro: a partir de aquí
+ * `cancelServiceRequest` deja de aceptar la cancelación instantánea del
+ * cliente (ver EN_CURSO_USAR_DISPUTA arriba), que solo puede recurrir a
+ * una reclamación (createDispute) si de verdad necesita echarse atrás.
+ *
+ * Deliberadamente NO obligatorio para poder completar el trabajo:
+ * `completeServiceRequest` ya acepta tanto "aceptada" como
+ * "en_progreso" — este botón es una protección opcional que el
+ * profesional puede usar o no, no una puerta que haya que cruzar sí o
+ * sí. Mismo patrón atómico que el resto del archivo: el `updateMany`
+ * condicionado al estado actual es la única sección crítica.
+ */
+export async function startServiceRequest(req: Request, res: Response) {
+  const { id } = req.params;
+  const profesionalId = req.user!.userId;
+
+  const actual = await prisma.serviceRequest.findUnique({ where: { id } });
+  if (!actual) {
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
+  }
+  if (actual.profesionalId !== profesionalId) {
+    return res.status(403).json({ error: 'No eres el profesional asignado a esta solicitud', code: 'NOT_ASSIGNED_PROFESSIONAL' });
+  }
+
+  const { count } = await prisma.serviceRequest.updateMany({
+    where: { id, profesionalId, estado: 'aceptada' },
+    data: { estado: 'en_progreso', iniciadoAt: new Date() },
+  });
+  if (count === 0) {
+    return res.status(409).json({
+      error: 'Esta solicitud no está en un estado válido para iniciar el trabajo',
+      code: 'REQUEST_INVALID_STATE_START',
+    });
+  }
+
+  enviarNotificacion(actual.clienteId, 'trabajo_en_curso', {}, { solicitudId: id }).catch((e) =>
+    console.error(`[startServiceRequest] Error al notificar al cliente de ${id}:`, e)
+  );
+
+  return res.json({ id, estado: 'en_progreso' });
+}
+
+/**
+ * Deshace un "Iniciar trabajo" pulsado por error — "en_progreso" ->
+ * "aceptada" de nuevo. A propósito NO toca Stripe ni genera ningún
+ * reembolso: la retención de la autorización es la misma en "aceptada"
+ * que en "en_progreso" (ver createEscrowPaymentIntent), este endpoint
+ * solo revierte la protección frente a la cancelación del cliente, no
+ * el dinero. Solo el propio profesional puede deshacer su propio inicio
+ * — nunca perjudica al cliente (solo le devuelve la cancelación
+ * instantánea), así que no hace falta ninguna ventana de tiempo ni
+ * revisión aparte.
+ */
+export async function undoStartServiceRequest(req: Request, res: Response) {
+  const { id } = req.params;
+  const profesionalId = req.user!.userId;
+
+  const actual = await prisma.serviceRequest.findUnique({ where: { id } });
+  if (!actual) {
+    return res.status(404).json({ error: 'Solicitud no encontrada', code: 'REQUEST_NOT_FOUND' });
+  }
+  if (actual.profesionalId !== profesionalId) {
+    return res.status(403).json({ error: 'No eres el profesional asignado a esta solicitud', code: 'NOT_ASSIGNED_PROFESSIONAL' });
+  }
+
+  const { count } = await prisma.serviceRequest.updateMany({
+    where: { id, profesionalId, estado: 'en_progreso' },
+    data: { estado: 'aceptada', iniciadoAt: null },
+  });
+  if (count === 0) {
+    return res.status(409).json({
+      error: 'Esta solicitud no está "en curso", no hay nada que deshacer',
+      code: 'REQUEST_NOT_IN_PROGRESS',
+    });
+  }
+
+  return res.json({ id, estado: 'aceptada' });
 }
 
 /**
