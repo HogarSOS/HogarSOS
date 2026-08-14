@@ -11,6 +11,12 @@ jest.mock('../../config/prisma', () => ({
     serviceRequest: { findUnique: jest.fn() },
     professional: { findUnique: jest.fn(), update: jest.fn() },
     user: { findUniqueOrThrow: jest.fn(), update: jest.fn() },
+    // P2 (auditoría 2026-08-14, revisión de concurrencia crítica):
+    // reclamarFilas usa UPDATE...RETURNING (no updateMany, que solo
+    // devuelve count) para conocer EXACTAMENTE qué filas reclamó esta
+    // ejecución — necesario para procesar solo esas filas, nunca un
+    // superconjunto derivado de re-filtrar por estado.
+    $queryRaw: jest.fn(),
   },
 }));
 
@@ -344,11 +350,20 @@ describe('releasePayments', () => {
     // tests de la incidencia real (cliente nunca confirmó el Payment
     // Sheet) lo sobreescriben explícitamente.
     mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_capture' });
-    // El lease de liberación se toma con un updateMany condicional: por
-    // defecto se concede (count > 0). Los tests de concurrencia lo
-    // sobreescriben a 0 para simular "otra ejecución está dentro".
+    // P2 (auditoría 2026-08-14, revisión de concurrencia crítica): el
+    // lease ahora se reclama con UPDATE...RETURNING ($queryRaw), no
+    // updateMany — por defecto se reclama exactamente 'pago-1' (el id
+    // que usa pagoRetenido() por defecto) con el fencing token ya
+    // incrementado. payment.count representa el TOTAL de filas
+    // relevantes para la comprobación "todo o nada": por defecto
+    // coincide con lo reclamado (1), así que reclamarTodoOAbortar no
+    // aborta. Los tests de concurrencia sobreescriben ambos para
+    // simular reclamos parciales o nulos.
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 2 }]);
+    mockPrisma.payment.count.mockResolvedValue(1);
+    // updateMany se sigue usando para liberar el lease (condicionado al
+    // fencing token) y para el resto de escrituras incidentales.
     mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
-    mockPrisma.payment.count.mockResolvedValue(0);
   });
 
   // Por defecto representa una autorización con base=100 (cliente 105,
@@ -542,8 +557,11 @@ describe('releasePayments', () => {
     expect(mockStripe.paymentIntents.cancel).toHaveBeenCalledWith('pi_ampliacion', undefined, {
       idempotencyKey: 'cnl_pago-2',
     });
-    expect(mockPrisma.payment.update).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: 'pago-2' }, data: expect.objectContaining({ estado: 'reembolsado' }) })
+    expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ id: 'pago-2' }),
+        data: expect.objectContaining({ estado: 'reembolsado' }),
+      })
     );
   });
 
@@ -726,7 +744,12 @@ describe('releasePayments — recuperación e idempotencia', () => {
       stripePayoutsEnabled: true,
     });
     mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
-    mockPrisma.payment.count.mockResolvedValue(0);
+    // P2 (auditoría 2026-08-14, revisión de concurrencia crítica): claim
+    // exacto por UPDATE...RETURNING — por defecto reclama 'pago-1' (el
+    // id de `base`), coincidiendo con `payment.count` para que
+    // reclamarTodoOAbortar no aborte por reclamo parcial.
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 2 }]);
+    mockPrisma.payment.count.mockResolvedValue(1);
     mockPrisma.payment.update.mockImplementation(({ data }: any) => Promise.resolve({ ...data }));
     mockStripe.transfers.create.mockResolvedValue({ id: 'tr_nuevo' });
     mockStripe.transfers.list.mockResolvedValue({ data: [] });
@@ -763,16 +786,20 @@ describe('releasePayments — recuperación e idempotencia', () => {
 
     // El plan (75% de la autorización) se persiste antes de capturar: si
     // el proceso muere en la captura, el reintento sabe con qué importes
-    // se hizo, en vez de tener que adivinarlos.
-    const escrituraDelPlan = mockPrisma.payment.update.mock.calls.find(
+    // se hizo, en vez de tener que adivinarlos. Ahora es un updateMany
+    // fenced (condicionado a intentosLiberacion), no un update simple.
+    const escrituraDelPlan = mockPrisma.payment.updateMany.mock.calls.find(
       ([arg]: any) => arg.data.capturadoBase !== undefined
     );
-    expect(escrituraDelPlan[0].data).toEqual({
-      capturadoBase: 75,
-      capturadoTotal: 78.75,
-      capturadoProfesional: 71.25,
+    expect(escrituraDelPlan[0]).toEqual({
+      where: { id: 'pago-1', intentosLiberacion: 1 },
+      data: {
+        capturadoBase: 75,
+        capturadoTotal: 78.75,
+        capturadoProfesional: 71.25,
+      },
     });
-    const ordenPlan = mockPrisma.payment.update.mock.invocationCallOrder[0];
+    const ordenPlan = mockPrisma.payment.updateMany.mock.invocationCallOrder[0];
     const ordenCaptura = mockStripe.paymentIntents.capture.mock.invocationCallOrder[0];
     expect(ordenPlan).toBeLessThan(ordenCaptura);
   });
@@ -876,7 +903,7 @@ describe('releasePayments — recuperación e idempotencia', () => {
     expect(mockStripe.transfers.list).toHaveBeenCalledWith({ transfer_group: 'pago-1', limit: 1 });
     expect(mockStripe.transfers.create).not.toHaveBeenCalled();
     // Se adopta la transferencia previa en lugar de crear una nueva.
-    const escrituraFinal = mockPrisma.payment.update.mock.calls.find(
+    const escrituraFinal = mockPrisma.payment.updateMany.mock.calls.find(
       ([arg]: any) => arg.data.estado === 'liberado'
     );
     expect(escrituraFinal[0].data.stripeTransferId).toBe('tr_ya_existente');
@@ -923,9 +950,10 @@ describe('releasePayments — recuperación e idempotencia', () => {
   });
 
   it('rechaza una ejecución concurrente con LIBERACION_YA_EN_CURSO en vez de duplicar movimientos', async () => {
-    // El updateMany condicional del lease no afectó a ninguna fila: otra
-    // ejecución lo tiene tomado ahora mismo.
-    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+    // El UPDATE...RETURNING no devuelve ninguna fila: otra ejecución las
+    // tiene tomadas ahora mismo. payment.count SÍ ve la fila (existe y
+    // es relevante), solo que no se pudo reclamar.
+    mockPrisma.$queryRaw.mockResolvedValue([]);
     mockPrisma.payment.count.mockResolvedValue(1);
 
     await expect(releasePayments('sr-1', 100)).rejects.toThrow('LIBERACION_YA_EN_CURSO');
@@ -934,7 +962,7 @@ describe('releasePayments — recuperación e idempotencia', () => {
   });
 
   it('distingue "no hay nada que liberar" de "hay otra ejecución dentro"', async () => {
-    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+    mockPrisma.$queryRaw.mockResolvedValue([]);
     mockPrisma.payment.count.mockResolvedValue(0);
 
     await expect(releasePayments('sr-1', 100)).rejects.toThrow('PAGO_NO_ENCONTRADO');
@@ -947,17 +975,27 @@ describe('releasePayments — recuperación e idempotencia', () => {
 
     await expect(releasePayments('sr-1', 100)).rejects.toThrow('Stripe timeout');
 
+    // P2 (auditoría 2026-08-14, revisión de concurrencia crítica): tanto
+    // el registro del error como la liberación del lease ahora van
+    // condicionados al fencing token (id + intentosLiberacion exacto)
+    // capturado en el claim — no un updateMany "a ciegas" por estado.
     const registroDelError = mockPrisma.payment.updateMany.mock.calls.find(
       ([arg]: any) => arg.data.ultimoErrorLiberacion !== undefined
     );
-    expect(registroDelError[0].data.ultimoErrorLiberacion).toBe('Stripe timeout');
+    expect(registroDelError[0]).toEqual({
+      where: { id: 'pago-1', intentosLiberacion: 2 },
+      data: { ultimoErrorLiberacion: 'Stripe timeout' },
+    });
 
     // El lease se suelta pase lo que pase (finally): si no, el pago
     // quedaría bloqueado 5 minutos tras cada fallo.
     const sueltaDelLease = mockPrisma.payment.updateMany.mock.calls.find(
       ([arg]: any) => arg.data.liberacionEnCursoAt === null
     );
-    expect(sueltaDelLease).toBeDefined();
+    expect(sueltaDelLease[0]).toEqual({
+      where: { id: 'pago-1', intentosLiberacion: 2 },
+      data: { liberacionEnCursoAt: null },
+    });
   });
 
   it('mezcla correctamente una fila ya capturada con otra todavía retenida, sin recontar la base', async () => {
@@ -985,6 +1023,12 @@ describe('releasePayments — recuperación e idempotencia', () => {
         intentosLiberacion: 2,
       },
     ]);
+    // Dos filas relevantes, las dos reclamadas — todo o nada coincide.
+    mockPrisma.$queryRaw.mockResolvedValue([
+      { id: 'pago-1', intentosLiberacion: 3 },
+      { id: 'pago-2', intentosLiberacion: 3 },
+    ]);
+    mockPrisma.payment.count.mockResolvedValue(2);
     mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_capture' });
     mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_ampliacion', latest_charge: 'ch_2' });
 
@@ -1006,6 +1050,12 @@ describe('refundPayment — filas ya capturadas', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockPrisma.payment.update.mockResolvedValue({ estado: 'reembolsado' });
+    // Lease compartido con releasePayments (ver reclamarTodoOAbortar):
+    // concedido por defecto para no bloquear estos tests, que no prueban
+    // concurrencia — reclama exactamente 'pago-1', el id que usan.
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+    mockPrisma.payment.count.mockResolvedValue(1);
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
   });
 
   /**
@@ -1088,8 +1138,13 @@ describe('listarPagosAtascados', () => {
 describe('reintentarLiberacion', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+    // Sin nada que reclamar: reclamarTodoOAbortar lanza PAGO_NO_ENCONTRADO
+    // antes de llegar a ejecutarLiberacion — lo que estos tests
+    // comprueban es de dónde saca la base (precioFinal vs recomposición),
+    // no el resultado de la liberación en sí.
+    mockPrisma.$queryRaw.mockResolvedValue([]);
     mockPrisma.payment.count.mockResolvedValue(0);
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
   });
 
   it('usa el precioFinal ya fijado al completar el trabajo', async () => {
@@ -1127,15 +1182,29 @@ describe('reintentarLiberacion', () => {
 describe('refundPayment', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // P2 (auditoría 2026-08-14, revisión de concurrencia crítica): el
+    // lease compartido con releasePayments ahora se reclama con
+    // UPDATE...RETURNING ($queryRaw), no updateMany. Por defecto se
+    // reclama exactamente 'pago-1' (el id que usan la mayoría de estos
+    // tests), coincidiendo con payment.count para que
+    // reclamarTodoOAbortar no aborte. Los tests con más de una fila o
+    // con la carrera explícita sobreescriben ambos mocks.
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+    mockPrisma.payment.count.mockResolvedValue(1);
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it('cancela TODAS las autorizaciones retenidas (inicial + ampliaciones) y las marca como reembolsadas', async () => {
     mockPrisma.payment.findMany.mockResolvedValue([
-      { id: 'pago-1', stripePaymentIntentId: 'pi_1' },
-      { id: 'pago-2', stripePaymentIntentId: 'pi_2' },
+      { id: 'pago-1', stripePaymentIntentId: 'pi_1', intentosLiberacion: 1 },
+      { id: 'pago-2', stripePaymentIntentId: 'pi_2', intentosLiberacion: 1 },
     ]);
-    mockStripe.paymentIntents.cancel.mockResolvedValue({ status: 'canceled' });
-    mockPrisma.payment.update.mockResolvedValue({ estado: 'reembolsado' });
+    mockPrisma.$queryRaw.mockResolvedValue([
+      { id: 'pago-1', intentosLiberacion: 1 },
+      { id: 'pago-2', intentosLiberacion: 1 },
+    ]);
+    mockPrisma.payment.count.mockResolvedValue(2);
+    mockStripe.paymentIntents.cancel.mockResolvedValue({ id: 'pi_cancel', status: 'canceled' });
 
     await refundPayment('sr-1');
 
@@ -1145,12 +1214,12 @@ describe('refundPayment', () => {
     expect(mockStripe.paymentIntents.cancel).toHaveBeenCalledWith('pi_2', undefined, {
       idempotencyKey: 'cnl_pago-2',
     });
-    expect(mockPrisma.payment.update).toHaveBeenCalledWith({
-      where: { id: 'pago-1' },
+    expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: 'pago-1', intentosLiberacion: 1 },
       data: { estado: 'reembolsado', liberacionEnCursoAt: null },
     });
-    expect(mockPrisma.payment.update).toHaveBeenCalledWith({
-      where: { id: 'pago-2' },
+    expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: 'pago-2', intentosLiberacion: 1 },
       data: { estado: 'reembolsado', liberacionEnCursoAt: null },
     });
   });
@@ -1158,14 +1227,17 @@ describe('refundPayment', () => {
   it('lanza PAGO_NO_ENCONTRADO si la solicitud nunca llegó a tener un pago autorizado', async () => {
     // Caso real: cancelServiceRequest permite cancelar una solicitud
     // "pendiente" (nunca hubo pago) además de "aceptada" — el llamador
-    // debe poder distinguir este caso de un fallo real de Stripe.
-    mockPrisma.payment.findMany.mockResolvedValue([]);
+    // debe poder distinguir este caso de un fallo real de Stripe. Nada
+    // que reclamar: reclamarTodoOAbortar lanza aquí, sin llegar siquiera
+    // al findMany de ejecutarReembolso.
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    mockPrisma.payment.count.mockResolvedValue(0);
     await expect(refundPayment('sr-sin-pago')).rejects.toThrow('PAGO_NO_ENCONTRADO');
   });
 
   it('reembolsa (sin reverse_transfer) un pago "capturado" que nunca llegó a transferirse', async () => {
     mockPrisma.payment.findMany.mockResolvedValue([
-      { id: 'pago-1', estado: 'capturado', stripePaymentIntentId: 'pi_1' },
+      { id: 'pago-1', estado: 'capturado', stripePaymentIntentId: 'pi_1', intentosLiberacion: 1 },
     ]);
     mockStripe.refunds.create.mockResolvedValue({ id: 're_1' });
 
@@ -1182,7 +1254,7 @@ describe('refundPayment', () => {
   // sobre un trabajo ya completado no tenía forma de resolverse.
   it('reembolsa CON reverse_transfer un pago ya "liberado" al profesional (disputa tras completar)', async () => {
     mockPrisma.payment.findMany.mockResolvedValue([
-      { id: 'pago-1', estado: 'liberado', stripePaymentIntentId: 'pi_1' },
+      { id: 'pago-1', estado: 'liberado', stripePaymentIntentId: 'pi_1', intentosLiberacion: 1 },
     ]);
     mockStripe.refunds.create.mockResolvedValue({ id: 're_1' });
 
@@ -1196,9 +1268,410 @@ describe('refundPayment', () => {
       },
       { idempotencyKey: 'ref_pago-1' }
     );
-    expect(mockPrisma.payment.update).toHaveBeenCalledWith({
-      where: { id: 'pago-1' },
+    expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: 'pago-1', intentosLiberacion: 1 },
       data: { estado: 'reembolsado', liberacionEnCursoAt: null },
+    });
+  });
+
+  /**
+   * P2 (auditoría 2026-08-14): refundPayment ahora comparte el lease de
+   * releasePayments (Payment.liberacionEnCursoAt) en vez de ignorarlo.
+   * Estos tests comprueban el ORDEN (lease antes que Stripe), que el
+   * perdedor de una carrera nunca llega a Stripe, y que el lease se
+   * suelta siempre — no solo los estados finales.
+   */
+  describe('coordinación con el lease compartido (releasePayments)', () => {
+    it('adquiere el lease (UPDATE...RETURNING) ANTES de llamar a Stripe', async () => {
+      const orden: string[] = [];
+      mockPrisma.$queryRaw.mockImplementation(async () => {
+        orden.push('lease');
+        return [{ id: 'pago-1', intentosLiberacion: 1 }];
+      });
+      mockPrisma.payment.count.mockResolvedValue(1);
+      mockPrisma.payment.findMany.mockResolvedValue([
+        { id: 'pago-1', estado: 'retenido', stripePaymentIntentId: 'pi_1' },
+      ]);
+      mockStripe.paymentIntents.cancel.mockImplementation(async () => {
+        orden.push('stripe');
+        return { status: 'canceled' };
+      });
+
+      await refundPayment('sr-1');
+
+      expect(orden).toEqual(['lease', 'stripe']);
+    });
+
+    it('si NO consigue el lease (otra operación en curso), NO llama a Stripe en absoluto', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([]);
+      mockPrisma.payment.count.mockResolvedValue(1); // sí hay filas reembolsables, solo que están tomadas
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+
+      expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+      expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+      expect(mockPrisma.payment.findMany).not.toHaveBeenCalled();
+    });
+
+    it('sin lease Y sin nada reembolsable, distingue PAGO_NO_ENCONTRADO de LIBERACION_YA_EN_CURSO', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([]);
+      mockPrisma.payment.count.mockResolvedValue(0);
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('PAGO_NO_ENCONTRADO');
+      expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+    });
+
+    it('release y refund simultáneos: el que pierde el lease no toca Stripe (release gana)', async () => {
+      // Simula que releasePayments ya tomó el lease: el UPDATE...RETURNING
+      // de refundPayment no devuelve ninguna fila.
+      mockPrisma.$queryRaw.mockResolvedValue([]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+      expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+      expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+    });
+
+    it('suelta el lease en el finally incluso si Stripe falla a mitad del bucle', async () => {
+      mockPrisma.payment.findMany.mockResolvedValue([
+        { id: 'pago-1', estado: 'retenido', stripePaymentIntentId: 'pi_1' },
+      ]);
+      mockStripe.paymentIntents.cancel.mockRejectedValue(new Error('Stripe caído'));
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('Stripe caído');
+
+      // La liberación va condicionada al fencing token capturado en el claim.
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+        where: { id: 'pago-1', intentosLiberacion: 1 },
+        data: { liberacionEnCursoAt: null },
+      });
+    });
+
+    it('dos refund simultáneos sobre la misma fila: misma idempotencyKey en ambos, sin duplicar el reembolso en Stripe', async () => {
+      // El lease serializa las dos ejecuciones (una gana, la otra falla
+      // limpio) — pero incluso si llegaran a coincidir, la clave
+      // determinista ('ref_'+pago.id) ya protegía esto a nivel de Stripe
+      // antes de este cambio; se conserva sin modificar.
+      mockPrisma.payment.findMany.mockResolvedValue([
+        { id: 'pago-1', estado: 'capturado', stripePaymentIntentId: 'pi_1' },
+      ]);
+      mockStripe.refunds.create.mockResolvedValue({ id: 're_1' });
+
+      await refundPayment('sr-1');
+
+      expect(mockStripe.refunds.create).toHaveBeenCalledWith(
+        expect.anything(),
+        { idempotencyKey: 'ref_pago-1' }
+      );
+      expect(mockStripe.refunds.create).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * P2 (auditoría 2026-08-14, revisión de concurrencia crítica): casos
+   * A-E pedidos explícitamente. Demuestran, con filas mixtas reales, que
+   * refundPayment reclama EXACTAMENTE lo que su UPDATE...RETURNING
+   * consigue, que si eso es menos de lo que necesita (ESTADOS_REEMBOLSABLES
+   * = retenido+capturado+liberado) aborta ENTERO sin tocar Stripe sobre
+   * ninguna fila — ni siquiera la que sí llegó a reclamar — y suelta ese
+   * reclamo parcial antes de devolver el error. No se repite el camino
+   * feliz de `releasePayments` (ya cubierto en otros tests) — cada test
+   * aquí demuestra solo la propiedad de concurrencia.
+   */
+  describe('Casos A-E: qué reclama refundPayment cuando release ya tiene parte de las filas', () => {
+    beforeEach(() => {
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+    });
+
+    it('Caso A (A=retenido, B=retenido): mismo conjunto que release — si release ya las tiene, refund no reclama ninguna y aborta', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([]);
+      mockPrisma.payment.count.mockResolvedValue(2);
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+      expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+      expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+    });
+
+    it('Caso B (A=retenido, B=liberado): refund necesita [A,B]; si A ya la tiene release, refund solo reclama B — y aún así aborta entero sin tocarla', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'B', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(2);
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+
+      // Se suelta B (lo único reclamado) antes de abortar — el reclamo
+      // parcial no se queda colgado 5 minutos.
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+        where: { id: 'B', intentosLiberacion: 1 },
+        data: { liberacionEnCursoAt: null },
+      });
+      expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+      expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+      // Ni siquiera se llega a leer las filas completas para procesarlas.
+      expect(mockPrisma.payment.findMany).not.toHaveBeenCalled();
+    });
+
+    it('Caso C (A=capturado, B=liberado): mismo patrón que el Caso B — refund reclama solo B, necesita A+B, aborta sin tocar Stripe', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'B', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(2);
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+      expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+    });
+
+    it('Caso D (A=retenido, B=capturado): mismo conjunto para release y refund (ambos estados están en ESTADOS_LIBERABLES) — sin split-brain posible, igual que el Caso A', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([]);
+      mockPrisma.payment.count.mockResolvedValue(2);
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+    });
+
+    it('Caso E (3 filas: retenido/capturado/liberado): release solo necesita 2 de las 3; refund necesita las 3 — si release tiene esas 2, refund reclama solo la liberada y aborta sin tocarla', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'C', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(3);
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+        where: { id: 'C', intentosLiberacion: 1 },
+        data: { liberacionEnCursoAt: null },
+      });
+      expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * P2 (auditoría 2026-08-14, revisión adversarial final): heartbeat/
+   * renovación del lease antes de cada llamada mutante a Stripe (capture/
+   * transfer/cancel/refund), escrituras BD finales condicionadas al
+   * mismo fencing token, y detección explícita del resultado "huérfano"
+   * cuando Stripe confirma éxito pero el UPDATE fenced afecta 0 filas.
+   *
+   * Jest es síncrono: no se puede simular literalmente "5 minutos de
+   * pausa real" ni una llamada HTTP a Stripe genuinamente en vuelo. Lo
+   * que SÍ se prueba, en cada caso, es la propiedad observable que hace
+   * segura la carrera: si el heartbeat ya no encuentra el token, la
+   * llamada a Stripe correspondiente NUNCA se hace; si Stripe ya
+   * confirmó éxito pero la escritura fenced no encuentra el token, se
+   * registra explícitamente como huérfano y NUNCA se sobrescribe al
+   * nuevo propietario. El límite documentado: un fencing de BD no puede
+   * cancelar una llamada a Stripe ya en vuelo — solo reduce la ventana
+   * de "toda la duración de la operación" a "la duración de una sola
+   * llamada HTTP", y esto último (el huérfano) es la prueba de que ese
+   * límite sigue existiendo y de que se maneja explícitamente, no en
+   * silencio.
+   */
+  describe('Heartbeat, fencing y huérfanos de Stripe (revisión adversarial final)', () => {
+    const filaBase = (overrides: Partial<Record<string, unknown>> = {}) => ({
+      id: 'pago-1',
+      serviceRequestId: 'sr-1',
+      estado: 'retenido',
+      stripePaymentIntentId: 'pi_1',
+      montoBase: 100,
+      montoTotal: 105,
+      montoProfesional: 95,
+      intentosLiberacion: 1,
+      capturadoBase: null,
+      capturadoTotal: null,
+      capturadoProfesional: null,
+      stripeChargeId: null,
+      stripeTransferId: null,
+      ...overrides,
+    });
+
+    beforeEach(() => {
+      mockStripe.accounts.retrieve.mockResolvedValue({
+        details_submitted: true,
+        charges_enabled: true,
+        payouts_enabled: true,
+      });
+      mockPrisma.professional.update.mockResolvedValue({
+        stripeDetailsSubmitted: true,
+        stripeChargesEnabled: true,
+        stripePayoutsEnabled: true,
+      });
+      mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+        id: 'sr-1',
+        profesional: { userId: 'prof-1', stripeAccountId: 'acct_pro_1' },
+      });
+      mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_capture' });
+    });
+
+    // --- Stall A: después del claim, antes de tocar Stripe ---
+    it('Stall A — crash entre el claim y la primera llamada a Stripe: cero llamadas a Stripe, el lease se suelta igualmente', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+      // serviceRequest.findUnique corre antes que cualquier stripe.* en
+      // ejecutarLiberacion — fallar aquí simula un crash justo después
+      // de reclamar, antes de tocar Stripe.
+      mockPrisma.serviceRequest.findUnique.mockRejectedValue(new Error('conexión perdida'));
+
+      await expect(releasePayments('sr-1', 100)).rejects.toThrow('conexión perdida');
+
+      expect(mockStripe.paymentIntents.capture).not.toHaveBeenCalled();
+      expect(mockStripe.transfers.create).not.toHaveBeenCalled();
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+        where: { id: 'pago-1', intentosLiberacion: 1 },
+        data: { liberacionEnCursoAt: null },
+      });
+    });
+
+    // --- Caso central pedido explícitamente: release→refund, Stall C ---
+    it('Caso central (release→refund): A ya capturó (BD=capturado) y se detiene antes de transferir; TTL expira; B=refund recupera y reembolsa — el heartbeat de A antes de transferir falla, A NUNCA llama a transfers.create, B conserva ownership', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+      // La fila YA está capturada en BD (A completó ese paso antes de
+      // detenerse) — se planifica directo como 'transferir', sin volver
+      // a capturar ni a leer el estado de Stripe.
+      mockPrisma.payment.findMany.mockResolvedValue([
+        filaBase({
+          estado: 'capturado',
+          capturadoBase: 100,
+          capturadoTotal: 105,
+          capturadoProfesional: 95,
+          stripeChargeId: 'ch_1',
+        }),
+      ]);
+      // El heartbeat de A (justo antes de transfers.create) ya no
+      // encuentra su token — B (refund) lo reclamó de nuevo tras el TTL.
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(releasePayments('sr-1', 100)).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+
+      expect(mockStripe.transfers.create).not.toHaveBeenCalled();
+    });
+
+    // --- Stall B: Stripe capture() confirma éxito, pero B ya recuperó ---
+    it('Stall B (huérfano en captura): heartbeat OK, Stripe capture() confirma éxito, pero B ya recuperó antes de la escritura final — se registra como huérfano, sin sobrescribir a B', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+      mockPrisma.payment.findMany.mockResolvedValue([filaBase()]);
+      mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_1', latest_charge: 'ch_1' });
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      // FASE1b (write-ahead) y el heartbeat previo a capture() SÍ
+      // encuentran el token de A todavía vigente — pero la escritura
+      // FINAL, tras el capture() que Stripe YA confirmó, ya no lo
+      // encuentra: B reclamó justo en ese hueco.
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // FASE1b write-ahead
+        .mockResolvedValueOnce({ count: 1 }) // heartbeat antes de capture()
+        .mockResolvedValueOnce({ count: 0 }); // escritura final — huérfano
+
+      await expect(releasePayments('sr-1', 100)).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+
+      // Stripe SÍ se llamó y SÍ tuvo éxito — el dinero se movió de verdad.
+      expect(mockStripe.paymentIntents.capture).toHaveBeenCalledTimes(1);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('[STRIPE_HUERFANO]'));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('paymentId=pago-1'));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('operacion=capturarConIdempotencia'));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('stripeResultadoId=ch_1'));
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    // --- Stalls D/E: transfers.create() en vuelo / justo después ---
+    it('Stalls D/E (huérfano en transferencia): heartbeat OK antes de transfers.create(), Stripe confirma éxito, pero B ya recuperó — huérfano registrado, sin sobrescribir a B', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+      mockPrisma.payment.findMany.mockResolvedValue([
+        filaBase({
+          estado: 'capturado',
+          capturadoBase: 100,
+          capturadoTotal: 105,
+          capturadoProfesional: 95,
+          stripeChargeId: 'ch_1',
+        }),
+      ]);
+      mockStripe.transfers.create.mockResolvedValue({ id: 'tr_1' });
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // heartbeat antes de transfers.create()
+        .mockResolvedValueOnce({ count: 0 }); // escritura final — huérfano
+
+      await expect(releasePayments('sr-1', 100)).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+
+      // Stripe SÍ transfirió el dinero al profesional — de verdad.
+      expect(mockStripe.transfers.create).toHaveBeenCalledTimes(1);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('[STRIPE_HUERFANO]'));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('operacion=transferirConIdempotencia'));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('stripeResultadoId=tr_1'));
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    // --- Stalls F/G: refunds.create()/cancel() en vuelo / justo después ---
+    it('Stalls F/G (huérfano en reembolso): heartbeat OK antes de cancel(), Stripe confirma éxito, pero B (release) ya recuperó — huérfano registrado', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+      mockPrisma.payment.findMany.mockResolvedValue([filaBase()]);
+      mockStripe.paymentIntents.cancel.mockResolvedValue({ id: 'pi_1', status: 'canceled' });
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // heartbeat antes de cancel()
+        .mockResolvedValueOnce({ count: 0 }); // escritura final — huérfano
+
+      await expect(refundPayment('sr-1')).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+
+      expect(mockStripe.paymentIntents.cancel).toHaveBeenCalledTimes(1);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('[STRIPE_HUERFANO]'));
+      expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('operacion=ejecutarReembolso'));
+
+      consoleErrorSpy.mockRestore();
+    });
+
+    // --- refund → release: verificación de la protección ya existente ---
+    it('refund → release: A=refund cancela en Stripe pero se detiene antes de escribir BD; B=release relee el estado REAL en Stripe (ya canceled) y no intenta capturar', async () => {
+      // B es quien ejecuta releasePayments en este test: la fila sigue
+      // 'retenido' en BD (A no llegó a escribir 'reembolsado'), pero al
+      // releer el PaymentIntent real en Stripe, B ve 'canceled' — su
+      // propia comprobación YA existente (no una novedad de este cambio)
+      // corta antes de intentar capturar.
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 2 }]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+      mockPrisma.payment.findMany.mockResolvedValue([filaBase({ intentosLiberacion: 2 })]);
+      mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'canceled' });
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+
+      await expect(releasePayments('sr-1', 100)).rejects.toThrow('PAGO_NO_AUTORIZADO_TODAVIA');
+
+      expect(mockStripe.paymentIntents.capture).not.toHaveBeenCalled();
+    });
+
+    // --- Sección 9: operación legítima > TTL con heartbeats correctos ---
+    it('operación legítima que "tarda" conceptualmente más de 5 minutos pero sigue avanzando (heartbeat siempre con éxito) NUNCA pierde el lease', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+      mockPrisma.payment.findMany.mockResolvedValue([filaBase()]);
+      mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_1', latest_charge: 'ch_1' });
+      mockStripe.transfers.create.mockResolvedValue({ id: 'tr_1' });
+      // Cada heartbeat y cada escritura fenced encuentra siempre el
+      // MISMO token de A — conceptualmente "pasa el tiempo" pero A sigue
+      // siendo el dueño porque cada heartbeat renueva el lease antes de
+      // que el TTL llegue a importar. B nunca consigue nada mientras A
+      // sigue avanzando: no hace falta ni simularlo aparte.
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+
+      const resultados = await releasePayments('sr-1', 100);
+
+      expect(resultados).toHaveLength(1);
+      expect(mockStripe.paymentIntents.capture).toHaveBeenCalledTimes(1);
+      expect(mockStripe.transfers.create).toHaveBeenCalledTimes(1);
+    });
+
+    // --- refund vs refund: sin cambios de comportamiento por el heartbeat ---
+    it('dos refund simultáneos sobre la misma fila siguen protegidos por la idempotencyKey existente, incluso con el heartbeat de por medio', async () => {
+      mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+      mockPrisma.payment.count.mockResolvedValue(1);
+      mockPrisma.payment.findMany.mockResolvedValue([filaBase({ estado: 'capturado' })]);
+      mockStripe.refunds.create.mockResolvedValue({ id: 're_1' });
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+
+      await refundPayment('sr-1');
+
+      expect(mockStripe.refunds.create).toHaveBeenCalledTimes(1);
+      expect(mockStripe.refunds.create).toHaveBeenCalledWith(expect.anything(), { idempotencyKey: 'ref_pago-1' });
     });
   });
 });

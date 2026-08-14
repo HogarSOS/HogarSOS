@@ -6,6 +6,7 @@ import {
   releasePayments,
   listarPagosAtascados,
   reintentarLiberacion,
+  LEASE_LIBERACION_MS,
 } from '../services/payment.service';
 import { agregarPagos } from './serviceRequest.controller';
 import { TAREAS, ejecutarTareaAhora } from '../jobs';
@@ -302,6 +303,53 @@ export async function resolveDispute(req: Request, res: Response) {
 
   const { resolucion, notas } = parsed.data;
 
+  // P2 (auditoría 2026-08-14, revisión de concurrencia crítica): claim
+  // atómico ANTES de mover ningún euro. La comprobación de arriba es
+  // solo un atajo para el caso obvio — no reserva nada. Dos
+  // resolveDispute concurrentes (dos admins, o un doble clic) pueden
+  // pasarla ambos antes de que ninguno escriba. Este `updateMany`
+  // condicionado es la sección crítica real: solo uno ve `count > 0` y
+  // continúa; el otro recibe 409 SIN haber llamado a
+  // refundPayment/releasePayments ni a Stripe. 'en_resolucion' es un
+  // estado transitorio — Dispute.estado es String libre (no un enum de
+  // BD), no hace falta migración para el valor en sí.
+  //
+  // `miReclamadaAt` se genera UNA sola vez aquí y viaja sin recalcularse
+  // por el resto de la función — es el fencing token de ESTA ejecución
+  // concreta. El `OR` de abajo también permite recuperar una disputa
+  // cuyo claim anterior superó LEASE_LIBERACION_MS (mismo TTL que ya usa
+  // el lease de Payment — misma naturaleza de operación, no hay motivo
+  // para un número distinto): si el proceso que la reclamó murió o se
+  // quedó colgado a mitad de la resolución, otra petición puede
+  // recuperarla en vez de dejarla varada para siempre (la misma
+  // "disputa inmortal" que ya se corrigió una vez para el caso de fallo
+  // de Stripe con el proceso vivo).
+  //
+  // Toda escritura posterior de ESTA ejecución (revert, finalización)
+  // se condiciona a `reclamadaAt: miReclamadaAt` exacto — no solo a
+  // `estado: 'en_resolucion'` — para que una ejecución que se quedó
+  // colgada más del TTL y luego revive no pueda pisar el trabajo de
+  // otra que ya recuperó la disputa por caducidad (revisión de
+  // concurrencia crítica: comparar solo por `estado` no bastaba).
+  const miReclamadaAt = new Date();
+  const limiteReclamacion = new Date(Date.now() - LEASE_LIBERACION_MS);
+  const reclamada = await prisma.dispute.updateMany({
+    where: {
+      id,
+      OR: [
+        { estado: { in: ['abierta', 'en_revision'] } },
+        { estado: 'en_resolucion', reclamadaAt: { lt: limiteReclamacion } },
+      ],
+    },
+    data: { estado: 'en_resolucion', resueltoPor: adminId, reclamadaAt: miReclamadaAt },
+  });
+  if (reclamada.count === 0) {
+    return res.status(409).json({
+      error: 'Esta disputa ya fue resuelta o está siendo resuelta ahora mismo',
+      code: 'DISPUTE_ALREADY_RESOLVED',
+    });
+  }
+
   try {
     if (resolucion === 'resuelta_cliente') {
       await refundPayment(disputa.serviceRequestId);
@@ -336,9 +384,27 @@ export async function resolveDispute(req: Request, res: Response) {
     const mensaje = (err as Error).message;
 
     // La disputa NO se marca resuelta si el dinero no se pudo mover, a
-    // propósito: el estado de la disputa debe reflejar la realidad. Pero
-    // antes eso la dejaba inmortal — el reintento encontraba las filas ya
-    // fuera de 'retenido' y lanzaba PAGO_NO_ENCONTRADO para siempre.
+    // propósito: el estado de la disputa debe reflejar la realidad. Por
+    // eso el claim de arriba se revierte aquí a 'abierta' — sin esto, la
+    // disputa quedaría varada en 'en_resolucion' para siempre, la misma
+    // "disputa inmortal" que motivó hacer releasePayments/refundPayment
+    // reanudables. Se revierte siempre a 'abierta' (no al `disputa.estado`
+    // leído al principio): 'en_revision' no se escribe hoy en ningún
+    // sitio del código (confirmado por auditoría), así que en la
+    // práctica el estado original de cualquier disputa real es siempre
+    // 'abierta'; si en el futuro algo empieza a usar 'en_revision' de
+    // verdad, este punto habría que revisarlo.
+    //
+    // `reclamadaAt: miReclamadaAt` en el WHERE es la condición de
+    // ownership (fencing token) — NO un simple `estado: 'en_resolucion'`:
+    // si ESTA ejecución se quedó colgada más de LEASE_LIBERACION_MS y
+    // otra ya recuperó la disputa por TTL mientras tanto, este UPDATE
+    // afecta 0 filas y no toca el trabajo del nuevo propietario legítimo.
+    await prisma.dispute.updateMany({
+      where: { id, estado: 'en_resolucion', reclamadaAt: miReclamadaAt },
+      data: { estado: 'abierta', resueltoPor: null, reclamadaAt: null },
+    });
+
     // Ahora releasePayments/refundPayment son reanudables, así que
     // repetir esta misma llamada continúa desde donde se quedó.
     console.error(`[resolveDispute] Fallo al aplicar la resolución de la disputa ${id}:`, err);
@@ -349,15 +415,35 @@ export async function resolveDispute(req: Request, res: Response) {
     });
   }
 
-  const actualizada = await prisma.dispute.update({
-    where: { id },
+  // Misma condición de ownership que el revert de arriba, aplicada
+  // también al camino de éxito (revisión de concurrencia crítica): si
+  // otra ejecución ya recuperó y resolvió esta disputa por TTL mientras
+  // la nuestra estaba colgada en la llamada a Stripe, no debemos
+  // sobrescribir su resultado con el nuestro.
+  const finalizada = await prisma.dispute.updateMany({
+    where: { id, estado: 'en_resolucion', reclamadaAt: miReclamadaAt },
     data: {
       estado: resolucion,
       resueltoPor: adminId,
       resolucionNotas: notas,
       resueltaAt: new Date(),
+      reclamadaAt: null,
     },
   });
+  if (finalizada.count === 0) {
+    // El dinero de ESTA petición SÍ se movió (ya superamos el try/catch
+    // de arriba), pero entre medias otra ejecución recuperó esta disputa
+    // por caducidad del TTL y ya la finalizó a su manera — solo posible
+    // si este proceso estuvo colgado más de LEASE_LIBERACION_MS durante
+    // la llamada a Stripe. No sobrescribimos su resultado (ver revisión
+    // de concurrencia crítica); se deja constancia en logs para
+    // investigar a mano en vez de fallar silenciosamente.
+    console.error(
+      `[resolveDispute] La disputa ${id} ya no pertenecía a este intento al finalizar (reclamadaAt=${miReclamadaAt.toISOString()}) — otra ejecución la recuperó por TTL mientras esta operaba. El dinero de ESTA petición sí se movió.`
+    );
+  }
+
+  const actualizada = await prisma.dispute.findUniqueOrThrow({ where: { id } });
 
   await registrarAccionAdmin({
     adminId,

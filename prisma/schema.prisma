@@ -296,6 +296,21 @@ model Dispute {
   resolucionNotas  String?           @map("resolucion_notas")
   createdAt        DateTime          @default(now()) @map("created_at")
   resueltaAt       DateTime?         @map("resuelta_at")
+  // P2 (auditoría 2026-08-14, revisión de concurrencia crítica): TTL +
+  // fencing token del claim de resolveDispute. Sin esto, una disputa que
+  // queda en estado 'en_resolucion' porque el proceso que la reclamó
+  // murió o se colgó a mitad de la resolución no puede volver a
+  // reclamarse nunca — la misma "disputa inmortal" que ya se corrigió
+  // una vez para el caso de fallo de Stripe con el proceso vivo. Se
+  // limpia (NULL) al finalizar con éxito o al revertir por fallo; solo
+  // tiene un valor mientras una resolución está genuinamente en curso.
+  // El valor exacto con el que una ejecución concreta reclamó la
+  // disputa es también su fencing token: toda escritura posterior de
+  // esa misma ejecución (revert, finalización) se condiciona a que
+  // reclamadaAt siga siendo exactamente ese valor, para que una
+  // ejecución que se quedó colgada más del TTL y luego revive no pueda
+  // pisar el trabajo de otra que ya recuperó la disputa por caducidad.
+  reclamadaAt      DateTime?         @map("reclamada_at")
   serviceRequest   ServiceRequest    @relation(fields: [serviceRequestId], references: [id])
 
   @@index([serviceRequestId])

@@ -1,5 +1,5 @@
 import Stripe from 'stripe';
-import { Payment, Prisma } from '@prisma/client';
+import { Payment, Prisma, EstadoPago } from '@prisma/client';
 import { stripe } from '../config/stripe';
 import { prisma } from '../config/prisma';
 import {
@@ -99,8 +99,16 @@ export const COMISION_PROFESIONAL_PORCENTAJE = Number(process.env.PLATFORM_COMMI
  *   siempre si Render reinicia en pleno vuelo.
  */
 
-/** Milisegundos que un lease de liberación se considera vivo antes de darlo por abandonado (ej. reinicio de Render en pleno vuelo). */
-const LEASE_LIBERACION_MS = 5 * 60 * 1000;
+/**
+ * Milisegundos que un lease de liberación se considera vivo antes de
+ * darlo por abandonado (ej. reinicio de Render en pleno vuelo). Exportada
+ * porque `resolveDispute` (admin.controller.ts) reutiliza el mismo TTL
+ * para el claim de Dispute — mismo tipo de operación (unas pocas
+ * llamadas a Stripe + un par de escrituras), no hay motivo para un
+ * número distinto, y una sola constante evita que las dos guardas se
+ * desincronicen si algún día se ajusta el valor.
+ */
+export const LEASE_LIBERACION_MS = 5 * 60 * 1000;
 
 /** Estados de los que una liberación todavía puede (y debe) avanzar. */
 const ESTADOS_LIBERABLES = ['retenido', 'capturado'] as const;
@@ -350,59 +358,197 @@ export async function reautorizarPaymentIntent(
 }
 
 /**
- * Toma el lease de liberación de una solicitud. Atómico: el `updateMany`
- * condicional es la única sección crítica: si dos peticiones entran a la
- * vez (doble clic del admin, webhook + cierre manual...), solo una ve
- * `count > 0`. El lease caduca solo a los LEASE_LIBERACION_MS, así que un
- * reinicio de Render con el lease tomado no bloquea el pago para siempre.
- *
- * Incrementa `intentosLiberacion` en el mismo movimiento: a partir del
- * segundo intento se activa la búsqueda por `transfer_group` (red de
- * seguridad para cuando la clave de idempotencia de Stripe ya caducó).
+ * Una fila reclamada: su id y el fencing token con el que ESTA ejecución
+ * la reclamó (ver `reclamarFilas`).
  */
-async function adquirirLeaseLiberacion(serviceRequestId: string): Promise<boolean> {
+interface FilaReclamada {
+  id: string;
+  intentosLiberacion: number;
+}
+
+/**
+ * Reclama TODAS las filas de una solicitud que coincidan con `estados` y
+ * cuyo lease esté libre o caducado — en una única sentencia atómica
+ * `UPDATE ... RETURNING`, no `updateMany` (que solo devuelve `count`).
+ *
+ * P2 (auditoría 2026-08-14, revisión de concurrencia crítica): antes se
+ * usaba `updateMany` + un `findMany` posterior filtrado solo por
+ * `estado` — eso significaba que, si `releasePayments` y `refundPayment`
+ * usan listas de estados distintas (ESTADOS_LIBERABLES es subconjunto de
+ * ESTADOS_REEMBOLSABLES), una de las dos podía "conseguir el lease"
+ * (`count > 0` sobre AL MENOS una fila) y luego procesar, sin saberlo,
+ * OTRAS filas de la misma solicitud que en realidad tenía tomadas la
+ * otra ejecución — un split-brain real con solicitudes de estados
+ * mixtos (el caso exacto que motivó `refundPayment` en el hallazgo #4).
+ * `RETURNING id` elimina la ambigüedad: los IDs reclamados son
+ * EXACTAMENTE los que esta sentencia consiguió bloquear, ni uno más.
+ *
+ * `estado::text IN (...)` castea el enum `EstadoPago` a texto porque el
+ * SQL crudo no pasa por el mapeo de tipos de Prisma.
+ */
+async function reclamarFilas(
+  serviceRequestId: string,
+  estados: readonly EstadoPago[]
+): Promise<FilaReclamada[]> {
   const limite = new Date(Date.now() - LEASE_LIBERACION_MS);
 
-  const { count } = await prisma.payment.updateMany({
-    where: {
-      serviceRequestId,
-      estado: { in: [...ESTADOS_LIBERABLES] },
-      OR: [{ liberacionEnCursoAt: null }, { liberacionEnCursoAt: { lt: limite } }],
-    },
-    data: {
-      liberacionEnCursoAt: new Date(),
-      // A diferencia de liberacionEnCursoAt, este NO se limpia al soltar
-      // el lease: es el que usa el backoff exponencial de la tarea
-      // programada de reintento (ver jobs/reintentarPagosAtascados.job.ts)
-      // para saber cuánto hace del último intento.
-      ultimoIntentoLiberacionAt: new Date(),
-      intentosLiberacion: { increment: 1 },
-    },
+  return prisma.$queryRaw<FilaReclamada[]>`
+    UPDATE payments
+    SET liberacion_en_curso_at = now(),
+        ultimo_intento_liberacion_at = now(),
+        intentos_liberacion = intentos_liberacion + 1
+    WHERE service_request_id = ${serviceRequestId}
+      AND estado::text IN (${Prisma.join(estados)})
+      AND (liberacion_en_curso_at IS NULL OR liberacion_en_curso_at < ${limite})
+    RETURNING id, intentos_liberacion AS "intentosLiberacion"
+  `;
+}
+
+/**
+ * Reclama TODO lo relevante o aborta entero — nunca un subconjunto. Si
+ * `reclamarFilas` consigue menos filas de las que existen para ese
+ * `serviceRequestId`+`estados` (alguna ya está tomada por la otra
+ * operación), procesar solo lo reclamado dejaría la planificación de
+ * `ejecutarLiberacion`/`ejecutarReembolso` incompleta o, peor, tocando
+ * Stripe sobre una fila que la otra ejecución tiene en curso. Todo o
+ * nada es lo único que garantiza que release y refund nunca se crucen.
+ */
+async function reclamarTodoOAbortar(
+  serviceRequestId: string,
+  estados: readonly EstadoPago[]
+): Promise<FilaReclamada[]> {
+  const reclamadas = await reclamarFilas(serviceRequestId, estados);
+  const totalRelevantes = await prisma.payment.count({
+    where: { serviceRequestId, estado: { in: [...estados] } },
   });
 
+  if (reclamadas.length === 0) {
+    throw new Error(totalRelevantes === 0 ? 'PAGO_NO_ENCONTRADO' : 'LIBERACION_YA_EN_CURSO');
+  }
+  if (reclamadas.length < totalRelevantes) {
+    await liberarFilas(reclamadas);
+    throw new Error('LIBERACION_YA_EN_CURSO');
+  }
+  return reclamadas;
+}
+
+/**
+ * Escribe `data` en cada fila reclamada, pero SOLO si `intentosLiberacion`
+ * sigue siendo exactamente el token con el que esta ejecución la
+ * reclamó — el fencing token viaja en memoria desde `reclamarFilas` hasta
+ * aquí sin recalcularse nunca.
+ *
+ * Revisión de concurrencia crítica (ABA): un `UPDATE ... WHERE id IN
+ * (...)` sin esta condición podía, si ESTA ejecución se quedaba colgada
+ * (no muerta) más de LEASE_LIBERACION_MS, escribir sobre una fila que
+ * mientras tanto otra ejecución ya había reclamado de nuevo tras la
+ * caducidad — soltando o contaminando el lease del nuevo propietario
+ * legítimo sin que él lo supiera. `intentosLiberacion` (ya existente,
+ * se incrementa atómicamente en cada reclamo) es un fencing token
+ * entero: a diferencia de un DateTime, su igualdad no depende de
+ * ninguna precisión de reloj — o es exactamente el mismo número, o no.
+ * Se hace una llamada por fila porque cada una puede llevar un token
+ * distinto (intentos previos distintos), así que no se puede comparar
+ * con un único valor escalar en un `updateMany` conjunto.
+ */
+async function actualizarSiPropietario(
+  filas: FilaReclamada[],
+  data: Prisma.PaymentUpdateManyMutationInput
+): Promise<void> {
+  await Promise.all(
+    filas.map((f) =>
+      prisma.payment.updateMany({
+        where: { id: f.id, intentosLiberacion: f.intentosLiberacion },
+        data,
+      })
+    )
+  );
+}
+
+async function liberarFilas(filas: FilaReclamada[]): Promise<void> {
+  if (filas.length === 0) return;
+  await actualizarSiPropietario(filas, { liberacionEnCursoAt: null });
+}
+
+/**
+ * Heartbeat: comprueba Y renueva el lease en una única sentencia atómica,
+ * justo antes de cada llamada MUTANTE a Stripe (capture/transfer/cancel/
+ * refund) dentro de una operación que ya lleva un rato en marcha.
+ *
+ * Revisión de concurrencia crítica (release↔refund): un fencing token
+ * comprobado solo al principio (en el claim) no protege nada de lo que
+ * pasa DESPUÉS si la ejecución se queda colgada más de LEASE_LIBERACION_MS
+ * a mitad de camino — el lease ya caducó y otra ejecución puede haberlo
+ * reclamado antes de que esta llegue a la siguiente llamada a Stripe.
+ * Releer aquí, justo antes de esa llamada, con el MISMO token capturado
+ * originalmente (nunca uno recalculado), reduce esa ventana de "toda la
+ * duración de la operación" a "la duración de una sola llamada HTTP a
+ * Stripe" — no la elimina matemáticamente (un fencing de BD no puede
+ * cancelar una llamada a Stripe ya en vuelo), pero si el heartbeat
+ * devuelve false, la llamada a Stripe correspondiente NUNCA se hace.
+ *
+ * Al renovar `liberacionEnCursoAt` en cada heartbeat, una operación
+ * LEGÍTIMA que tarda más de 5 minutos en conjunto (varias filas, cada
+ * captura/transferencia tarda su tiempo) pero sigue avanzando y llamando
+ * a este heartbeat en cada paso NUNCA pierde el lease de verdad — solo
+ * lo pierde una ejecución que de verdad dejó de avanzar.
+ */
+async function heartbeat(paymentId: string, token: number): Promise<boolean> {
+  const { count } = await prisma.payment.updateMany({
+    where: { id: paymentId, intentosLiberacion: token },
+    data: { liberacionEnCursoAt: new Date() },
+  });
   return count > 0;
 }
 
-async function liberarLeaseLiberacion(serviceRequestId: string): Promise<void> {
-  await prisma.payment.updateMany({
-    where: { serviceRequestId, estado: { in: [...ESTADOS_LIBERABLES] } },
-    data: { liberacionEnCursoAt: null },
+/**
+ * Escribe el resultado de una llamada a Stripe que YA tuvo éxito, pero
+ * SOLO si esta ejecución sigue siendo la propietaria (mismo token). No
+ * podemos deshacer retroactivamente una llamada a Stripe que ya terminó
+ * — si el UPDATE afecta 0 filas, Stripe ya movió dinero de verdad (o
+ * confirmó una autorización/cancelación) pero el dueño en BD cambió
+ * mientras la llamada estaba en vuelo. Eso NO se trata como éxito local
+ * ni se sobrescribe al nuevo propietario: se registra explícitamente
+ * como resultado de Stripe confirmado con ownership perdido — un
+ * "huérfano" — para que se pueda investigar a mano. Reutiliza el mismo
+ * `console.error` con prefijo ya usado en todo este archivo para los
+ * logs de Render, en vez de inventar un mecanismo de observabilidad
+ * nuevo. Solo se registran IDs de objetos de Stripe (nunca datos de
+ * tarjeta, cliente ni ningún secreto — esos IDs no lo son).
+ */
+async function escribirResultadoStripe(
+  paymentId: string,
+  token: number,
+  data: Prisma.PaymentUpdateManyMutationInput,
+  contexto: { operacion: string; stripeResultadoId: string | undefined }
+): Promise<void> {
+  const { count } = await prisma.payment.updateMany({
+    where: { id: paymentId, intentosLiberacion: token },
+    data,
   });
+  if (count === 0) {
+    console.error(
+      `[STRIPE_HUERFANO] paymentId=${paymentId} operacion=${contexto.operacion} tokenPerdido=${token} ` +
+        `stripeResultadoId=${contexto.stripeResultadoId ?? 'desconocido'} — Stripe confirmó esta operación con ` +
+        `éxito pero el UPDATE condicionado al fencing token afectó 0 filas: otra ejecución ya es la propietaria ` +
+        `de este Payment. Este movimiento de Stripe existe de verdad y no quedó reflejado en BD; requiere revisión manual.`
+    );
+    throw new Error('LIBERACION_YA_EN_CURSO');
+  }
 }
 
 /**
  * Registra por qué falló el último intento, para que el endpoint de
  * admin (`GET /api/admin/payments/stuck`) pueda mostrarlo sin obligar a
- * bucear en los logs de Render.
+ * bucear en los logs de Render. Condicionado al mismo fencing token que
+ * `liberarFilas` — mismo motivo: si esta ejecución se quedó colgada y
+ * otra ya reclamó las mismas filas, no debe escribir nada sobre ellas.
  */
-async function registrarFalloLiberacion(serviceRequestId: string, error: unknown): Promise<void> {
+async function registrarFalloLiberacion(filas: FilaReclamada[], error: unknown): Promise<void> {
   const mensaje = error instanceof Error ? error.message : String(error);
-  await prisma.payment
-    .updateMany({
-      where: { serviceRequestId, estado: { in: [...ESTADOS_LIBERABLES] } },
-      data: { ultimoErrorLiberacion: mensaje.slice(0, 500) },
-    })
-    .catch((e) => console.error(`[releasePayments] No se pudo registrar el fallo de ${serviceRequestId}:`, e));
+  await actualizarSiPropietario(filas, { ultimoErrorLiberacion: mensaje.slice(0, 500) }).catch((e) =>
+    console.error(`[releasePayments] No se pudo registrar el fallo de la fila:`, e)
+  );
 }
 
 /**
@@ -464,7 +610,14 @@ async function adoptarCapturaHuerfana(
     capturadoProfesional: redondear2(Number(pago.montoProfesional) * fraccion),
   };
 
-  await prisma.payment.update({ where: { id: pago.id }, data: datos });
+  // Fenced (ver escribirResultadoStripe): la captura que se adopta aquí
+  // ya ocurrió de verdad en Stripe en una ejecución anterior — si esta
+  // ejecución ya no es la propietaria (perdió el lease mientras
+  // reconciliaba), no se sobrescribe al nuevo dueño.
+  await escribirResultadoStripe(pago.id, pago.intentosLiberacion, datos, {
+    operacion: 'adoptarCapturaHuerfana',
+    stripeResultadoId: datos.stripeChargeId ?? undefined,
+  });
 
   // Se fusiona sobre la fila que ya tenemos en memoria en lugar de
   // adoptar lo que devuelva el update: el resto de campos (id,
@@ -487,6 +640,18 @@ async function capturarConIdempotencia(
 ): Promise<{ pago: PagoEnLiberacion; chargeId?: string }> {
   const { pago } = paso;
   const paymentIntentId = pago.stripePaymentIntentId!;
+  // Token capturado al reclamar (viaja en pago.intentosLiberacion desde
+  // ejecutarLiberacion, nunca se relee) — es el mismo para el heartbeat
+  // de abajo y para la escritura fenced del final.
+  const token = pago.intentosLiberacion;
+
+  // Heartbeat: comprueba Y renueva el lease justo antes de la llamada
+  // mutante a Stripe. Si esta ejecución ya no es la propietaria (el
+  // lease caducó y otra lo reclamó mientras tanto), aborta AQUÍ — nunca
+  // llega a llamar a capture().
+  if (!(await heartbeat(pago.id, token))) {
+    throw new Error('LIBERACION_YA_EN_CURSO');
+  }
 
   let intentCapturado: Stripe.PaymentIntent;
   try {
@@ -511,11 +676,15 @@ async function capturarConIdempotencia(
 
   const datos = { estado: 'capturado' as const, capturadoAt: new Date(), stripeChargeId: chargeId ?? null };
 
-  // Persistir es para la SIGUIENTE ejecución (si la hay); el paso
-  // siguiente de ESTA usa lo que Stripe acaba de confirmar, fusionado
-  // sobre la fila en memoria — no lo que devuelva el update, que sería
-  // depender de qué columnas decida devolver el driver.
-  await prisma.payment.update({ where: { id: pago.id }, data: datos });
+  // Fenced: si el heartbeat de arriba pasó pero la llamada a Stripe
+  // tardó lo bastante como para que OTRA ejecución reclamara el lease
+  // mientras tanto (la llamada ya estaba en vuelo — un fencing de BD no
+  // puede cancelarla), esta escritura no sobrescribe al nuevo
+  // propietario y el resultado de Stripe se registra como huérfano.
+  await escribirResultadoStripe(pago.id, token, datos, {
+    operacion: 'capturarConIdempotencia',
+    stripeResultadoId: chargeId,
+  });
 
   return { pago: { ...pago, ...datos }, chargeId };
 }
@@ -532,12 +701,14 @@ async function transferirConIdempotencia(
   stripeAccountId: string
 ): Promise<Payment> {
   const { pago } = paso;
+  const token = pago.intentosLiberacion;
 
   let transferId = pago.stripeTransferId ?? undefined;
 
   // Un intento anterior pudo crear la transferencia y morir antes de
   // guardarla. Solo se consulta a partir del segundo intento: en el
-  // camino feliz no añade ninguna llamada extra a Stripe.
+  // camino feliz no añade ninguna llamada extra a Stripe. Es una
+  // lectura, no una mutación — no necesita heartbeat propio.
   if (!transferId && pago.intentosLiberacion > 1) {
     const previas = await stripe.transfers.list({ transfer_group: pago.id, limit: 1 });
     if (previas.data.length > 0) {
@@ -547,6 +718,12 @@ async function transferirConIdempotencia(
   }
 
   if (!transferId) {
+    // Heartbeat: comprueba Y renueva el lease justo antes de la llamada
+    // mutante a Stripe — ver capturarConIdempotencia para el porqué.
+    if (!(await heartbeat(pago.id, token))) {
+      throw new Error('LIBERACION_YA_EN_CURSO');
+    }
+
     const transfer = await stripe.transfers.create(
       {
         amount: aCentimos(paso.capturadoProfesional),
@@ -563,25 +740,34 @@ async function transferirConIdempotencia(
     transferId = transfer.id;
   }
 
-  return prisma.payment.update({
-    where: { id: pago.id },
-    data: {
-      estado: 'liberado',
-      liberadoAt: new Date(),
-      stripeTransferId: transferId,
-      // Se ajustan a lo REALMENTE capturado (puede ser menos que lo
-      // autorizado) para que la suma de las filas "liberado" refleje el
-      // dinero que de verdad se movió. Se hace SOLO aquí, al final: los
-      // importes autorizados se conservan intactos durante todo el
-      // proceso para poder re-planificar si hace falta reintentar.
-      montoBase: paso.baseAConsumir,
-      montoTotal: paso.capturadoTotal,
-      comisionPlataforma: redondear2(paso.capturadoTotal - paso.capturadoProfesional),
-      montoProfesional: paso.capturadoProfesional,
-      liberacionEnCursoAt: null,
-      ultimoErrorLiberacion: null,
-    },
+  const datos = {
+    estado: 'liberado' as const,
+    liberadoAt: new Date(),
+    stripeTransferId: transferId,
+    // Se ajustan a lo REALMENTE capturado (puede ser menos que lo
+    // autorizado) para que la suma de las filas "liberado" refleje el
+    // dinero que de verdad se movió. Se hace SOLO aquí, al final: los
+    // importes autorizados se conservan intactos durante todo el
+    // proceso para poder re-planificar si hace falta reintentar.
+    montoBase: paso.baseAConsumir,
+    montoTotal: paso.capturadoTotal,
+    comisionPlataforma: redondear2(paso.capturadoTotal - paso.capturadoProfesional),
+    montoProfesional: paso.capturadoProfesional,
+    liberacionEnCursoAt: null,
+    ultimoErrorLiberacion: null,
+  };
+
+  // Fenced: si el heartbeat de arriba pasó pero transfers.create() tardó
+  // lo bastante como para que OTRA ejecución reclamara el lease mientras
+  // la llamada seguía en vuelo, esta escritura no sobrescribe al nuevo
+  // propietario y el resultado (dinero YA transferido al profesional) se
+  // registra como huérfano en vez de perderse en silencio.
+  await escribirResultadoStripe(pago.id, token, datos, {
+    operacion: 'transferirConIdempotencia',
+    stripeResultadoId: transferId,
   });
+
+  return { ...pago, ...datos } as unknown as Payment;
 }
 
 /**
@@ -599,31 +785,28 @@ async function transferirConIdempotencia(
  * hace seguro el endpoint de reintento del panel de admin.
  */
 export async function releasePayments(serviceRequestId: string, baseFinal: number) {
-  if (!(await adquirirLeaseLiberacion(serviceRequestId))) {
-    // O no hay nada que liberar, o hay otra ejecución dentro ahora mismo.
-    // Se distingue para que el llamador pueda dar un mensaje honesto.
-    const pendientes = await prisma.payment.count({
-      where: { serviceRequestId, estado: { in: [...ESTADOS_LIBERABLES] } },
-    });
-    throw new Error(pendientes === 0 ? 'PAGO_NO_ENCONTRADO' : 'LIBERACION_YA_EN_CURSO');
-  }
+  const reclamadas = await reclamarTodoOAbortar(serviceRequestId, ESTADOS_LIBERABLES);
 
   try {
-    const resultados = await ejecutarLiberacion(serviceRequestId, baseFinal);
+    const resultados = await ejecutarLiberacion(
+      reclamadas.map((f) => f.id),
+      serviceRequestId,
+      baseFinal
+    );
     return resultados;
   } catch (e) {
-    await registrarFalloLiberacion(serviceRequestId, e);
+    await registrarFalloLiberacion(reclamadas, e);
     throw e;
   } finally {
-    await liberarLeaseLiberacion(serviceRequestId).catch((e) =>
+    await liberarFilas(reclamadas).catch((e) =>
       console.error(`[releasePayments] No se pudo liberar el lease de ${serviceRequestId}:`, e)
     );
   }
 }
 
-async function ejecutarLiberacion(serviceRequestId: string, baseFinal: number) {
+async function ejecutarLiberacion(ids: string[], serviceRequestId: string, baseFinal: number) {
   const pagos = await prisma.payment.findMany({
-    where: { serviceRequestId, estado: { in: [...ESTADOS_LIBERABLES] } },
+    where: { id: { in: ids } },
     orderBy: { createdAt: 'asc' },
   });
   if (pagos.length === 0) throw new Error('PAGO_NO_ENCONTRADO');
@@ -756,14 +939,19 @@ async function ejecutarLiberacion(serviceRequestId: string, baseFinal: number) {
   // lugar de tener que adivinarlos.
   for (const paso of plan) {
     if (paso.accion !== 'capturar') continue;
-    await prisma.payment.update({
-      where: { id: paso.pago.id },
+    // Fenced (sin llamada a Stripe todavía en este punto — es la
+    // planificación, no un resultado de Stripe, así que no hay nada que
+    // registrar como huérfano si falla: simplemente esta ejecución ya no
+    // es la propietaria y debe abortar ANTES de tocar Stripe).
+    const { count } = await prisma.payment.updateMany({
+      where: { id: paso.pago.id, intentosLiberacion: paso.pago.intentosLiberacion },
       data: {
         capturadoBase: paso.baseAConsumir,
         capturadoTotal: paso.capturadoTotal,
         capturadoProfesional: paso.capturadoProfesional,
       },
     });
+    if (count === 0) throw new Error('LIBERACION_YA_EN_CURSO');
   }
 
   // ---------- FASE 2: EJECUTAR ----------
@@ -771,15 +959,25 @@ async function ejecutarLiberacion(serviceRequestId: string, baseFinal: number) {
 
   for (const paso of plan) {
     if (paso.accion === 'cancelar') {
-      await stripe.paymentIntents.cancel(paso.pago.stripePaymentIntentId!, undefined, {
+      const tokenCancelar = paso.pago.intentosLiberacion;
+      // Heartbeat antes de la llamada mutante a Stripe — ver
+      // capturarConIdempotencia para el porqué.
+      if (!(await heartbeat(paso.pago.id, tokenCancelar))) {
+        throw new Error('LIBERACION_YA_EN_CURSO');
+      }
+
+      const cancelado = await stripe.paymentIntents.cancel(paso.pago.stripePaymentIntentId!, undefined, {
         idempotencyKey: `cnl_${paso.pago.id}`,
       });
-      resultados.push(
-        await prisma.payment.update({
-          where: { id: paso.pago.id },
-          data: { estado: 'reembolsado', liberacionEnCursoAt: null },
-        })
-      );
+
+      const datosCancelacion = { estado: 'reembolsado' as const, liberacionEnCursoAt: null };
+      // Fenced + huérfano si esta ejecución perdió la propiedad mientras
+      // la llamada a Stripe estaba en vuelo.
+      await escribirResultadoStripe(paso.pago.id, tokenCancelar, datosCancelacion, {
+        operacion: 'ejecutarLiberacion:cancelar',
+        stripeResultadoId: cancelado.id,
+      });
+      resultados.push({ ...paso.pago, ...datosCancelacion } as unknown as Payment);
       continue;
     }
 
@@ -857,18 +1055,59 @@ export async function diagnosticarPagoSinConfirmar(
  *
  * Todas las operaciones llevan clave de idempotencia determinista, así
  * que reintentar tras un timeout no cancela ni reembolsa dos veces.
+ *
+ * P2 (auditoría 2026-08-14): comparte el mismo lease que `releasePayments`
+ * (ver `reclamarTodoOAbortar`, con ESTADOS_REEMBOLSABLES en vez de
+ * ESTADOS_LIBERABLES) — antes esta función no lo respetaba en absoluto,
+ * así que un reembolso y una liberación podían correr a la vez sobre la
+ * misma solicitud (p. ej. `resolveDispute` a favor del cliente mientras
+ * el profesional completa el trabajo, o `cancelServiceRequest` mientras
+ * un job de reintento libera). Sin el lease, no había forma de saber si
+ * la otra operación ya estaba tocando las mismas filas — con él, el
+ * perdedor de la carrera falla ANTES de llamar a Stripe, nunca a mitad.
+ * Además, "todo o nada" (ver `reclamarTodoOAbortar`) impide que
+ * `refundPayment` procese solo un subconjunto de filas mientras
+ * `releasePayments` tiene el resto — el bug real que dejaba el diseño
+ * anterior (basado en `count` agregado, sin IDs exactos) sin cerrar.
  */
 export async function refundPayment(serviceRequestId: string) {
+  const reclamadas = await reclamarTodoOAbortar(serviceRequestId, ESTADOS_REEMBOLSABLES);
+
+  try {
+    await ejecutarReembolso(
+      reclamadas.map((f) => f.id),
+      serviceRequestId
+    );
+  } finally {
+    await liberarFilas(reclamadas).catch((e) =>
+      console.error(`[refundPayment] No se pudo liberar el lease de ${serviceRequestId}:`, e)
+    );
+  }
+}
+
+async function ejecutarReembolso(ids: string[], serviceRequestId: string): Promise<void> {
   const pagos = await prisma.payment.findMany({
-    where: { serviceRequestId, estado: { in: [...ESTADOS_REEMBOLSABLES] } },
+    where: { id: { in: ids } },
   });
   if (pagos.length === 0) throw new Error('PAGO_NO_ENCONTRADO');
 
   for (const pago of pagos) {
     if (!pago.stripePaymentIntentId) continue;
+    // Token capturado al reclamar (viaja en pago.intentosLiberacion
+    // desde el findMany de arriba, nunca se relee).
+    const token = pago.intentosLiberacion;
 
+    // Heartbeat: comprueba Y renueva el lease justo antes de la llamada
+    // mutante a Stripe — ver capturarConIdempotencia para el porqué. Si
+    // esta ejecución ya no es la propietaria, aborta AQUÍ, antes de
+    // llamar a Stripe.
+    if (!(await heartbeat(pago.id, token))) {
+      throw new Error('LIBERACION_YA_EN_CURSO');
+    }
+
+    let stripeResultadoId: string | undefined;
     if (pago.estado === 'capturado' || pago.estado === 'liberado') {
-      await stripe.refunds.create(
+      const refund = await stripe.refunds.create(
         {
           payment_intent: pago.stripePaymentIntentId,
           ...(pago.estado === 'liberado' ? { reverse_transfer: true } : {}),
@@ -876,16 +1115,25 @@ export async function refundPayment(serviceRequestId: string) {
         },
         { idempotencyKey: `ref_${pago.id}` }
       );
+      stripeResultadoId = refund.id;
     } else {
-      await stripe.paymentIntents.cancel(pago.stripePaymentIntentId, undefined, {
+      const cancelado = await stripe.paymentIntents.cancel(pago.stripePaymentIntentId, undefined, {
         idempotencyKey: `cnl_${pago.id}`,
       });
+      stripeResultadoId = cancelado.id;
     }
 
-    await prisma.payment.update({
-      where: { id: pago.id },
-      data: { estado: 'reembolsado', liberacionEnCursoAt: null },
-    });
+    // Fenced: si el heartbeat de arriba pasó pero la llamada a Stripe
+    // tardó lo bastante como para que OTRA ejecución reclamara el lease
+    // mientras tanto, esta escritura no sobrescribe al nuevo propietario
+    // y el resultado (reembolso/cancelación YA confirmado en Stripe) se
+    // registra como huérfano en vez de perderse en silencio.
+    await escribirResultadoStripe(
+      pago.id,
+      token,
+      { estado: 'reembolsado', liberacionEnCursoAt: null },
+      { operacion: 'ejecutarReembolso', stripeResultadoId }
+    );
   }
 }
 

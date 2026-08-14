@@ -112,6 +112,41 @@ describe('cancelServiceRequest', () => {
     expect(res.json).toHaveBeenCalledWith({ id: 'sr-1', estado: 'cancelada' });
   });
 
+  /**
+   * P2 (auditoría 2026-08-14): refundPayment ahora comparte el lease con
+   * releasePayments — si una liberación está en curso sobre la misma
+   * solicitud (p. ej. el profesional completando el trabajo justo cuando
+   * el cliente cancela), refundPayment lanza LIBERACION_YA_EN_CURSO en
+   * vez de arriesgarse a tocar Stripe a la vez que la liberación.
+   * cancelServiceRequest lo tolera igual que cualquier otro fallo de
+   * refundPayment: la solicitud ya quedó cancelada (el UPDATE atómico de
+   * ServiceRequest.estado ya se ejecutó antes), y el fallo del reembolso
+   * solo se registra en logs.
+   *
+   * GAP RESIDUAL, documentado a propósito y NO resuelto aquí: no existe
+   * ningún job que reintente automáticamente un reembolso que perdió
+   * esta carrera — a diferencia de las liberaciones (reintentarPagosAtascados.job.ts),
+   * no hay equivalente para refunds. Si esto ocurre en producción, el
+   * dinero queda retenido en Stripe con la solicitud ya "cancelada" en
+   * BD, sin reintento automático. Ver informe de la auditoría P2 #1.
+   */
+  it('tolera que refundPayment falle por lease ocupado (liberación en curso) — la cancelación sigue devolviendo éxito', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'aceptada',
+    });
+    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 1 });
+    mockRefundPayment.mockRejectedValue(new Error('LIBERACION_YA_EN_CURSO'));
+
+    const res = fakeRes();
+    await cancelServiceRequest(fakeReq({ id: 'sr-1' }, 'cliente-1'), res);
+
+    expect(res.status).not.toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ id: 'sr-1', estado: 'cancelada' });
+  });
+
   it('avisa al profesional asignado de que su trabajo fue cancelado', async () => {
     mockPrisma.serviceRequest.findUnique.mockResolvedValue({
       id: 'sr-1',
