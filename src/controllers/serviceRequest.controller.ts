@@ -963,9 +963,25 @@ export async function completeServiceRequest(req: Request, res: Response) {
       return res.status(409).json({ error: 'Ya hay un cierre pendiente de confirmación del cliente', code: 'HOURS_CLOSURE_ALREADY_PENDING' });
     }
 
-    const cierre = await prisma.cierreHoras.create({
-      data: { serviceRequestId: id, horasReales: parsed.data.horasReales },
-    });
+    // El findFirst de arriba es solo fast-path (evita una escritura
+    // innecesaria en el caso normal) — la garantía real es el índice
+    // único parcial `cierres_horas_pendiente_unico` (WHERE
+    // estado='pendiente'). Sin él, dos peticiones casi simultáneas
+    // podían pasar ambas el findFirst (ninguna ve todavía la fila de
+    // la otra) y crear dos CierreHoras "pendiente" para la misma
+    // solicitud — mismo patrón ya usado para candidaturas, ver
+    // postulacion.controller.ts.
+    let cierre;
+    try {
+      cierre = await prisma.cierreHoras.create({
+        data: { serviceRequestId: id, horasReales: parsed.data.horasReales },
+      });
+    } catch (err: any) {
+      if (err?.code === 'P2002') {
+        return res.status(409).json({ error: 'Ya hay un cierre pendiente de confirmación del cliente', code: 'HOURS_CLOSURE_ALREADY_PENDING' });
+      }
+      throw err;
+    }
 
     enviarNotificacion(solicitud.clienteId, 'cierre_horas_pendiente', {}, { solicitudId: id }).catch((e) =>
       console.error(`[completeServiceRequest] Error al notificar al cliente de ${id}:`, e)

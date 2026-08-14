@@ -1,0 +1,13 @@
+-- P2 #2 (auditoría 2026-08-14): completeServiceRequest hacía un
+-- findFirst(estado='pendiente') y luego un create sin ninguna
+-- protección atómica entre medias — dos peticiones casi simultáneas
+-- (doble tap, reintento por timeout) podían pasar ambas la
+-- comprobación y crear dos CierreHoras "pendiente" para la misma
+-- solicitud. Comprobado contra producción (2026-08-14): 0 duplicados
+-- existentes, así que este índice se aplica limpio.
+--
+-- Parcial (solo WHERE estado='pendiente') a propósito: no debe
+-- impedir que una solicitud tenga múltiples CierreHoras históricos en
+-- 'aceptado'/'rechazado' — solo puede haber UNO pendiente de
+-- confirmación a la vez por solicitud.
+CREATE UNIQUE INDEX "cierres_horas_pendiente_unico" ON "cierres_horas" ("service_request_id") WHERE "estado" = 'pendiente';

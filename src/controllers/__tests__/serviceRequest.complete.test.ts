@@ -224,6 +224,85 @@ describe('completeServiceRequest', () => {
     expect(mockPrisma.cierreHoras.create).not.toHaveBeenCalled();
   });
 
+  // P2 #2 (auditoría 2026-08-14): el findFirst de arriba es solo
+  // fast-path — dos peticiones casi simultáneas pueden pasarlo ambas
+  // (ninguna ve todavía la fila de la otra) antes de que la primera
+  // haga el create. La garantía real es el índice único parcial
+  // `cierres_horas_pendiente_unico`; en ese caso Postgres/Prisma
+  // rechaza el segundo create con P2002. Este test simula justo esa
+  // carrera: findFirst pasa (null), pero el create choca con el
+  // índice.
+  it('"por_horas": si el create choca con el índice único (P2002 — carrera con otra petición), devuelve el mismo 409 que el fast-path', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'aceptada',
+      presupuestos: [{ id: 'pres-1', tipo: 'por_horas', tarifaHora: 25, horasEstimadas: 4 }],
+    });
+    mockPrisma.cierreHoras.findFirst.mockResolvedValue(null);
+    mockPrisma.cierreHoras.create.mockRejectedValue({ code: 'P2002' });
+
+    const res = fakeRes();
+    await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1', { horasReales: 3.5 }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'HOURS_CLOSURE_ALREADY_PENDING' })
+    );
+    expect(mockPrisma.serviceRequest.update).not.toHaveBeenCalled();
+    expect(mockReleasePayments).not.toHaveBeenCalled();
+  });
+
+  it('"por_horas": un error de Prisma que NO es P2002 no se convierte en 409 — se deja propagar tal cual (no se filtra/oculta)', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'aceptada',
+      presupuestos: [{ id: 'pres-1', tipo: 'por_horas', tarifaHora: 25, horasEstimadas: 4 }],
+    });
+    mockPrisma.cierreHoras.findFirst.mockResolvedValue(null);
+    const errorInesperado = { code: 'P2028', message: 'Transaction API error' };
+    mockPrisma.cierreHoras.create.mockRejectedValue(errorInesperado);
+
+    const res = fakeRes();
+    await expect(completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1', { horasReales: 3.5 }), res)).rejects.toBe(
+      errorInesperado
+    );
+
+    expect(res.status).not.toHaveBeenCalledWith(409);
+    expect(res.json).not.toHaveBeenCalled();
+  });
+
+  // Tras resolver un cierre anterior (aceptado o rechazado), el índice
+  // parcial (WHERE estado='pendiente') no debe estorbar: el
+  // profesional puede volver a declarar horas y crear un cierre
+  // pendiente nuevo con normalidad.
+  it('"por_horas": puede crear un nuevo cierre pendiente después de que el anterior quedó rechazado', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'aceptada',
+      presupuestos: [{ id: 'pres-1', tipo: 'por_horas', tarifaHora: 25, horasEstimadas: 4 }],
+    });
+    // El cierre anterior ya no está 'pendiente' — el findFirst (que
+    // solo busca estado: 'pendiente') no lo ve, igual que no lo vería
+    // el índice único parcial.
+    mockPrisma.cierreHoras.findFirst.mockResolvedValue(null);
+    mockPrisma.cierreHoras.create.mockResolvedValue({ id: 'cierre-2', horasReales: 4.5 });
+
+    const res = fakeRes();
+    await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1', { horasReales: 4.5 }), res);
+
+    expect(mockPrisma.cierreHoras.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ serviceRequestId: 'sr-1', horasReales: 4.5 }) })
+    );
+    expect(res.status).toHaveBeenCalledWith(202);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ cierreHorasId: 'cierre-2' }));
+  });
+
   it('devuelve 409 si el cliente aún no ha autorizado ningún pago', async () => {
     mockPrisma.payment.findFirst.mockResolvedValue(null);
     mockPrisma.serviceRequest.findUnique.mockResolvedValue({
