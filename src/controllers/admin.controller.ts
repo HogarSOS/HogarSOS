@@ -10,6 +10,7 @@ import {
 import { agregarPagos } from './serviceRequest.controller';
 import { TAREAS, ejecutarTareaAhora } from '../jobs';
 import { registrarAccionAdmin, listarAccionesAdmin } from '../services/adminAction.service';
+import { enviarNotificacion } from '../services/notification.service';
 
 /**
  * Estado de las tareas programadas (ver src/jobs/). Sin esto, saber si
@@ -214,8 +215,14 @@ export async function approveProfessional(req: Request, res: Response) {
     },
   });
 
-  // TODO: disparar notificación push/email al profesional con el resultado
-  // (y el motivoRechazo si aplica) — pendiente de integrar servicio de notificaciones.
+  // Fire-and-forget, mismo patrón que el resto de eventos de estado
+  // (postulación, presupuesto, cierre de horas...): un fallo al enviar
+  // no debe tumbar la respuesta al admin, la decisión ya quedó guardada.
+  enviarNotificacion(
+    professionalId,
+    parsed.data.aprobar ? 'verificacion_aprobada' : 'verificacion_rechazada',
+    parsed.data.aprobar ? {} : { motivoRechazo: parsed.data.motivoRechazo }
+  ).catch((e) => console.error('[admin.controller] Error al notificar verificación:', e?.message ?? e));
 
   await registrarAccionAdmin({
     adminId,

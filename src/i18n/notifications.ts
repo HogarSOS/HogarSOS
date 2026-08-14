@@ -23,7 +23,9 @@ export type NotificationKey =
   | 'pago_autorizado'
   | 'autorizacion_por_caducar'
   | 'autorizacion_caducada'
-  | 'valoracion_recibida';
+  | 'valoracion_recibida'
+  | 'verificacion_aprobada'
+  | 'verificacion_rechazada';
 
 export interface NotificationParams {
   /** nueva_solicitud: nombre canónico (en español) de la categoría del servicio, tal cual viene de la BD — se traduce con `traducirCategoria` antes de interpolarlo. */
@@ -32,6 +34,8 @@ export interface NotificationParams {
   tipoAmpliacion?: 'por_horas' | 'monto';
   /** valoracion_recibida: puntuación de 1 a 5 recibida. */
   puntuacion?: number;
+  /** verificacion_rechazada: motivo escrito por el admin, interpolado tal cual en el cuerpo. */
+  motivoRechazo?: string;
 }
 
 type Mensaje = { title: string; body: string };
@@ -263,6 +267,24 @@ const MENSAJES: Record<NotificationKey, Record<Idioma, Constructor>> = {
   valoracion_recibida: {
     es: ({ puntuacion }) => ({ title: 'Nueva valoración', body: `Has recibido una valoración de ${puntuacion ?? '?'} estrellas` }),
     en: ({ puntuacion }) => ({ title: 'New rating', body: `You've received a ${puntuacion ?? '?'}-star rating` }),
+  },
+  verificacion_aprobada: {
+    es: () => ({ title: '¡Verificación aprobada!', body: 'Ya puedes empezar a recibir solicitudes de clientes' }),
+    en: () => ({ title: 'Verification approved!', body: 'You can now start receiving client requests' }),
+  },
+  verificacion_rechazada: {
+    es: ({ motivoRechazo }) => ({
+      title: 'Verificación no aprobada',
+      body: motivoRechazo
+        ? `No hemos podido aprobar tu verificación: ${motivoRechazo}`
+        : 'No hemos podido aprobar tu verificación. Revisa tu documentación y vuelve a intentarlo.',
+    }),
+    en: ({ motivoRechazo }) => ({
+      title: 'Verification not approved',
+      body: motivoRechazo
+        ? `We couldn't approve your verification: ${motivoRechazo}`
+        : "We couldn't approve your verification. Please review your documents and try again.",
+    }),
   },
 };
 
