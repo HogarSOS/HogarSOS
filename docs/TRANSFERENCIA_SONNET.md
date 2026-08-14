@@ -7,13 +7,15 @@
 
 > Este documento vive en el repositorio del **backend** porque es donde está el grueso del cambio, pero **cubre los dos repositorios**: `HogarSOS/HogarSOS` (backend) y `HogarSOS/hogarSOS-frontend` (app Flutter).
 
+> **Actualización 2026-08-14** — el estado de §5.1/§6/§10 sobre iOS y Stripe descrito abajo corresponde al 2026-08-04 y ya no es vigente. Desde entonces: `PRODUCT_BUNDLE_IDENTIFIER` es `es.hogarsos.app`, `ios/Runner/GoogleService-Info.plist` existe, Stripe está en modo Live y verificado en producción, `pk_live` ya está en `main.dart`, y el Build 35 de iOS ya está subido y validado en App Store Connect (notificaciones y Apple Pay confirmados con pago real en iPhone). El resto del documento (arquitectura de pagos, decisiones de diseño §4, qué no tocar §7) sigue vigente sin cambios — ver anotaciones puntuales `[ACTUALIZADO 2026-08-14]` más abajo en vez de repetir todo el checklist.
+
 ---
 
 ## 1. Resumen ejecutivo
 
 ### Estado actual
 
-Hogar SOS es un marketplace de servicios a domicilio (España) con dos roles —cliente y profesional— y pagos retenidos tipo *escrow* vía Stripe Connect. Está **listo para publicar en Google Play** una vez completada la configuración manual del §6. **No está listo para iOS.**
+Hogar SOS es un marketplace de servicios a domicilio (España) con dos roles —cliente y profesional— y pagos retenidos tipo *escrow* vía Stripe Connect. Está **listo para publicar en Google Play** una vez completada la configuración manual del §6. **[ACTUALIZADO 2026-08-14] iOS ya no está bloqueado**: bundle id, Firebase y Stripe Live corregidos, Build 35 subido y validado en App Store Connect — ver nota al inicio del documento.
 
 | Métrica | Antes de esta fase | Ahora |
 |---|---|---|
@@ -387,14 +389,14 @@ Un `updateMany` condicional y atómico sobre una columna de timestamp, con caduc
 | Riesgo | Severidad | Por qué sigue abierto |
 |---|---|---|
 | **`email_verified` nunca se comprueba** | 🟠 | **No es un arreglo pequeño.** `auth_service.dart` llama a `sendEmailVerification()` **después** de que `/auth/register` responda OK, así que en el registro `email_verified` es **siempre `false`**. Añadir la comprobación rompería el 100% de los registros. Exige reestructurar el flujo |
-| **PII en Stripe tras eliminar cuenta** | 🟠 | `deleteMe` no llama a `stripe.customers.del()`. El `Customer` conserva nombre, email y teléfono indefinidamente |
-| **CORS `origin: true` + `credentials: true`** | 🟠 | Refleja cualquier origen. Contenido porque la auth va por `Authorization: Bearer` y no por cookies |
+| ~~**PII en Stripe tras eliminar cuenta**~~ | ✅ [ACTUALIZADO 2026-08-14] | `deleteMe` ya anonimiza name/email/phone del Customer de Stripe. Los mensajes de chat en Firestore siguen sin tocar (pendiente de decisión de retención) |
+| ~~**CORS `origin: true` + `credentials: true`**~~ | ✅ [ACTUALIZADO 2026-08-14] | Restringido a `hogarsos.es`/`www.hogarsos.es` en producción; abierto solo fuera de producción |
 | **El manejador de errores filtra `err.message`** | 🟠 | Errores de Prisma exponen nombres de tabla y columna |
 | **Sin rate limit específico en `/api/auth`** | 🟠 | 2000 req/15 min por IP permite fuerza bruta contra login y bombardeo de `forgot-password` |
 | **Refresh tokens de 30 días sin revocación** | 🟠 | JWT puro. Mitigado en parte: `/auth/refresh` revalida que el usuario exista y esté activo |
 | **Filtro de contactos del chat solo en cliente** | 🟠 | El chat va directo a Firestore. Fuga de ingresos por desintermediación |
 | **Disco de 1 GB sin cuota por usuario** | 🟠 | Un usuario puede llenarlo. La tarea de limpieza ayuda pero no pone cuota |
-| **iOS no arranca** | 🔴 (solo iOS) | `com.example.hogarsos` y sin `GoogleService-Info.plist` |
+| ~~**iOS no arranca**~~ | ✅ [ACTUALIZADO 2026-08-14] | Resuelto: `es.hogarsos.app` + `GoogleService-Info.plist` añadido, Build 35 subido y validado |
 
 ### 5.2 Riesgos aceptados deliberadamente
 
@@ -427,26 +429,25 @@ Se comporta igual en test y en live: si los profesionales de prueba llegaron a `
 
 ### Stripe
 
-- [ ] Activar la cuenta (datos fiscales + cuenta bancaria).
-- [ ] Cambiar a modo **Live**; copiar `sk_live_...` y `pk_live_...`.
-- [ ] **Connect → Settings**: aceptar el acuerdo de plataforma y rellenar el perfil en modo Live (si no, el onboarding Express falla).
-- [ ] Crear el **webhook en modo Live** → `https://hogarsos.es/api/payments/webhook` con **5** eventos:
-  - `payment_intent.amount_capturable_updated`
-  - `payment_intent.payment_failed`
-  - `payment_intent.canceled`
-  - `account.updated`
-  - `charge.dispute.created`
-- [ ] Copiar el **Signing secret** (`whsec_...`) de ese endpoint Live (es **distinto** del de test).
-- [ ] Probar **3D Secure** en test con `4000 0027 6000 3184`, incluyendo abandonar a mitad y reintentar.
+**[ACTUALIZADO 2026-08-14] Cuenta activada y modo Live confirmado en producción** (`acct_1TyVJ9CmpBOiu5cT`, webhook Live con 4 eventos — sin `account.updated`, cubierto por fallback vía `sincronizarEstadoCuentaStripe`, ver detalle en memoria del proyecto). Checklist original, para referencia:
+
+- [x] Activar la cuenta (datos fiscales + cuenta bancaria).
+- [x] Cambiar a modo **Live**; copiar `sk_live_...` y `pk_live_...`.
+- [x] **Connect → Settings**: aceptar el acuerdo de plataforma y rellenar el perfil en modo Live.
+- [x] Crear el **webhook en modo Live** → `https://hogarsos.es/api/payments/webhook`.
+- [x] Copiar el **Signing secret** (`whsec_...`) de ese endpoint Live.
+- [ ] Probar **3D Secure** en test con `4000 0027 6000 3184` — el fix de código está desplegado, no hay confirmación registrada de una prueba real con banco.
 
 ### Render
 
-- [ ] `STRIPE_SECRET_KEY` = `sk_live_...`
-- [ ] `STRIPE_WEBHOOK_SECRET` = `whsec_...` del endpoint **Live**
-- [ ] `APP_BASE_URL` = `https://hogarsos.es` (**sin barra final**)
-- [ ] `SMTP_HOST / PORT / SECURE / USER / PASSWORD / FROM` (IONOS)
-- [ ] Desplegar y **confirmar en el log**: `[config] Configuración validada. Stripe en modo LIVE.`
-- [ ] `npx prisma migrate status` → las 3 migraciones aplicadas.
+**[ACTUALIZADO 2026-08-14]** Claves Live confirmadas en Render, deploy validado con `[config] Configuración validada. Stripe en modo LIVE.` en el log.
+
+- [x] `STRIPE_SECRET_KEY` = `sk_live_...`
+- [x] `STRIPE_WEBHOOK_SECRET` = `whsec_...` del endpoint **Live**
+- [x] `APP_BASE_URL` = `https://hogarsos.es`
+- [x] `SMTP_HOST / PORT / SECURE / USER / PASSWORD / FROM` (IONOS)
+- [x] Desplegar y confirmar en el log.
+- [ ] `npx prisma migrate status` → sin verificar en esta actualización, comprobar antes del lanzamiento final (incluye la migración nueva de RLS de `admin_actions`).
 
 ### Firebase
 
@@ -461,19 +462,21 @@ Se comporta igual en test y en live: si los profesionales de prueba llegaron a `
 
 ### Android
 
-- [ ] Sustituir el `defaultValue` `pk_test_...` por `pk_live_...` en `lib/main.dart` (~línea 32).
-- [ ] Verificar que `android/key.properties` existe (si no, el build **falla a propósito** desde esta fase).
-- [ ] `flutter build appbundle --release` y **comprobar que la app no arranca en la pantalla roja**.
-- [ ] Hacer un pago real pequeño (5-10 €) de principio a fin y comprobar que el profesional lo recibe.
+**[ACTUALIZADO 2026-08-14]**
+
+- [x] Sustituir el `defaultValue` `pk_test_...` por `pk_live_...` en `lib/main.dart`.
+- [x] Verificar que `android/key.properties` existe.
+- [x] `flutter build appbundle --release` sin caer en la pantalla roja.
+- [x] Pago real de prueba autorizado en Live sin errores (liberación al profesional con dinero Live real: sin confirmar registrada aún).
 
 ### iOS
 
-> **No publicable hoy.**
+> **[ACTUALIZADO 2026-08-14] Ya publicable.** Build 35 subido y validado en App Store Connect (solo warning informativo de MinimumOSVersion, no bloqueante hasta 2027). Notificaciones push y Apple Pay confirmados con pago real en iPhone.
 
-- [ ] Cambiar `PRODUCT_BUNDLE_IDENTIFIER` de `com.example.hogarsos` a `es.hogarsos.app` (Apple rechaza `com.example.*`).
-- [ ] Crear la app iOS en Firebase y añadir `ios/Runner/GoogleService-Info.plist` (sin él, `Firebase.initializeApp()` **crashea al arrancar**).
-- [ ] Verificar el esquema de deep link `hogarsos://` (ya declarado en `Info.plist`).
-- [ ] **No hace falta "Sign in with Apple"**: la regla 4.8 solo aplica con login social de terceros, y aquí solo hay email y teléfono.
+- [x] Cambiar `PRODUCT_BUNDLE_IDENTIFIER` de `com.example.hogarsos` a `es.hogarsos.app`.
+- [x] Crear la app iOS en Firebase y añadir `ios/Runner/GoogleService-Info.plist`.
+- [x] Verificar el esquema de deep link `hogarsos://` — confirmado en dispositivo real (arranque en frío y segundo plano).
+- [x] **No hace falta "Sign in with Apple"**: solo login por email y teléfono, la regla 4.8 no aplica.
 
 ---
 
@@ -647,11 +650,9 @@ flutter test      # esperado: 9/9
 
 ### ¿Firmarías esta arquitectura para producción?
 
-**Sí para Android. No para iOS.**
+**Sí para Android. [ACTUALIZADO 2026-08-14] También para iOS** — bundle id, Firebase y Stripe Live corregidos, Build 35 subido y validado, Apple Pay confirmado con pago real.
 
 Se firma la arquitectura de pagos, el control de acceso a archivos y la infraestructura de tareas programadas. Lo que mueve dinero y datos sensibles está resuelto **en la arquitectura, no parcheado**: la liberación es idempotente y reanudable con tres barreras contra el doble pago; hay una cola de reintento real en lugar de un comentario prometiéndola; los documentos de identidad ya no son públicos y el borrado de cuenta borra de verdad; y hay validación de arranque que impide desplegar fingiendo cobrar.
-
-iOS no se firma: no arranca.
 
 ### ¿Con qué nivel de confianza?
 
@@ -661,7 +662,7 @@ iOS no se firma: no arranca.
 
 **Media, en tres puntos concretos que deben constar:**
 
-1. **Nada se ha ejecutado contra Stripe Live.** Los tests son unitarios con Stripe mockeado. El arreglo de 3D Secure en particular es reciente y no se ha probado contra un banco real.
+1. **[ACTUALIZADO 2026-08-14]** Los tests siguen siendo unitarios con Stripe mockeado, pero **sí se ha ejecutado contra Stripe Live real**: pago inicial y ampliación autorizados en producción sin errores. El arreglo de 3D Secure sigue sin confirmación registrada de una prueba real con banco.
 2. **Las migraciones no se han aplicado a ninguna base de datos.** El backfill de B4 es SQL validado solo sintácticamente.
 3. **El comportamiento de `charges_enabled` en cuentas Connect de solo-transferencias no se pudo verificar** (§5.4).
 
