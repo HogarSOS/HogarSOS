@@ -119,4 +119,50 @@ describe('createPresupuesto', () => {
 
     expect(res.status).toHaveBeenCalledWith(400);
   });
+
+  // P2 #3 (auditoría 2026-08-14): el findFirst de arriba es solo
+  // fast-path — dos peticiones casi simultáneas pueden pasarlo ambas
+  // antes de que la primera haga el create. La garantía real es el
+  // índice único parcial `presupuestos_pendiente_unico`; en ese caso
+  // Postgres/Prisma rechaza el segundo create con P2002.
+  it('si el create choca con el índice único (P2002 — carrera con otra petición), devuelve el mismo 409 que el fast-path', async () => {
+    mockPrisma.presupuesto.create.mockRejectedValue({ code: 'P2002' });
+
+    const res = fakeRes();
+    await createPresupuesto(fakeReq({ id: 'sr-1' }, 'pro-1', { tipo: 'cerrado', monto: 100 }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'BUDGET_ALREADY_PENDING' }));
+  });
+
+  it('un error de Prisma que NO es P2002 no se convierte en 409 — se deja propagar tal cual', async () => {
+    const errorInesperado = { code: 'P2028', message: 'Transaction API error' };
+    mockPrisma.presupuesto.create.mockRejectedValue(errorInesperado);
+
+    const res = fakeRes();
+    await expect(
+      createPresupuesto(fakeReq({ id: 'sr-1' }, 'pro-1', { tipo: 'cerrado', monto: 100 }), res)
+    ).rejects.toBe(errorInesperado);
+
+    expect(res.status).not.toHaveBeenCalledWith(409);
+    expect(res.json).not.toHaveBeenCalled();
+  });
+
+  // Tras resolver un presupuesto anterior (aceptado o rechazado), el
+  // índice parcial (WHERE estado='pendiente') no debe estorbar: el
+  // profesional puede volver a enviar un presupuesto nuevo.
+  it('puede crear un nuevo presupuesto pendiente después de que el anterior quedó rechazado', async () => {
+    // El presupuesto anterior ya no está 'pendiente' — el findFirst
+    // (que solo busca estado: 'pendiente') no lo ve, igual que no lo
+    // vería el índice único parcial.
+    mockPrisma.presupuesto.create.mockResolvedValue({ id: 'pres-2', tipo: 'cerrado', estado: 'pendiente' });
+
+    const res = fakeRes();
+    await createPresupuesto(fakeReq({ id: 'sr-1' }, 'pro-1', { tipo: 'cerrado', monto: 150 }), res);
+
+    expect(mockPrisma.presupuesto.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ monto: 150 }) })
+    );
+    expect(res.status).toHaveBeenCalledWith(201);
+  });
 });

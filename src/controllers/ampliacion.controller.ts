@@ -70,12 +70,27 @@ export async function crearAmpliacion(req: Request, res: Response) {
     return res.status(409).json({ error: 'Ya hay una ampliación pendiente de respuesta', code: 'EXTENSION_ALREADY_PENDING' });
   }
 
-  const ampliacion = await prisma.ampliacion.create({
-    data:
-      presupuesto.tipo === 'por_horas'
-        ? { presupuestoId: presupuesto.id, horasAdicionales: parsed.data.horasAdicionales, mensaje: parsed.data.mensaje }
-        : { presupuestoId: presupuesto.id, montoAdicional: parsed.data.montoAdicional, mensaje: parsed.data.mensaje },
-  });
+  // El findFirst de arriba es solo fast-path — la garantía real es el
+  // índice único parcial `ampliaciones_pendiente_unico` (WHERE
+  // estado='pendiente'), sobre presupuesto_id. Sin él, dos peticiones
+  // casi simultáneas podían pasar ambas el findFirst y crear dos
+  // ampliaciones "pendiente" para el mismo presupuesto — mismo patrón
+  // ya cerrado en completeServiceRequest/CierreHoras (auditoría
+  // 2026-08-14).
+  let ampliacion;
+  try {
+    ampliacion = await prisma.ampliacion.create({
+      data:
+        presupuesto.tipo === 'por_horas'
+          ? { presupuestoId: presupuesto.id, horasAdicionales: parsed.data.horasAdicionales, mensaje: parsed.data.mensaje }
+          : { presupuestoId: presupuesto.id, montoAdicional: parsed.data.montoAdicional, mensaje: parsed.data.mensaje },
+    });
+  } catch (err: any) {
+    if (err?.code === 'P2002') {
+      return res.status(409).json({ error: 'Ya hay una ampliación pendiente de respuesta', code: 'EXTENSION_ALREADY_PENDING' });
+    }
+    throw err;
+  }
 
   enviarNotificacion(
     solicitud.clienteId,

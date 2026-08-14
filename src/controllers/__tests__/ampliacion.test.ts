@@ -137,4 +137,50 @@ describe('crearAmpliacion', () => {
     expect(res.status).toHaveBeenCalledWith(409);
     expect(mockPrisma.ampliacion.create).not.toHaveBeenCalled();
   });
+
+  // P2 #3 (auditoría 2026-08-14): el findFirst de arriba es solo
+  // fast-path — la garantía real es el índice único parcial
+  // `ampliaciones_pendiente_unico` (sobre presupuesto_id). En una
+  // carrera, Postgres/Prisma rechaza el segundo create con P2002.
+  it('si el create choca con el índice único (P2002 — carrera con otra petición), devuelve el mismo 409 que el fast-path', async () => {
+    mockPrisma.ampliacion.create.mockRejectedValue({ code: 'P2002' });
+
+    const res = fakeRes();
+    await crearAmpliacion(fakeReq({ id: 'sr-1' }, 'pro-1', { horasAdicionales: 2 }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'EXTENSION_ALREADY_PENDING' }));
+  });
+
+  it('un error de Prisma que NO es P2002 no se convierte en 409 — se deja propagar tal cual', async () => {
+    const errorInesperado = { code: 'P2028', message: 'Transaction API error' };
+    mockPrisma.ampliacion.create.mockRejectedValue(errorInesperado);
+
+    const res = fakeRes();
+    await expect(
+      crearAmpliacion(fakeReq({ id: 'sr-1' }, 'pro-1', { horasAdicionales: 2 }), res)
+    ).rejects.toBe(errorInesperado);
+
+    expect(res.status).not.toHaveBeenCalledWith(409);
+    expect(res.json).not.toHaveBeenCalled();
+  });
+
+  // Tras resolver una ampliación anterior (aceptada o rechazada), el
+  // índice parcial (WHERE estado='pendiente') no debe estorbar: el
+  // profesional puede volver a pedir una ampliación nueva sobre el
+  // mismo presupuesto.
+  it('puede crear una nueva ampliación pendiente después de que la anterior dejó de estar pendiente', async () => {
+    // La ampliación anterior ya no está 'pendiente' — el findFirst
+    // (que solo busca estado: 'pendiente') no lo ve, igual que no lo
+    // vería el índice único parcial.
+    mockPrisma.ampliacion.create.mockResolvedValue({ id: 'ampl-3', estado: 'pendiente' });
+
+    const res = fakeRes();
+    await crearAmpliacion(fakeReq({ id: 'sr-1' }, 'pro-1', { horasAdicionales: 3 }), res);
+
+    expect(mockPrisma.ampliacion.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ presupuestoId: 'pres-1', horasAdicionales: 3 }) })
+    );
+    expect(res.status).toHaveBeenCalledWith(201);
+  });
 });

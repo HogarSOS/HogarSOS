@@ -68,27 +68,41 @@ export async function createPresupuesto(req: Request, res: Response) {
     return res.status(409).json({ error: 'Ya hay un presupuesto pendiente de respuesta para esta solicitud', code: 'BUDGET_ALREADY_PENDING' });
   }
 
-  const presupuesto = await prisma.presupuesto.create({
-    data:
-      datos.tipo === 'cerrado'
-        ? {
-            serviceRequestId: id,
-            profesionalId,
-            tipo: 'cerrado',
-            monto: datos.monto,
-            mensaje: datos.mensaje,
-            incluyeIva: datos.incluyeIva,
-          }
-        : {
-            serviceRequestId: id,
-            profesionalId,
-            tipo: 'por_horas',
-            tarifaHora: datos.tarifaHora,
-            horasEstimadas: datos.horasEstimadas,
-            mensaje: datos.mensaje,
-            incluyeIva: datos.incluyeIva,
-          },
-  });
+  // El findFirst de arriba es solo fast-path — la garantía real es el
+  // índice único parcial `presupuestos_pendiente_unico` (WHERE
+  // estado='pendiente'). Sin él, dos peticiones casi simultáneas
+  // podían pasar ambas el findFirst y crear dos presupuestos
+  // "pendiente" para la misma solicitud — mismo patrón ya cerrado en
+  // completeServiceRequest/CierreHoras (auditoría 2026-08-14).
+  let presupuesto;
+  try {
+    presupuesto = await prisma.presupuesto.create({
+      data:
+        datos.tipo === 'cerrado'
+          ? {
+              serviceRequestId: id,
+              profesionalId,
+              tipo: 'cerrado',
+              monto: datos.monto,
+              mensaje: datos.mensaje,
+              incluyeIva: datos.incluyeIva,
+            }
+          : {
+              serviceRequestId: id,
+              profesionalId,
+              tipo: 'por_horas',
+              tarifaHora: datos.tarifaHora,
+              horasEstimadas: datos.horasEstimadas,
+              mensaje: datos.mensaje,
+              incluyeIva: datos.incluyeIva,
+            },
+    });
+  } catch (err: any) {
+    if (err?.code === 'P2002') {
+      return res.status(409).json({ error: 'Ya hay un presupuesto pendiente de respuesta para esta solicitud', code: 'BUDGET_ALREADY_PENDING' });
+    }
+    throw err;
+  }
 
   enviarNotificacion(solicitud.clienteId, 'nuevo_presupuesto', {}, { solicitudId: id }).catch((e) =>
     console.error(`[createPresupuesto] Error al notificar al cliente de ${id}:`, e)
