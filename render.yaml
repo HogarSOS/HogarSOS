@@ -73,6 +73,15 @@ services:
         sync: false
       - key: FIREBASE_PRIVATE_KEY
         sync: false
+      # Usada solo por passwordReset.routes.ts (Web API Key de Firebase,
+      # pública por diseño — es la misma clase de clave que la
+      # publishable key de Stripe, no un secreto de servidor). El código
+      # todavía tiene un fallback hardcodeado con el valor actual por si
+      # esta variable faltara en Render; limpieza pendiente: confirmar
+      # que Render ya la tiene puesta y entonces retirar el fallback del
+      # código (auditoría pre-lanzamiento, 2026-08-14).
+      - key: FIREBASE_WEB_API_KEY
+        sync: false
       # LANZAMIENTO (auditoría B1): debe ser la clave sk_live_... de la
       # cuenta real. Con NODE_ENV=production y una sk_test, el arranque
       # aborta a propósito (usa ALLOW_STRIPE_TEST_IN_PRODUCTION=true si

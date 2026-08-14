@@ -31,7 +31,12 @@ import { Router } from 'express';
  */
 const router = Router();
 
-const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyDknprwo1qH3bd4x_lD9AsUh8pVH06zxsk';
+// Documentada en render.yaml como FIREBASE_WEB_API_KEY (sync: false).
+// Confirmado en Render (auditoría pre-lanzamiento, 2026-08-14) que la
+// variable ya está configurada — sin fallback hardcodeado, igual que el
+// resto de configuración obligatoria del backend (ver JWT_SECRET en
+// auth.middleware.ts).
+const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY as string;
 
 function paginaResetPassword(): string {
   return `<!DOCTYPE html>
