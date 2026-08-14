@@ -36,6 +36,7 @@ import {
   obtenerResumenPagos,
   obtenerOCrearStripeCustomerId,
   createEscrowPaymentIntent,
+  reautorizarPaymentIntent,
   listarPagosAtascados,
   reintentarLiberacion,
 } from '../payment.service';
@@ -194,6 +195,123 @@ describe('createEscrowPaymentIntent', () => {
   });
 });
 
+/**
+ * B5: una fila Payment con estado 'reembolsado' porque su autorización
+ * caducó en Stripe (~7 días sin capturar). Todo el bloque parte de esta
+ * fila "muerta" con intentosAutorizacion: 0 salvo que un test concreto
+ * la sobreescriba.
+ */
+describe('reautorizarPaymentIntent (B5)', () => {
+  const pagoMuerto = (overrides: Partial<Record<string, unknown>> = {}) => ({
+    id: 'pago-viejo',
+    serviceRequestId: 'sr-1',
+    presupuestoId: 'pres-1',
+    ampliacionId: null,
+    estado: 'reembolsado',
+    stripePaymentIntentId: 'pi_viejo_canceled',
+    montoBase: 180,
+    montoTotal: 189,
+    comisionPlataforma: 9,
+    intentosAutorizacion: 0,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockStripe.ephemeralKeys.create.mockResolvedValue({ secret: 'ek_nueva' });
+    mockStripe.paymentIntents.create.mockResolvedValue({ id: 'pi_nuevo_2', client_secret: 'secret_nuevo_2' });
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.payment.findUniqueOrThrow.mockResolvedValue({
+      id: 'pago-viejo',
+      estado: 'pendiente',
+      stripePaymentIntentId: 'pi_nuevo_2',
+      montoBase: 180,
+      montoTotal: 189,
+      comisionPlataforma: 9,
+      intentosAutorizacion: 1,
+    });
+  });
+
+  it('crea un PaymentIntent NUEVO en Stripe, distinto del cancelado, y devuelve su client_secret', async () => {
+    const resultado = await reautorizarPaymentIntent(pagoMuerto() as any, 'cus_123');
+
+    expect(mockStripe.paymentIntents.create).toHaveBeenCalledTimes(1);
+    const [params] = mockStripe.paymentIntents.create.mock.calls[0];
+    expect(params.amount).toBe(18900); // montoTotal guardado (189) * 100, no recalculado
+    expect(params.capture_method).toBe('manual');
+
+    expect(resultado.clientSecret).toBe('secret_nuevo_2');
+    expect(resultado.clientSecret).not.toBe('pi_viejo_canceled');
+  });
+
+  it('actualiza la MISMA fila Payment (no crea una fila nueva)', async () => {
+    await reautorizarPaymentIntent(pagoMuerto() as any, 'cus_123');
+
+    expect(mockPrisma.payment.create).not.toHaveBeenCalled();
+    expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: 'pago-viejo', stripePaymentIntentId: 'pi_viejo_canceled' },
+      data: {
+        stripePaymentIntentId: 'pi_nuevo_2',
+        estado: 'pendiente',
+        avisoCaducidadEnviadoAt: null,
+        intentosAutorizacion: 1,
+      },
+    });
+  });
+
+  it('usa la idempotency key intent_retry_<id>_<intento> derivada del id de la fila', async () => {
+    await reautorizarPaymentIntent(pagoMuerto({ intentosAutorizacion: 0 }) as any, 'cus_123');
+
+    expect(mockStripe.paymentIntents.create).toHaveBeenCalledWith(
+      expect.anything(),
+      { idempotencyKey: 'intent_retry_pago-viejo_1' }
+    );
+  });
+
+  it('doble clic simultáneo: misma fila y misma idempotency key en ambas llamadas', async () => {
+    const pago = pagoMuerto();
+
+    await Promise.all([
+      reautorizarPaymentIntent(pago as any, 'cus_123'),
+      reautorizarPaymentIntent(pago as any, 'cus_123'),
+    ]);
+
+    expect(mockStripe.paymentIntents.create).toHaveBeenCalledTimes(2);
+    const claves = mockStripe.paymentIntents.create.mock.calls.map((c: any[]) => c[1].idempotencyKey);
+    // Las dos llamadas parten del MISMO pago.intentosAutorizacion (0, leído
+    // antes de que ninguna escriba) -> misma clave en Stripe en las dos, que
+    // es justo lo que hace que Stripe devuelva el mismo PaymentIntent a
+    // ambas en vez de crear dos autorizaciones distintas.
+    expect(claves[0]).toBe(claves[1]);
+    expect(claves[0]).toBe('intent_retry_pago-viejo_1');
+  });
+
+  it('segunda caducidad de la MISMA fila: usa el intento 2, no reutiliza la clave del intento 1', async () => {
+    await reautorizarPaymentIntent(pagoMuerto({ intentosAutorizacion: 1 }) as any, 'cus_123');
+
+    expect(mockStripe.paymentIntents.create).toHaveBeenCalledWith(
+      expect.anything(),
+      { idempotencyKey: 'intent_retry_pago-viejo_2' }
+    );
+    expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ intentosAutorizacion: 2 }) })
+    );
+  });
+
+  it('el importe sale exclusivamente de montoBase/montoTotal/comisionPlataforma ya guardados, nunca se recalcula ni acepta un valor externo', async () => {
+    // Un montoBase distinto al montoTotal ya guardado simularía que el
+    // presupuesto cambió después de la autorización original — la
+    // reautorización NO debe leerlo, solo debe usar lo ya persistido.
+    await reautorizarPaymentIntent(
+      pagoMuerto({ montoBase: 999, montoTotal: 189, comisionPlataforma: 9 }) as any,
+      'cus_123'
+    );
+
+    const [params] = mockStripe.paymentIntents.create.mock.calls[0];
+    expect(params.amount).toBe(18900); // deriva de montoTotal (189), no de montoBase (999)
+  });
+});
+
 describe('releasePayments', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -267,6 +385,35 @@ describe('releasePayments', () => {
 
     await releasePayments('sr-1', 100);
 
+    expect(mockStripe.transfers.create).toHaveBeenCalledWith(
+      expect.objectContaining({ source_transaction: 'ch_456' }),
+      { idempotencyKey: 'trf_pago-1' }
+    );
+  });
+
+  /**
+   * B5: una fila que ya pasó por reautorizarPaymentIntent (intentosAutorizacion: 1,
+   * stripePaymentIntentId apuntando al PaymentIntent nuevo, estado ya
+   * 'retenido' porque el webhook confirmó la reautorización) debe
+   * capturarse y liberarse exactamente igual que una fila nunca
+   * reautorizada — releasePayments no debe tratarlas distinto.
+   */
+  it('captura y transfiere igual una fila reautorizada (intentosAutorizacion > 0) que una normal', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([
+      pagoRetenido({ stripePaymentIntentId: 'pi_reautorizado', intentosAutorizacion: 1 }),
+    ]);
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
+    mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_reautorizado', latest_charge: 'ch_456' });
+    mockStripe.transfers.create.mockResolvedValue({ id: 'tr_789' });
+    mockPrisma.payment.update.mockResolvedValue({ estado: 'liberado' });
+
+    await releasePayments('sr-1', 100);
+
+    expect(mockStripe.paymentIntents.capture).toHaveBeenCalledWith(
+      'pi_reautorizado',
+      undefined,
+      { idempotencyKey: 'cap_pago-1' }
+    );
     expect(mockStripe.transfers.create).toHaveBeenCalledWith(
       expect.objectContaining({ source_transaction: 'ch_456' }),
       { idempotencyKey: 'trf_pago-1' }

@@ -4,12 +4,14 @@ import { stripe } from '../config/stripe';
 import { prisma } from '../config/prisma';
 import {
   createEscrowPaymentIntent,
+  reautorizarPaymentIntent,
   obtenerResumenPagos,
   obtenerOCrearStripeCustomerId,
   crearEphemeralKey,
   COMISION_CLIENTE_PORCENTAJE,
   COMISION_PROFESIONAL_PORCENTAJE,
 } from '../services/payment.service';
+import { Payment } from '@prisma/client';
 import { enviarNotificacion } from '../services/notification.service';
 import { enviarEmail } from '../services/email.service';
 import { sincronizarEstadoCuentaStripe } from '../services/professional.service';
@@ -48,19 +50,56 @@ const createIntentSchema = z.object({
  *
  * Devolver el mismo `client_secret` permite al Payment Sheet retomar la
  * autenticación donde se quedó, que es el comportamiento que Stripe
- * espera.
+ * espera. `canceled` NO está aquí (auditoría B5): es un estado terminal
+ * en Stripe, reconfirmar ese mismo PaymentIntent falla siempre — ver
+ * `intentarRetomarPago`, que lo trata como reautorización, no como
+ * reintento.
  */
-const ESTADOS_STRIPE_ABANDONABLES = new Set([
+const ESTADOS_STRIPE_REANUDABLES = new Set([
   'requires_payment_method',
-  'canceled',
   'requires_action',
   'requires_confirmation',
 ]);
 
-async function intentoAbandonado(pago: { stripePaymentIntentId: string | null }) {
+/**
+ * Decide qué hacer con una autorización existente cuando el cliente
+ * vuelve a pulsar "pagar": retomarla tal cual si Stripe la considera
+ * reanudable, reautorizarla desde cero (B5) si Stripe ya la canceló por
+ * caducidad, o no hacer nada (null) si sigue viva/ya confirmada — en ese
+ * caso el llamador sigue su lógica normal (buscar ampliación pendiente o
+ * devolver 409).
+ */
+async function intentarRetomarPago(pago: Payment, clienteStripeCustomerId: string) {
   if (!pago.stripePaymentIntentId) return null;
   const paymentIntent = await stripe.paymentIntents.retrieve(pago.stripePaymentIntentId);
-  return ESTADOS_STRIPE_ABANDONABLES.has(paymentIntent.status) ? paymentIntent.client_secret : null;
+
+  if (ESTADOS_STRIPE_REANUDABLES.has(paymentIntent.status)) {
+    return {
+      paymentId: pago.id,
+      clientSecret: paymentIntent.client_secret,
+      montoBase: Number(pago.montoBase),
+      montoTotal: Number(pago.montoTotal),
+      comisionPlataforma: Number(pago.comisionPlataforma),
+      customerId: clienteStripeCustomerId,
+      ephemeralKeySecret: await crearEphemeralKey(clienteStripeCustomerId),
+    };
+  }
+
+  if (paymentIntent.status === 'canceled') {
+    const { pago: pagoReautorizado, clientSecret, customerId, ephemeralKeySecret } =
+      await reautorizarPaymentIntent(pago, clienteStripeCustomerId);
+    return {
+      paymentId: pagoReautorizado.id,
+      clientSecret,
+      montoBase: Number(pagoReautorizado.montoBase),
+      montoTotal: Number(pagoReautorizado.montoTotal),
+      comisionPlataforma: Number(pagoReautorizado.comisionPlataforma),
+      customerId,
+      ephemeralKeySecret,
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -126,17 +165,9 @@ export async function createPaymentIntent(req: Request, res: Response) {
         ? Number(presupuesto.monto)
         : Number(presupuesto.tarifaHora) * Number(presupuesto.horasEstimadas);
   } else {
-    const reintentoInicial = await intentoAbandonado(pagoInicial);
+    const reintentoInicial = await intentarRetomarPago(pagoInicial, stripeCustomerId);
     if (reintentoInicial) {
-      return res.status(201).json({
-        paymentId: pagoInicial.id,
-        clientSecret: reintentoInicial,
-        montoBase: Number(pagoInicial.montoBase),
-        montoTotal: Number(pagoInicial.montoTotal),
-        comisionPlataforma: Number(pagoInicial.comisionPlataforma),
-        customerId: stripeCustomerId,
-        ephemeralKeySecret: await crearEphemeralKey(stripeCustomerId),
-      });
+      return res.status(201).json(reintentoInicial);
     }
 
     const ampliacionSinAutorizar = presupuesto.ampliaciones.find(
@@ -144,17 +175,11 @@ export async function createPaymentIntent(req: Request, res: Response) {
     );
     if (!ampliacionSinAutorizar) {
       const ultimoPagoAmpliacion = [...solicitud.pagos].reverse().find((p) => p.ampliacionId);
-      const reintentoAmpliacion = ultimoPagoAmpliacion ? await intentoAbandonado(ultimoPagoAmpliacion) : null;
-      if (reintentoAmpliacion && ultimoPagoAmpliacion) {
-        return res.status(201).json({
-          paymentId: ultimoPagoAmpliacion.id,
-          clientSecret: reintentoAmpliacion,
-          montoBase: Number(ultimoPagoAmpliacion.montoBase),
-          montoTotal: Number(ultimoPagoAmpliacion.montoTotal),
-          comisionPlataforma: Number(ultimoPagoAmpliacion.comisionPlataforma),
-          customerId: stripeCustomerId,
-          ephemeralKeySecret: await crearEphemeralKey(stripeCustomerId),
-        });
+      const reintentoAmpliacion = ultimoPagoAmpliacion
+        ? await intentarRetomarPago(ultimoPagoAmpliacion, stripeCustomerId)
+        : null;
+      if (reintentoAmpliacion) {
+        return res.status(201).json(reintentoAmpliacion);
       }
       return res.status(409).json({ error: 'No hay nada pendiente de autorizar para esta solicitud', code: 'PAYMENT_NOTHING_PENDING' });
     }

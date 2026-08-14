@@ -84,6 +84,32 @@ describe('stripeWebhook — precondiciones de estado (auditoría, hallazgo #6)',
     });
   });
 
+  // B5: tras reautorizarPaymentIntent, la fila Payment ya no tiene el
+  // stripePaymentIntentId viejo (se sobrescribió por el nuevo) — un
+  // webhook `canceled` tardío del PaymentIntent viejo que llega DESPUÉS
+  // de la reautorización no encuentra ninguna fila con ese id (count: 0)
+  // y no debe tocar ni revertir la fila ya reautorizada.
+  it('un webhook canceled tardío del PaymentIntent viejo tras reautorizar (B5) no encuentra fila y no revierte nada', async () => {
+    mockStripe.webhooks.constructEvent.mockReturnValue({
+      type: 'payment_intent.canceled',
+      data: { object: { id: 'pi_viejo_canceled' } },
+    });
+    // La fila ya fue reautorizada: su stripePaymentIntentId ahora es
+    // 'pi_nuevo_2', así que el updateMany por 'pi_viejo_canceled' no
+    // encuentra ninguna coincidencia.
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+    const res = fakeRes();
+    await stripeWebhook(fakeReq(), res);
+
+    expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { stripePaymentIntentId: 'pi_viejo_canceled', estado: { in: ['pendiente', 'retenido'] } },
+      data: { estado: 'reembolsado' },
+    });
+    // No lanza, responde igual que cualquier webhook procesado sin más efecto.
+    expect(res.status).not.toHaveBeenCalledWith(400);
+  });
+
   // Bug real encontrado en QA (2026-08-08): createEscrowPaymentIntent crea
   // la fila Payment en 'pendiente' en cuanto se crea el PaymentIntent en
   // Stripe, ANTES de que el cliente confirme nada — si nunca confirma

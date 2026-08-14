@@ -271,6 +271,85 @@ export async function createEscrowPaymentIntent(params: {
 }
 
 /**
+ * B5: una autorización con capture_method: 'manual' caduca sola en
+ * Stripe a los ~7 días si nadie la captura (ver autorizacionesPorCaducar.job.ts,
+ * que ya detecta esto y marca la fila como 'reembolsado'). Reintentar el
+ * pago con el client_secret del PaymentIntent caducado no funciona nunca:
+ * 'canceled' es un estado terminal en Stripe, no se puede reconfirmar.
+ *
+ * Esta función crea un PaymentIntent NUEVO en Stripe pero reutiliza la
+ * MISMA fila Payment (UPDATE, no INSERT) — Payment no tiene restricción
+ * única sobre (presupuestoId, ampliacionId), así que insertar una fila
+ * nueva dejaría dos filas para la misma autorización y rompería la
+ * asunción de "una fila por presupuesto/ampliación" que usan
+ * releasePayments, refundPayment, listarPagosAtascados y el panel admin.
+ *
+ * Idempotencia: la clave `intent_retry_<pago.id>_<intento>` se deriva del
+ * id de la fila (estable entre clics) y de un contador que solo avanza
+ * al reautorizar — dos clics simultáneos sobre la misma fila calculan la
+ * MISMA clave y Stripe devuelve el mismo PaymentIntent a ambos, igual
+ * que ya protege createEscrowPaymentIntent la autorización original.
+ */
+export async function reautorizarPaymentIntent(
+  pago: Payment,
+  clienteStripeCustomerId: string
+) {
+  const ephemeralKeySecret = await crearEphemeralKey(clienteStripeCustomerId);
+  const numeroIntento = pago.intentosAutorizacion + 1;
+  const idempotencyKey = `intent_retry_${pago.id}_${numeroIntento}`;
+
+  const paymentIntent = await stripe.paymentIntents.create(
+    {
+      // Importe ya fijado en la fila desde la autorización original —
+      // nunca se recalcula desde el presupuesto ni se acepta del cliente.
+      amount: Math.round(Number(pago.montoTotal) * 100),
+      currency: 'eur',
+      capture_method: 'manual',
+      payment_method_types: ['card'],
+      customer: clienteStripeCustomerId,
+      setup_future_usage: 'off_session',
+      metadata: {
+        serviceRequestId: pago.serviceRequestId,
+        presupuestoId: pago.presupuestoId,
+        ...(pago.ampliacionId ? { ampliacionId: pago.ampliacionId } : {}),
+        // Trazabilidad sin columna nueva: el PaymentIntent caducado sigue
+        // existiendo en Stripe para siempre, buscable por esta metadata
+        // desde el dashboard si hace falta reconstruir la cadena.
+        paymentIntentIdAnterior: pago.stripePaymentIntentId ?? '',
+      },
+    },
+    { idempotencyKey }
+  );
+
+  // Condicionado al stripePaymentIntentId que el llamador ya comprobó
+  // como 'canceled' en Stripe — NO a estado: 'reembolsado', porque
+  // autorizacionesPorCaducar.job.ts corre cada 6h y puede no haber
+  // marcado la fila todavía aunque Stripe ya haya cancelado la
+  // autorización de verdad. Si una petición concurrente con la misma
+  // idempotency key ya aplicó este mismo cambio, count sale en 0 — no es
+  // un error, Stripe ya devolvió el mismo PaymentIntent a ambas y el
+  // findUniqueOrThrow de abajo recoge esa fila ya actualizada.
+  await prisma.payment.updateMany({
+    where: { id: pago.id, stripePaymentIntentId: pago.stripePaymentIntentId },
+    data: {
+      stripePaymentIntentId: paymentIntent.id,
+      estado: 'pendiente',
+      avisoCaducidadEnviadoAt: null,
+      intentosAutorizacion: numeroIntento,
+    },
+  });
+
+  const pagoActualizado = await prisma.payment.findUniqueOrThrow({ where: { id: pago.id } });
+
+  return {
+    pago: pagoActualizado,
+    clientSecret: paymentIntent.client_secret,
+    customerId: clienteStripeCustomerId,
+    ephemeralKeySecret,
+  };
+}
+
+/**
  * Toma el lease de liberación de una solicitud. Atómico: el `updateMany`
  * condicional es la única sección crítica: si dos peticiones entran a la
  * vez (doble clic del admin, webhook + cierre manual...), solo una ve

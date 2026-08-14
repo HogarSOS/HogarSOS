@@ -228,6 +228,22 @@ model Payment {
   // Stripe mantiene un cargo autorizado sin capturar). Evita repetir el
   // aviso en cada pasada de la tarea programada.
   avisoCaducidadEnviadoAt DateTime?    @map("aviso_caducidad_enviado_at")
+  // B5 — cuántas veces se ha reautorizado esta misma fila tras una
+  // caducidad (0 = autorización original, nunca reautorizada). Mismo
+  // patrón que intentosLiberacion: sirve para que la idempotency key de
+  // cada reautorización (intent_retry_<id>_<intentosAutorizacion>) sea
+  // distinta de la anterior, evitando que Stripe devuelva desde caché el
+  // PaymentIntent ya caducado de un intento previo si esta misma fila
+  // vuelve a caducar una segunda vez.
+  //
+  // No se guarda el stripePaymentIntentId anterior al reautorizar (se
+  // sobrescribe): añadir una columna nueva solo para eso no aporta nada
+  // que Stripe no tenga ya — el PaymentIntent cancelado sigue existiendo
+  // en Stripe para siempre, buscable por metadata.presupuestoId/
+  // ampliacionId, y cada reautorización guarda el id anterior en la
+  // metadata del PaymentIntent nuevo (paymentIntentIdAnterior) por si
+  // hace falta reconstruir la cadena desde el dashboard de Stripe.
+  intentosAutorizacion  Int          @default(0) @map("intentos_autorizacion")
 
   serviceRequest        ServiceRequest @relation(fields: [serviceRequestId], references: [id])
   presupuesto           Presupuesto    @relation(fields: [presupuestoId], references: [id])
