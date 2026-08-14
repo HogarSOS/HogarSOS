@@ -25,6 +25,7 @@ import { authMiddleware } from './middlewares/auth.middleware';
 import { prisma } from './config/prisma';
 import { TAREAS, iniciarScheduler, detenerScheduler } from './jobs';
 import { validarConfiguracionOAbortar } from './config/validateEnv';
+import { sanitizarUrlParaLog } from './utils/sanitizarUrlParaLog';
 
 dotenv.config();
 
@@ -108,7 +109,7 @@ app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
   const inicio = Date.now();
   res.on('finish', () => {
-    console.log(`[req] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - inicio}ms)`);
+    console.log(`[req] ${req.method} ${sanitizarUrlParaLog(req.originalUrl)} -> ${res.statusCode} (${Date.now() - inicio}ms)`);
   });
   next();
 });

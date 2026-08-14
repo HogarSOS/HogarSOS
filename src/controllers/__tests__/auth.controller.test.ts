@@ -203,6 +203,27 @@ describe('forgotPassword', () => {
     expect(res.status).toHaveBeenCalledWith(400);
     expect(mockFirebaseAuth.generatePasswordResetLink).not.toHaveBeenCalled();
   });
+
+  // Auditoría P1 (2026-08-14): antes este error interpolaba el enlace
+  // completo de Firebase (con el oobCode) en el mensaje, que console.error
+  // volcaba tal cual a los logs de Render — un segundo camino de fuga del
+  // mismo secreto que el logger global (ver sanitizarUrlParaLog.test.ts).
+  it('si el enlace de Firebase no trae oobCode, el error registrado en logs no contiene el enlace completo', async () => {
+    const linkSinOobCode = 'https://firebase.example/action?mode=resetPassword&otro=x';
+    mockFirebaseAuth.generatePasswordResetLink.mockResolvedValue(linkSinOobCode);
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const res = fakeRes();
+
+    await forgotPassword(fakeReq({ email: 'ana@example.com' }), res);
+
+    expect(consoleErrorSpy).toHaveBeenCalled();
+    const loggedError = consoleErrorSpy.mock.calls[0][1] as Error;
+    expect(loggedError.message).not.toContain(linkSinOobCode);
+    expect(loggedError.message).not.toContain('firebase.example');
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+
+    consoleErrorSpy.mockRestore();
+  });
 });
 
 describe('refreshToken', () => {

@@ -208,7 +208,7 @@ export async function forgotPassword(req: Request, res: Response) {
     const link = await firebaseAuth.generatePasswordResetLink(email);
     const oobCode = new URL(link).searchParams.get('oobCode');
     if (!oobCode) {
-      throw new Error(`Enlace de Firebase sin oobCode: ${link}`);
+      throw new Error('Enlace de Firebase sin oobCode');
     }
 
     const enlacePropio = `https://hogarsos.es/auth/reset-password?mode=resetPassword&oobCode=${encodeURIComponent(oobCode)}`;
