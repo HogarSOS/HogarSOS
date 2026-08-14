@@ -172,6 +172,62 @@ describe('completeServiceRequest', () => {
 
     expect(res.status).toHaveBeenCalledWith(403);
   });
+
+  // Protección anti-evasión de comisión (auditoría 2026-08-14): un
+  // presupuesto por_horas autoriza tarifaHora × horasEstimadas en
+  // Stripe, pero lo que de verdad se cobra y comisiona es tarifaHora ×
+  // horasReales, un valor que declara libremente el profesional. Estos
+  // casos (D/E/F del pedido) prueban el suelo UMBRAL_MINIMO_ABSOLUTO_HORAS.
+  describe('protección anti-evasión: horasReales', () => {
+    beforeEach(() => {
+      mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+        id: 'sr-1',
+        clienteId: 'cliente-1',
+        profesionalId: 'pro-1',
+        estado: 'aceptada',
+        presupuestos: [{ id: 'pres-1', tipo: 'por_horas', tarifaHora: 50, horasEstimadas: 10 }],
+      });
+      mockPrisma.cierreHoras.findFirst.mockResolvedValue(null);
+    });
+
+    it('D) horasReales = 0: rechazado por el propio esquema (positive()), no llega a crear el cierre', async () => {
+      const res = fakeRes();
+      await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1', { horasReales: 0 }), res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'VALIDATION_INVALID' }));
+      expect(mockPrisma.cierreHoras.create).not.toHaveBeenCalled();
+    });
+
+    it('E) horasReales negativas: rechazado por el propio esquema (positive())', async () => {
+      const res = fakeRes();
+      await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1', { horasReales: -3 }), res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'VALIDATION_INVALID' }));
+      expect(mockPrisma.cierreHoras.create).not.toHaveBeenCalled();
+    });
+
+    it('F) horasReales absurdamente pequeñas (0.2h, por debajo del suelo de 0.5h): bloqueado con HOURS_TOO_LOW', async () => {
+      const res = fakeRes();
+      await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1', { horasReales: 0.2 }), res);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'HOURS_TOO_LOW' }));
+      expect(mockPrisma.cierreHoras.create).not.toHaveBeenCalled();
+    });
+
+    it('un valor justo en el suelo (0.5h) sí se acepta y crea el cierre pendiente', async () => {
+      mockPrisma.cierreHoras.create.mockResolvedValue({ id: 'cierre-1', horasReales: 0.5 });
+      const res = fakeRes();
+      await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1', { horasReales: 0.5 }), res);
+
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(mockPrisma.cierreHoras.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ horasReales: 0.5 }) })
+      );
+    });
+  });
 });
 
 describe('responderCierreHoras', () => {
@@ -246,5 +302,97 @@ describe('responderCierreHoras', () => {
     await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar' }), res);
 
     expect(res.status).toHaveBeenCalledWith(404);
+  });
+
+  // Protección anti-evasión de comisión (auditoría 2026-08-14): gate de
+  // confirmación explícita cuando horasReales cae muy por debajo de
+  // horasEstimadas (UMBRAL_RATIO_REDUCCION_ANOMALA = 50%). Presupuesto
+  // fijo para todos estos casos: 50€/h × 10h estimadas = 500€ de base
+  // autorizada en Stripe (el escenario exacto pedido en la auditoría).
+  describe('protección anti-evasión: reducción anómala', () => {
+    beforeEach(() => {
+      mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+        id: 'sr-1',
+        clienteId: 'cliente-1',
+        profesionalId: 'pro-1',
+        presupuestos: [{ id: 'pres-1', tipo: 'por_horas', tarifaHora: 50, horasEstimadas: 10 }],
+      });
+    });
+
+    it('A) horasReales normales (10 de 10 estimadas, 100%): se acepta directamente, sin pedir confirmación', async () => {
+      mockPrisma.cierreHoras.findUnique.mockResolvedValue({
+        id: 'cierre-1', serviceRequestId: 'sr-1', horasReales: 10, estado: 'pendiente',
+      });
+
+      const res = fakeRes();
+      await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar' }), res);
+
+      expect(mockPrisma.cierreHoras.updateMany).toHaveBeenCalled();
+      // G) cálculo final: 50€/h × 10h = 500€.
+      expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ precioFinal: 500 }) })
+      );
+      expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 500);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ estado: 'aceptado' }));
+    });
+
+    it('B) horasReales ligeramente inferiores (7 de 10, 70%): por encima del umbral, se acepta directamente', async () => {
+      mockPrisma.cierreHoras.findUnique.mockResolvedValue({
+        id: 'cierre-1', serviceRequestId: 'sr-1', horasReales: 7, estado: 'pendiente',
+      });
+
+      const res = fakeRes();
+      await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar' }), res);
+
+      expect(mockPrisma.cierreHoras.updateMany).toHaveBeenCalled();
+      // G) cálculo final: 50€/h × 7h = 350€.
+      expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ precioFinal: 350 }) })
+      );
+      expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 350);
+    });
+
+    it('C) reducción muy grande (escenario de la auditoría: 1 de 10h, 10%) sin confirmación: 409, no toca el estado ni libera nada', async () => {
+      mockPrisma.cierreHoras.findUnique.mockResolvedValue({
+        id: 'cierre-1', serviceRequestId: 'sr-1', horasReales: 1, estado: 'pendiente',
+      });
+
+      const res = fakeRes();
+      await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          code: 'HOURS_REDUCTION_CONFIRMATION_REQUIRED',
+          horasReales: 1,
+          horasEstimadas: 10,
+          porcentaje: 10,
+        })
+      );
+      // El cierre sigue pendiente — nada de esto se ejecutó todavía.
+      expect(mockPrisma.cierreHoras.updateMany).not.toHaveBeenCalled();
+      expect(mockPrisma.serviceRequest.update).not.toHaveBeenCalled();
+      expect(mockReleasePayments).not.toHaveBeenCalled();
+    });
+
+    it('C) la misma reducción del 10%, CON confirmarReduccionGrande: se acepta y libera solo el importe real', async () => {
+      mockPrisma.cierreHoras.findUnique.mockResolvedValue({
+        id: 'cierre-1', serviceRequestId: 'sr-1', horasReales: 1, estado: 'pendiente',
+      });
+
+      const res = fakeRes();
+      await responderCierreHoras(
+        fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar', confirmarReduccionGrande: true }),
+        res
+      );
+
+      expect(mockPrisma.cierreHoras.updateMany).toHaveBeenCalled();
+      // G) cálculo final: 50€/h × 1h = 50€ — nunca los 500€ autorizados.
+      expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ precioFinal: 50 }) })
+      );
+      expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 50);
+      expect(res.status).not.toHaveBeenCalledWith(409);
+    });
   });
 });

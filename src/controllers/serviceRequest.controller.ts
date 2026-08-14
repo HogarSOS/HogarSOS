@@ -18,6 +18,50 @@ const RADIO_BUSQUEDA_METROS = 50000; // 50 km, ajustable por categoría en el fu
 // de llegar.
 const SOLICITUD_EXPIRA_HORAS = 48;
 
+// Protección anti-evasión de comisión en presupuestos "por_horas"
+// (auditoría 2026-08-14): el cliente autoriza en Stripe tarifaHora ×
+// horasEstimadas, pero el importe que de verdad se captura y comisiona
+// es tarifaHora × horasReales, un número que declara el profesional
+// libremente al cerrar. Sin ningún control, un profesional (a veces en
+// connivencia con el cliente) puede declarar unas horasReales muy por
+// debajo de lo estimado — el resto de la autorización se libera sola,
+// sin cobrar nada, y esa diferencia puede pagarse en mano fuera de la
+// app. Dos umbrales, con objetivos distintos:
+//
+// - UMBRAL_MINIMO_ABSOLUTO_HORAS: un suelo físico, independiente de la
+//   estimación. Ningún servicio a domicilio real de este catálogo
+//   (fontanería, electricidad, limpieza, pet sitting...) se completa en
+//   menos de 30 minutos una vez el profesional se ha desplazado — por
+//   debajo de eso, el valor no es una reducción legítima, es un dato
+//   fabricado. Se bloquea directamente (400), no se pide confirmación.
+// - UMBRAL_RATIO_REDUCCION_ANOMALA: una estimación de horas es, por
+//   naturaleza, aproximada — el profesional la hace sin haber visto
+//   todavía el alcance real del trabajo, así que terminar en un 60-70%
+//   de lo estimado es normal y no debe generar fricción. Caer por
+//   debajo de la MITAD de lo estimado es un patrón mucho más raro
+//   estadísticamente y es exactamente la firma del escenario de evasión
+//   descrito en la auditoría (10h estimadas → 1h reales = 10%). No se
+//   bloquea (podría ser legítimo: el profesional se equivocó al
+//   estimar) pero exige que el cliente confirme explícitamente viendo
+//   la comparación, en vez de poder aceptarlo sin darse cuenta.
+export const UMBRAL_MINIMO_ABSOLUTO_HORAS = 0.5;
+export const UMBRAL_RATIO_REDUCCION_ANOMALA = 0.5;
+
+/**
+ * Compara horasReales contra horasEstimadas y determina si la
+ * reducción es lo bastante grande como para requerir confirmación
+ * explícita adicional del cliente. Sin horasEstimadas (no debería
+ * pasar para un presupuesto por_horas ya aceptado, pero el campo es
+ * nullable en el schema) no hay nada que comparar.
+ */
+export function evaluarReduccionHoras(horasReales: number, horasEstimadas: number | null) {
+  if (!horasEstimadas || horasEstimadas <= 0) {
+    return { anomala: false, porcentaje: null as number | null };
+  }
+  const porcentaje = Math.round((horasReales / horasEstimadas) * 100);
+  return { anomala: horasReales < horasEstimadas * UMBRAL_RATIO_REDUCCION_ANOMALA, porcentaje };
+}
+
 /**
  * Serializa el último Presupuesto de una solicitud (pendiente, aceptado
  * o rechazado — no solo el aceptado) para que el frontend distinga los
@@ -70,15 +114,33 @@ function serializarAmpliacion(a: {
   };
 }
 
-/** Misma idea, para el último CierreHoras de una solicitud (cualquier estado). */
-function serializarCierreHoras(c: {
-  id: string;
-  horasReales: Prisma.Decimal;
-  estado: string;
-  createdAt: Date;
-} | undefined) {
+/**
+ * Misma idea, para el último CierreHoras de una solicitud (cualquier
+ * estado). Recibe también `horasEstimadas` (del presupuesto por_horas
+ * al que pertenece, no de la propia fila CierreHoras) para poder
+ * exponer `reduccionAnomala`/`porcentaje` sin necesidad de guardarlos
+ * — la comparación siempre se hace contra el valor vigente, y
+ * `horasEstimadas` de un presupuesto ya aceptado es inmutable (ver
+ * presupuesto.controller.ts), así que no hay riesgo de que cambie
+ * entre el cálculo original y esta serialización.
+ */
+function serializarCierreHoras(
+  c: { id: string; horasReales: Prisma.Decimal; estado: string; createdAt: Date } | undefined,
+  horasEstimadas?: Prisma.Decimal | null
+) {
   if (!c) return null;
-  return { id: c.id, horasReales: Number(c.horasReales), estado: c.estado, createdAt: c.createdAt };
+  const horasRealesNum = Number(c.horasReales);
+  const horasEstimadasNum = horasEstimadas ? Number(horasEstimadas) : null;
+  const anomalia = evaluarReduccionHoras(horasRealesNum, horasEstimadasNum);
+  return {
+    id: c.id,
+    horasReales: horasRealesNum,
+    horasEstimadas: horasEstimadasNum,
+    estado: c.estado,
+    createdAt: c.createdAt,
+    reduccionAnomala: anomalia.anomala,
+    porcentaje: anomalia.porcentaje,
+  };
 }
 
 /**
@@ -318,7 +380,7 @@ export async function getServiceRequestById(req: Request, res: Response) {
     numCandidatos: solicitud._count.postulaciones,
     presupuesto: serializarPresupuesto(presupuesto),
     ampliacion: serializarAmpliacion(ampliacion),
-    cierreHoras: serializarCierreHoras(solicitud.cierresHoras[0]),
+    cierreHoras: serializarCierreHoras(solicitud.cierresHoras[0], presupuesto?.horasEstimadas),
     pagoPendienteDeAutorizar: calcularPagoPendienteDeAutorizar(presupuesto, ampliacion, solicitud.pagos),
     payment: agregarPagos(solicitud.pagos),
     // Array en vez de un único objeto: puede haber hasta dos
@@ -868,6 +930,17 @@ export async function completeServiceRequest(req: Request, res: Response) {
       return res.status(400).json({ error: 'Indica las horas reales trabajadas', code: 'HOURS_REQUIRED' });
     }
 
+    // Suelo físico anti-evasión (ver UMBRAL_MINIMO_ABSOLUTO_HORAS más
+    // arriba) — se bloquea aquí, no se pide confirmación, porque un
+    // valor por debajo de este suelo no es una reducción legítima que
+    // el cliente pueda razonablemente aceptar, es un dato fabricado.
+    if (parsed.data.horasReales < UMBRAL_MINIMO_ABSOLUTO_HORAS) {
+      return res.status(400).json({
+        error: `Las horas reales declaradas son inferiores al mínimo permitido (${UMBRAL_MINIMO_ABSOLUTO_HORAS}h)`,
+        code: 'HOURS_TOO_LOW',
+      });
+    }
+
     const yaPendiente = await prisma.cierreHoras.findFirst({ where: { serviceRequestId: id, estado: 'pendiente' } });
     if (yaPendiente) {
       return res.status(409).json({ error: 'Ya hay un cierre pendiente de confirmación del cliente', code: 'HOURS_CLOSURE_ALREADY_PENDING' });
@@ -939,6 +1012,16 @@ export async function completeServiceRequest(req: Request, res: Response) {
 
 const responderCierreHorasSchema = z.object({
   accion: z.enum(['aceptar', 'rechazar']),
+  // Solo relevante para accion: 'aceptar' cuando la reducción es
+  // anómala (ver evaluarReduccionHoras) — el cliente tiene que haber
+  // visto explícitamente la comparación horasEstimadas/horasReales
+  // (pantalla de seguimiento) y confirmarlo aparte. Sin esto, aceptar
+  // una reducción anómala responde 409 en vez de liberar el pago — así
+  // un cliente (posiblemente en connivencia con el profesional) no
+  // puede aceptar sin más una declaración de horas muy por debajo de
+  // lo estimado, y una app desactualizada o modificada no puede
+  // saltarse el aviso llamando al endpoint directamente.
+  confirmarReduccionGrande: z.boolean().optional(),
 });
 
 /**
@@ -994,6 +1077,23 @@ export async function responderCierreHoras(req: Request, res: Response) {
   const presupuesto = solicitud.presupuestos[0];
   if (!presupuesto) {
     return res.status(409).json({ error: 'No hay un presupuesto aceptado para esta solicitud', code: 'NO_ACCEPTED_BUDGET' });
+  }
+
+  // Gate anti-evasión (auditoría 2026-08-14): antes de tocar ningún
+  // estado, si la reducción declarada es anómala frente a
+  // horasEstimadas y el cliente no ha mandado la confirmación
+  // explícita, se corta aquí. No se marca el cierre como resuelto —
+  // sigue "pendiente", así que el cliente puede reintentar con la
+  // confirmación en cuanto la vea en pantalla.
+  const anomalia = evaluarReduccionHoras(Number(cierre.horasReales), presupuesto.horasEstimadas ? Number(presupuesto.horasEstimadas) : null);
+  if (anomalia.anomala && !parsed.data.confirmarReduccionGrande) {
+    return res.status(409).json({
+      error: 'La reducción declarada es muy grande respecto a las horas estimadas; confírmala explícitamente',
+      code: 'HOURS_REDUCTION_CONFIRMATION_REQUIRED',
+      horasReales: Number(cierre.horasReales),
+      horasEstimadas: presupuesto.horasEstimadas ? Number(presupuesto.horasEstimadas) : null,
+      porcentaje: anomalia.porcentaje,
+    });
   }
 
   const { count } = await prisma.cierreHoras.updateMany({
@@ -1078,7 +1178,7 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
         precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
         presupuesto: serializarPresupuesto(presupuesto),
         ampliacion: serializarAmpliacion(ampliacion),
-        cierreHoras: serializarCierreHoras(s.cierresHoras[0]),
+        cierreHoras: serializarCierreHoras(s.cierresHoras[0], presupuesto?.horasEstimadas),
         createdAt: s.createdAt,
         tienePago: s.pagos.length > 0,
         payment: agregarPagos(s.pagos),

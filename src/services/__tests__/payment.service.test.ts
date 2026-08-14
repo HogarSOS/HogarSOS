@@ -399,6 +399,44 @@ describe('releasePayments', () => {
     );
   });
 
+  // H/I/J del pedido de la auditoría 2026-08-14: el escenario exacto de
+  // evasión analizado (50€/h × 10h estimadas → 500€ de base autorizada
+  // → el profesional declara horasReales=1 y el cliente lo confirma).
+  // Prueba que, aunque la protección de horasReales viviera solo en el
+  // controlador, la capa de pagos por sí sola YA garantiza que jamás se
+  // cobra ni comisiona más que el importe real, y que el resto de la
+  // autorización se libera sin cargo alguno — sea cual sea el origen
+  // del importe final reducido.
+  it('escenario auditado: 500€ autorizados, horasReales=1 → precioFinal=50€ — captura y comisiona solo el 10%, el resto se libera sin cobrar nada', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([
+      pagoRetenido({ montoBase: 500, montoTotal: 525, montoProfesional: 475 }),
+    ]);
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
+    mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_123', latest_charge: 'ch_456' });
+    mockStripe.transfers.create.mockResolvedValue({ id: 'tr_789' });
+    mockPrisma.payment.update.mockResolvedValue({ estado: 'liberado' });
+
+    await releasePayments('sr-1', 50); // tarifaHora(50€) × horasReales(1) = 50€, de una base autorizada de 500€ (10%)
+
+    // I) Captura parcial: solo el 10% de lo que el cliente autorizó (525€) = 52.5€.
+    expect(mockStripe.paymentIntents.capture).toHaveBeenCalledWith(
+      'pi_123',
+      { amount_to_capture: 5250 },
+      { idempotencyKey: 'cap_pago-1' }
+    );
+    // H) Comisión: el profesional recibe el mismo 10% de sus 475€ autorizados = 47.5€ — la
+    // proporción de comisión se mantiene, pero la base absoluta comisionable es solo la real.
+    expect(mockStripe.transfers.create).toHaveBeenCalledWith(
+      expect.objectContaining({ amount: 4750 }),
+      { idempotencyKey: 'trf_pago-1' }
+    );
+    // J) Los 450€ de base no consumidos (90% restante) no se capturan ni se cancelan aparte:
+    // al ser un único PaymentIntent, la propia captura parcial de Stripe libera automáticamente
+    // el resto de la autorización — no hay ningún cobro adicional posible sobre ese sobrante.
+    expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(mockStripe.paymentIntents.capture).toHaveBeenCalledTimes(1);
+  });
+
   it('lanza PAGO_NO_ENCONTRADO si no hay ninguna autorización retenida', async () => {
     mockPrisma.payment.findMany.mockResolvedValue([]);
     await expect(releasePayments('sr-sin-pago', 100)).rejects.toThrow('PAGO_NO_ENCONTRADO');
