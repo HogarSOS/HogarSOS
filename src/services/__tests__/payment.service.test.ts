@@ -39,6 +39,7 @@ import {
   reautorizarPaymentIntent,
   listarPagosAtascados,
   reintentarLiberacion,
+  diagnosticarPagoSinConfirmar,
 } from '../payment.service';
 
 const mockPrisma = prisma as any;
@@ -631,6 +632,74 @@ describe('releasePayments', () => {
     await expect(releasePayments('sr-1', 100)).rejects.toThrow('PAGO_NO_AUTORIZADO_TODAVIA');
     expect(mockStripe.paymentIntents.capture).not.toHaveBeenCalled();
     expect(mockStripe.transfers.create).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * P1 (auditoría 2026-08-14): distingue, SOLO leyendo Stripe (sin
+ * capturar, cancelar ni transferir nada), por qué un pago no está en
+ * requires_capture — el mismo problema que hace lanzar
+ * PAGO_NO_AUTORIZADO_TODAVIA en releasePayments, pero aquí exponiendo el
+ * motivo para que el controller pueda dar un aviso correcto.
+ */
+describe('diagnosticarPagoSinConfirmar', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  const pagoBase = (overrides: Partial<Record<string, unknown>> = {}) => ({
+    id: 'pago-1',
+    serviceRequestId: 'sr-1',
+    estado: 'retenido',
+    stripePaymentIntentId: 'pi_123',
+    ...overrides,
+  });
+
+  it('devuelve "nunca_autorizado" si el PaymentIntent nunca llegó a confirmarse', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pagoBase()]);
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_payment_method' });
+
+    await expect(diagnosticarPagoSinConfirmar('sr-1')).resolves.toBe('nunca_autorizado');
+  });
+
+  it('devuelve "autorizacion_caducada" si Stripe ya canceló la autorización (B5)', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pagoBase()]);
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'canceled' });
+
+    await expect(diagnosticarPagoSinConfirmar('sr-1')).resolves.toBe('autorizacion_caducada');
+  });
+
+  it('con varias autorizaciones, basta con que UNA esté "canceled" para reportar "autorizacion_caducada"', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([
+      pagoBase({ id: 'pago-1', stripePaymentIntentId: 'pi_1' }),
+      pagoBase({ id: 'pago-2', stripePaymentIntentId: 'pi_2' }),
+    ]);
+    mockStripe.paymentIntents.retrieve
+      .mockResolvedValueOnce({ status: 'requires_payment_method' })
+      .mockResolvedValueOnce({ status: 'canceled' });
+
+    await expect(diagnosticarPagoSinConfirmar('sr-1')).resolves.toBe('autorizacion_caducada');
+  });
+
+  it('ignora las filas sin stripePaymentIntentId en vez de fallar', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pagoBase({ stripePaymentIntentId: null })]);
+
+    await expect(diagnosticarPagoSinConfirmar('sr-1')).resolves.toBe('nunca_autorizado');
+    expect(mockStripe.paymentIntents.retrieve).not.toHaveBeenCalled();
+  });
+
+  it('no captura, cancela ni transfiere nada — es de solo lectura', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pagoBase()]);
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'canceled' });
+
+    await diagnosticarPagoSinConfirmar('sr-1');
+
+    expect(mockStripe.paymentIntents.capture).not.toHaveBeenCalled();
+    expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+    expect(mockStripe.paymentIntents.create).not.toHaveBeenCalled();
+    expect(mockStripe.transfers.create).not.toHaveBeenCalled();
+    expect(mockPrisma.payment.update).not.toHaveBeenCalled();
+    expect(mockPrisma.payment.updateMany).not.toHaveBeenCalled();
   });
 });
 

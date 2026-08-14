@@ -4,7 +4,7 @@ import admin from 'firebase-admin';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 import { firestore } from '../config/firebase';
-import { releasePayments, refundPayment } from '../services/payment.service';
+import { releasePayments, refundPayment, diagnosticarPagoSinConfirmar } from '../services/payment.service';
 import { asociarArchivosASolicitud } from '../services/archivo.service';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
 import { enviarNotificacion, enviarNotificacionMasiva, enviarNotificacionCruda } from '../services/notification.service';
@@ -857,6 +857,23 @@ export async function markChatRead(req: Request, res: Response) {
 const AVISO_LIBERACION_PENDIENTE =
   'Servicio completado. El cobro no ha podido completarse todavía y ha quedado en la cola de reintento — el importe no se pierde.';
 
+// P1 (auditoría 2026-08-14): PAGO_NO_AUTORIZADO_TODAVIA agrupaba bajo un
+// único aviso genérico dos situaciones distintas — que el cliente nunca
+// confirmara el Payment Sheet, o que SÍ lo hiciera y esa autorización ya
+// hubiera caducado (B5). diagnosticarPagoSinConfirmar distingue ambas
+// releyendo el estado real en Stripe. El texto de "caducada" reutiliza
+// la misma terminología que ya usan las notificaciones de B5
+// (autorizacion_caducada, ver i18n/notifications.ts) para no introducir
+// vocabulario nuevo.
+function avisoPagoSinConfirmar(
+  prefijo: string,
+  motivo: 'nunca_autorizado' | 'autorizacion_caducada'
+): string {
+  return motivo === 'autorizacion_caducada'
+    ? `${prefijo}, pero la autorización de pago del cliente ha caducado: hay que autorizarlo de nuevo en la app`
+    : `${prefijo}, pero el cliente todavía no ha confirmado el pago en la app`;
+}
+
 const completeRequestSchema = z.object({
   // Solo obligatorio si el presupuesto aceptado es "por_horas" — se
   // valida más abajo, una vez se sabe el tipo (no lo elige el cliente
@@ -996,16 +1013,20 @@ export async function completeServiceRequest(req: Request, res: Response) {
     console.error(`[completeServiceRequest] Error al liberar el pago de ${id}:`, err);
     // PAGO_NO_AUTORIZADO_TODAVIA (ver releasePayments) no es un fallo
     // puntual de Stripe que "se reintente" solo: el cliente nunca llegó
-    // a confirmar el Payment Sheet, así que no hay nada que reintentar
-    // hasta que lo haga. Distinguirlo evita que el profesional espere
-    // indefinidamente un cobro que no se resolverá solo.
+    // a confirmar el Payment Sheet, o su autorización ya caducó, así que
+    // no hay nada que reintentar hasta que vuelva a autorizar en la app
+    // (ver avisoPagoSinConfirmar). Distinguirlo evita que el profesional
+    // espere indefinidamente un cobro que no se resolverá solo.
     const pagoSinConfirmar = err instanceof Error && err.message === 'PAGO_NO_AUTORIZADO_TODAVIA';
+    let aviso = AVISO_LIBERACION_PENDIENTE;
+    if (pagoSinConfirmar) {
+      const motivo = await diagnosticarPagoSinConfirmar(id).catch(() => 'nunca_autorizado' as const);
+      aviso = avisoPagoSinConfirmar('Servicio completado', motivo);
+    }
     return res.status(202).json({
       solicitudId: id,
       estado: 'completada',
-      aviso: pagoSinConfirmar
-        ? 'Servicio completado, pero el cliente todavía no ha confirmado el pago en la app'
-        : AVISO_LIBERACION_PENDIENTE,
+      aviso,
     });
   }
 }
@@ -1123,12 +1144,15 @@ export async function responderCierreHoras(req: Request, res: Response) {
   } catch (err) {
     console.error(`[responderCierreHoras] Error al liberar el pago de ${id}:`, err);
     const pagoSinConfirmar = err instanceof Error && err.message === 'PAGO_NO_AUTORIZADO_TODAVIA';
+    let aviso = AVISO_LIBERACION_PENDIENTE;
+    if (pagoSinConfirmar) {
+      const motivo = await diagnosticarPagoSinConfirmar(id).catch(() => 'nunca_autorizado' as const);
+      aviso = avisoPagoSinConfirmar('Horas confirmadas', motivo);
+    }
     return res.status(202).json({
       id: cierreId,
       estado: 'aceptado',
-      aviso: pagoSinConfirmar
-        ? 'Horas confirmadas, pero el cliente todavía no ha confirmado el pago en la app'
-        : AVISO_LIBERACION_PENDIENTE,
+      aviso,
     });
   }
 }

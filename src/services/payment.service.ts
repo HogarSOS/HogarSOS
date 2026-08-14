@@ -801,6 +801,35 @@ async function ejecutarLiberacion(serviceRequestId: string, baseFinal: number) {
 }
 
 /**
+ * P1 (auditoría 2026-08-14): `PAGO_NO_AUTORIZADO_TODAVIA` (ver
+ * `ejecutarLiberacion` arriba) se lanza tanto si el cliente nunca llegó
+ * a confirmar el Payment Sheet como si SÍ lo confirmó y esa autorización
+ * ya caducó — dos situaciones distintas con el mismo mensaje genérico.
+ * Esta función NO mueve nada de dinero ni decide ninguna acción: solo
+ * relee el estado real en Stripe (misma llamada de solo lectura que ya
+ * hace `ejecutarLiberacion`) para que el llamador pueda dar un aviso
+ * correcto. 'canceled' es la señal: es el único estado terminal que
+ * alcanza un PaymentIntent de captura manual que SÍ llegó a autorizarse
+ * — la misma señal que ya usa `intentarRetomarPago` (payment.controller)
+ * para decidir si reautorizar en vez de reanudar.
+ */
+export async function diagnosticarPagoSinConfirmar(
+  serviceRequestId: string
+): Promise<'nunca_autorizado' | 'autorizacion_caducada'> {
+  const pagos = await prisma.payment.findMany({
+    where: { serviceRequestId, estado: { in: [...ESTADOS_LIBERABLES] } },
+  });
+
+  for (const pago of pagos) {
+    if (!pago.stripePaymentIntentId) continue;
+    const intent = await stripe.paymentIntents.retrieve(pago.stripePaymentIntentId);
+    if (intent.status === 'canceled') return 'autorizacion_caducada';
+  }
+
+  return 'nunca_autorizado';
+}
+
+/**
  * Deshace todas las autorizaciones pendientes de una solicitud — se
  * llama al cancelarse antes de completarse, y al resolver una disputa a
  * favor del cliente.

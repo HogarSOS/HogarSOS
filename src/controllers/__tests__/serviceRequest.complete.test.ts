@@ -11,6 +11,7 @@ jest.mock('../../config/prisma', () => ({
 jest.mock('../../services/payment.service', () => ({
   releasePayments: jest.fn(),
   refundPayment: jest.fn(),
+  diagnosticarPagoSinConfirmar: jest.fn(),
 }));
 
 jest.mock('../../services/notification.service', () => ({
@@ -19,12 +20,13 @@ jest.mock('../../services/notification.service', () => ({
 }));
 
 import { prisma } from '../../config/prisma';
-import { releasePayments } from '../../services/payment.service';
+import { releasePayments, diagnosticarPagoSinConfirmar } from '../../services/payment.service';
 import { enviarNotificacion } from '../../services/notification.service';
 import { completeServiceRequest, responderCierreHoras } from '../serviceRequest.controller';
 
 const mockPrisma = prisma as any;
 const mockReleasePayments = releasePayments as jest.Mock;
+const mockDiagnosticarPagoSinConfirmar = diagnosticarPagoSinConfirmar as jest.Mock;
 const mockEnviarNotificacion = enviarNotificacion as jest.Mock;
 
 function fakeRes(): Response {
@@ -43,6 +45,7 @@ describe('completeServiceRequest', () => {
     jest.clearAllMocks();
     mockPrisma.payment.findFirst.mockResolvedValue({ id: 'pago-1', estado: 'retenido' });
     mockReleasePayments.mockResolvedValue([{ estado: 'liberado' }]);
+    mockDiagnosticarPagoSinConfirmar.mockResolvedValue('nunca_autorizado');
   });
 
   it('"cerrado": completa y libera el pago con el monto del presupuesto, sin pedir horas', async () => {
@@ -85,6 +88,79 @@ describe('completeServiceRequest', () => {
       expect.objectContaining({ data: expect.objectContaining({ estado: 'completada', precioFinal: 250 }) })
     );
     expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 250);
+  });
+
+  // P1 (auditoría 2026-08-14): PAGO_NO_AUTORIZADO_TODAVIA agrupaba dos
+  // situaciones distintas bajo el mismo aviso genérico. Estos dos casos
+  // prueban que el mensaje que recibe el profesional ahora distingue
+  // "el cliente nunca autorizó" de "la autorización caducó", sin tocar
+  // el estado 202 ni el hecho de que el servicio queda "completada".
+  describe('PAGO_NO_AUTORIZADO_TODAVIA: mensaje según el motivo real', () => {
+    beforeEach(() => {
+      mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+        id: 'sr-1',
+        clienteId: 'cliente-1',
+        profesionalId: 'pro-1',
+        estado: 'aceptada',
+        presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180, ampliaciones: [] }],
+      });
+      mockReleasePayments.mockRejectedValue(new Error('PAGO_NO_AUTORIZADO_TODAVIA'));
+    });
+
+    it('caso A) el cliente nunca confirmó el Payment Sheet: aviso de "todavía no ha confirmado"', async () => {
+      mockDiagnosticarPagoSinConfirmar.mockResolvedValue('nunca_autorizado');
+      const res = fakeRes();
+
+      await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
+
+      expect(mockDiagnosticarPagoSinConfirmar).toHaveBeenCalledWith('sr-1');
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ aviso: expect.stringContaining('todavía no ha confirmado el pago') })
+      );
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ aviso: expect.not.stringContaining('caducado') })
+      );
+    });
+
+    it('caso B) la autorización existía y caducó (B5): aviso de "ha caducado", no el genérico de "nunca confirmó"', async () => {
+      mockDiagnosticarPagoSinConfirmar.mockResolvedValue('autorizacion_caducada');
+      const res = fakeRes();
+
+      await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
+
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ aviso: expect.stringContaining('ha caducado') })
+      );
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ aviso: expect.not.stringContaining('todavía no ha confirmado') })
+      );
+    });
+
+    it('si la propia comprobación en Stripe falla, cae de vuelta al aviso genérico de "nunca confirmó" en vez de romper la respuesta', async () => {
+      mockDiagnosticarPagoSinConfirmar.mockRejectedValue(new Error('Stripe caído'));
+      const res = fakeRes();
+
+      await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
+
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ aviso: expect.stringContaining('todavía no ha confirmado el pago') })
+      );
+    });
+
+    it('un fallo de Stripe NO relacionado con PAGO_NO_AUTORIZADO_TODAVIA sigue devolviendo el aviso genérico de cola de reintento, sin diagnosticar nada', async () => {
+      mockReleasePayments.mockRejectedValue(new Error('Stripe caído'));
+      const res = fakeRes();
+
+      await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
+
+      expect(mockDiagnosticarPagoSinConfirmar).not.toHaveBeenCalled();
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ aviso: expect.stringContaining('cola de reintento') })
+      );
+    });
   });
 
   it('"por_horas": crea un CierreHoras pendiente y NO completa ni libera el pago todavía', async () => {
@@ -244,6 +320,7 @@ describe('responderCierreHoras', () => {
     });
     mockPrisma.cierreHoras.updateMany.mockResolvedValue({ count: 1 });
     mockReleasePayments.mockResolvedValue([{ estado: 'liberado' }]);
+    mockDiagnosticarPagoSinConfirmar.mockResolvedValue('nunca_autorizado');
   });
 
   it('al aceptar: completa la solicitud, libera tarifaHora × horasReales y notifica al profesional', async () => {
@@ -274,6 +351,39 @@ describe('responderCierreHoras', () => {
       expect.any(Object),
       expect.any(Object)
     );
+  });
+
+  // P1 (auditoría 2026-08-14): mismo caso que en completeServiceRequest,
+  // aplicado a la confirmación de horas reales.
+  describe('PAGO_NO_AUTORIZADO_TODAVIA: mensaje según el motivo real', () => {
+    beforeEach(() => {
+      mockReleasePayments.mockRejectedValue(new Error('PAGO_NO_AUTORIZADO_TODAVIA'));
+    });
+
+    it('caso A) el cliente nunca confirmó el Payment Sheet: aviso de "todavía no ha confirmado"', async () => {
+      mockDiagnosticarPagoSinConfirmar.mockResolvedValue('nunca_autorizado');
+      const res = fakeRes();
+
+      await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar' }), res);
+
+      expect(mockDiagnosticarPagoSinConfirmar).toHaveBeenCalledWith('sr-1');
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ aviso: expect.stringContaining('todavía no ha confirmado el pago') })
+      );
+    });
+
+    it('caso B) la autorización existía y caducó (B5): aviso de "ha caducado"', async () => {
+      mockDiagnosticarPagoSinConfirmar.mockResolvedValue('autorizacion_caducada');
+      const res = fakeRes();
+
+      await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(202);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ aviso: expect.stringContaining('ha caducado') })
+      );
+    });
   });
 
   it('devuelve 409 si el cierre ya no está pendiente (condición de carrera)', async () => {
