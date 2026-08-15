@@ -493,8 +493,20 @@ export async function cancelServiceRequest(req: Request, res: Response) {
     if (!actual) throw new Error('NOT_FOUND');
     if (actual.clienteId !== clienteId) throw new Error('NO_AUTORIZADO');
 
+    // A4 (auditoría Fable 2026-08-15): "Iniciar trabajo" es opcional por
+    // diseño (ver EN_CURSO_USAR_DISPUTA más abajo), así que un
+    // profesional que nunca lo pulsó podía terminar el trabajo, declarar
+    // sus horas (CierreHoras 'pendiente') y el cliente igual cancelaba
+    // desde aquí — 'aceptada' seguía siendo un estado cancelable — con
+    // reembolso total de un trabajo ya entregado. La existencia de un
+    // CierreHoras 'pendiente' es la señal objetiva de "ya se entregó",
+    // así que se excluye atómicamente en el propio updateMany (mismo
+    // WHERE, sin una lectura aparte que pueda quedar desfasada).
     const { count } = await prisma.serviceRequest.updateMany({
-      where: { id, clienteId, estado: { in: ['pendiente', 'aceptada'] } },
+      where: {
+        id, clienteId, estado: { in: ['pendiente', 'aceptada'] },
+        cierresHoras: { none: { estado: 'pendiente' } },
+      },
       data: { estado: 'cancelada' },
     });
     if (count === 0) {
@@ -508,8 +520,13 @@ export async function cancelServiceRequest(req: Request, res: Response) {
       // WRITE, nunca toca Stripe, no compite con nada) es suficiente
       // para acertar el mensaje sin tocar la atomicidad de la decisión
       // real, que ya tomó el UPDATE de arriba.
-      const actualizado = await prisma.serviceRequest.findUnique({ where: { id }, select: { estado: true } });
-      throw new Error(actualizado?.estado === 'en_progreso' ? 'EN_CURSO_USAR_DISPUTA' : 'YA_NO_CANCELABLE');
+      const actualizado = await prisma.serviceRequest.findUnique({
+        where: { id },
+        select: { estado: true, cierresHoras: { where: { estado: 'pendiente' }, select: { id: true }, take: 1 } },
+      });
+      if (actualizado?.estado === 'en_progreso') throw new Error('EN_CURSO_USAR_DISPUTA');
+      if ((actualizado?.cierresHoras?.length ?? 0) > 0) throw new Error('CIERRE_PENDIENTE_USAR_DISPUTA');
+      throw new Error('YA_NO_CANCELABLE');
     }
 
     // En su propio try/catch, igual que la sincronización de Firestore
@@ -546,6 +563,12 @@ export async function cancelServiceRequest(req: Request, res: Response) {
       return res.status(409).json({
         error: 'El profesional ya ha marcado este trabajo como en curso — para cancelarlo ahora, abre una reclamación',
         code: 'REQUEST_IN_PROGRESS_USE_DISPUTE',
+      });
+    }
+    if (err instanceof Error && err.message === 'CIERRE_PENDIENTE_USAR_DISPUTA') {
+      return res.status(409).json({
+        error: 'El profesional ya declaró las horas trabajadas de este servicio — para cancelarlo ahora, abre una reclamación',
+        code: 'REQUEST_HOURS_CLOSURE_PENDING_USE_DISPUTE',
       });
     }
     throw err;

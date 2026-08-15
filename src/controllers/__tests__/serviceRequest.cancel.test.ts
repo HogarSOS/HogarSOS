@@ -74,7 +74,10 @@ describe('cancelServiceRequest', () => {
     await cancelServiceRequest(req, res);
 
     expect(mockPrisma.serviceRequest.updateMany).toHaveBeenCalledWith({
-      where: { id: 'sr-1', clienteId: 'cliente-1', estado: { in: ['pendiente', 'aceptada'] } },
+      where: {
+        id: 'sr-1', clienteId: 'cliente-1', estado: { in: ['pendiente', 'aceptada'] },
+        cierresHoras: { none: { estado: 'pendiente' } },
+      },
       data: { estado: 'cancelada' },
     });
     expect(res.json).toHaveBeenCalledWith({ id: 'sr-1', estado: 'cancelada' });
@@ -192,12 +195,37 @@ describe('cancelServiceRequest', () => {
     expect(mockRefundPayment).not.toHaveBeenCalled();
   });
 
+  // A4 (auditoría Fable 2026-08-15): "Iniciar trabajo" es opcional — un
+  // profesional que nunca lo pulsó podía terminar el trabajo, declarar
+  // sus horas (CierreHoras 'pendiente') y el cliente igual cancelaba
+  // desde 'aceptada' con reembolso total de un trabajo ya entregado.
+  it('devuelve 409 con código específico si hay un CierreHoras pendiente (trabajo ya declarado, debe usar disputa)', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'aceptada',
+      cierresHoras: [{ id: 'cierre-1' }],
+    });
+    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 0 });
+
+    const res = fakeRes();
+    await cancelServiceRequest(fakeReq({ id: 'sr-1' }, 'cliente-1'), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'REQUEST_HOURS_CLOSURE_PENDING_USE_DISPUTE' })
+    );
+    expect(mockRefundPayment).not.toHaveBeenCalled();
+  });
+
   it('devuelve 409 genérico si ya está completada o cancelada (sin vía de disputa)', async () => {
     mockPrisma.serviceRequest.findUnique.mockResolvedValue({
       id: 'sr-1',
       clienteId: 'cliente-1',
       profesionalId: 'pro-1',
       estado: 'completada',
+      cierresHoras: [],
     });
     mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 0 });
 
