@@ -4,6 +4,9 @@ jest.mock('../../config/prisma', () => ({
   prisma: {
     user: { findUnique: jest.fn(), update: jest.fn() },
     professional: { update: jest.fn() },
+    serviceRequest: { findFirst: jest.fn() },
+    payment: { findFirst: jest.fn() },
+    userFcmToken: { deleteMany: jest.fn() },
     $transaction: jest.fn(),
   },
 }));
@@ -49,8 +52,13 @@ describe('deleteMe', () => {
     // real, solo que ejecute el callback que le pasa el controlador —
     // igual que haría Prisma de verdad con el mock de tx de abajo.
     mockPrisma.$transaction.mockImplementation(async (cb: any) =>
-      cb({ user: mockPrisma.user, professional: mockPrisma.professional })
+      cb({ user: mockPrisma.user, professional: mockPrisma.professional, userFcmToken: mockPrisma.userFcmToken })
     );
+    // Por defecto, sin trabajos activos ni pagos pendientes (A3) — así
+    // los tests existentes, que no son sobre este bloqueo, siguen
+    // llegando hasta el borrado normal.
+    mockPrisma.serviceRequest.findFirst.mockResolvedValue(null);
+    mockPrisma.payment.findFirst.mockResolvedValue(null);
   });
 
   /**
@@ -175,5 +183,64 @@ describe('deleteMe', () => {
     expect(res.status).toHaveBeenCalledWith(404);
     expect(mockStripe.customers.update).not.toHaveBeenCalled();
     expect(mockFirebaseAuth.deleteUser).not.toHaveBeenCalled();
+  });
+
+  // A3 (auditoría Fable 2026-08-15): antes de este bloqueo, un usuario
+  // con un trabajo a medio confirmar podía eliminar la cuenta — Firebase
+  // se borraba y el otro lado (cliente o profesional) se quedaba sin
+  // contraparte con quien resolver el pago pendiente.
+  describe('A3: bloqueo con trabajos activos o pagos pendientes', () => {
+    beforeEach(() => {
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'u1', role: 'cliente', firebaseUid: 'fb-1', stripeCustomerId: 'cus_123',
+      });
+    });
+
+    it('devuelve 409 si tiene una ServiceRequest en curso (como cliente o profesional)', async () => {
+      mockPrisma.serviceRequest.findFirst.mockResolvedValue({ id: 'sr-1' });
+
+      const res = fakeRes();
+      await deleteMe(fakeReq('u1'), res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'ACTIVE_WORK_OR_PAYMENT_PENDING' }));
+      expect(mockFirebaseAuth.deleteUser).not.toHaveBeenCalled();
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('devuelve 409 si tiene un Payment retenido/capturado aunque la solicitud ya esté cancelada (M3: refund fallido)', async () => {
+      mockPrisma.payment.findFirst.mockResolvedValue({ id: 'pago-1' });
+
+      const res = fakeRes();
+      await deleteMe(fakeReq('u1'), res);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'ACTIVE_WORK_OR_PAYMENT_PENDING' }));
+      expect(mockFirebaseAuth.deleteUser).not.toHaveBeenCalled();
+    });
+
+    it('permite el borrado si no hay trabajos activos ni pagos pendientes', async () => {
+      const res = fakeRes();
+      await deleteMe(fakeReq('u1'), res);
+
+      expect(res.status).not.toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith({ success: true });
+    });
+
+    // Extra menor de A3: revoca cualquier sesión/refresh token abierto
+    // (mismo mecanismo que logout) y borra los tokens push del
+    // dispositivo — antes ninguno de los dos se tocaba al eliminar la cuenta.
+    it('incrementa sessionVersion (revoca refresh tokens) y borra los UserFcmToken del usuario', async () => {
+      const res = fakeRes();
+      await deleteMe(fakeReq('u1'), res);
+
+      expect(mockPrisma.user.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'u1' },
+          data: expect.objectContaining({ sessionVersion: { increment: 1 } }),
+        })
+      );
+      expect(mockPrisma.userFcmToken.deleteMany).toHaveBeenCalledWith({ where: { userId: 'u1' } });
+    });
   });
 });

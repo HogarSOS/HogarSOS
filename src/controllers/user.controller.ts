@@ -97,6 +97,39 @@ export async function deleteMe(req: Request, res: Response) {
     return res.status(404).json({ error: 'Usuario no encontrado', code: 'USER_NOT_FOUND' });
   }
 
+  // A3 (auditoría Fable 2026-08-15): sin este check, un cliente con un
+  // por_horas a medio confirmar podía eliminar su cuenta — Firebase se
+  // borra, activo=false, y el CierreHoras pendiente se queda sin nadie
+  // que lo pueda aceptar: la autorización de Stripe caduca sola a los
+  // ~7 días (ver B5) y el profesional se queda sin cobro y sin
+  // contraparte con quien resolverlo. Aplica igual al profesional con
+  // trabajos asignados. El check de Payment (además del de
+  // ServiceRequest) cubre también el caso M3: una solicitud ya
+  // 'cancelada' cuyo refund falló en silencio y dejó una fila
+  // 'retenido' atascada.
+  const [solicitudActiva, pagoPendiente] = await Promise.all([
+    prisma.serviceRequest.findFirst({
+      where: {
+        OR: [{ clienteId: userId }, { profesionalId: userId }],
+        estado: { in: ['aceptada', 'en_progreso', 'disputada'] },
+      },
+      select: { id: true },
+    }),
+    prisma.payment.findFirst({
+      where: {
+        estado: { in: ['retenido', 'capturado'] },
+        serviceRequest: { OR: [{ clienteId: userId }, { profesionalId: userId }] },
+      },
+      select: { id: true },
+    }),
+  ]);
+  if (solicitudActiva || pagoPendiente) {
+    return res.status(409).json({
+      error: 'Termina o cancela tus trabajos activos antes de eliminar la cuenta',
+      code: 'ACTIVE_WORK_OR_PAYMENT_PENDING',
+    });
+  }
+
   if (usuario.firebaseUid) {
     try {
       await firebaseAuth.deleteUser(usuario.firebaseUid);
@@ -155,8 +188,21 @@ export async function deleteMe(req: Request, res: Response) {
         firebaseUid: null,
         fcmToken: null,
         activo: false,
+        // A3, extra menor (auditoría Fable 2026-08-15): sin esto, el
+        // refresh token de una sesión ya abierta seguía siendo válido
+        // después de "eliminar" la cuenta (activo=false ya lo bloquea en
+        // login/refresh, pero sessionVersion es lo que fuerza a cerrar
+        // sesión de inmediato en cualquier dispositivo con sesión
+        // activa — mismo patrón que logout, ver auth.controller.ts).
+        sessionVersion: { increment: 1 },
       },
     });
+
+    // Igual que sessionVersion arriba: sin esto, los tokens push del
+    // dispositivo quedaban vivos en BD para una cuenta ya "eliminada"
+    // (P2 #5 introdujo esta tabla después de que deleteMe dejara de
+    // tocarse por última vez).
+    await tx.userFcmToken.deleteMany({ where: { userId } });
 
     // El perfil de profesional guarda datos aún más sensibles (documento
     // de identidad, certificados, seguro de responsabilidad civil) —
