@@ -111,4 +111,44 @@ describe('createDispute', () => {
 
     expect(res.status).toHaveBeenCalledWith(409);
   });
+
+  // M2 (auditoría Fable 2026-08-15): el check de arriba (findUnique +
+  // estado) es solo fast-path — dos peticiones casi simultáneas pueden
+  // pasarlo ambas antes de que la primera cree la Dispute. Este test
+  // simula justo esa carrera: el check pasa, pero el create choca con el
+  // índice único parcial `disputes_abierta_unico`.
+  it('devuelve el mismo 409 que el fast-path si el create choca con el índice único (P2002 — carrera con otra petición)', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'completada',
+    });
+    mockPrisma.$transaction.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('Unique constraint failed'), { code: 'P2002' });
+    });
+
+    const res = fakeRes();
+    await createDispute(fakeReq({ id: 'sr-1' }, 'cliente-1', bodyValido), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'DISPUTE_ALREADY_OPEN' }));
+  });
+
+  it('un error de Prisma que NO es P2002 no se convierte en 409 — se deja propagar tal cual', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'completada',
+    });
+    const errorInesperado = { code: 'P2028', message: 'Transaction API error' };
+    mockPrisma.$transaction.mockImplementationOnce(async () => {
+      throw errorInesperado;
+    });
+
+    await expect(createDispute(fakeReq({ id: 'sr-1' }, 'cliente-1', bodyValido), fakeRes())).rejects.toBe(
+      errorInesperado
+    );
+  });
 });

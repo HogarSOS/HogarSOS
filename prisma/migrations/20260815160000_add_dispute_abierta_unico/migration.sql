@@ -1,0 +1,16 @@
+-- M2 (auditoría externa Fable 2026-08-15): createDispute hace un
+-- findUnique(solicitud.estado) y luego un create sin ninguna protección
+-- atómica entre medias — dos peticiones casi simultáneas (cliente y
+-- profesional reportando el mismo problema a la vez, o un doble tap)
+-- podían pasar ambas la comprobación y crear dos Dispute abiertas para
+-- la misma solicitud. La segunda queda irresoluble para siempre:
+-- resolveDispute mueve el dinero (refund/release) una sola vez, así que
+-- al intentar resolver la segunda, PAGO_NO_ENCONTRADO la revierte a
+-- 'abierta' en cada intento, ensuciando la cola del admin sin parar.
+--
+-- Parcial (solo WHERE estado IN abierta/en_revision/en_resolucion) a
+-- propósito, mismo patrón que cierres_horas_pendiente_unico: no debe
+-- impedir que una solicitud tenga varias Dispute históricas ya resueltas
+-- ('resuelta_cliente'/'resuelta_profesional') — solo puede haber UNA
+-- abierta/en curso de resolución a la vez por solicitud.
+CREATE UNIQUE INDEX "disputes_abierta_unico" ON "disputes" ("service_request_id") WHERE "estado" IN ('abierta', 'en_revision', 'en_resolucion');

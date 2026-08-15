@@ -47,19 +47,35 @@ export async function createDispute(req: Request, res: Response) {
     return res.status(409).json({ error: 'Ya existe una reclamación abierta para este trabajo', code: 'DISPUTE_ALREADY_OPEN' });
   }
 
-  const dispute = await prisma.$transaction(async (tx) => {
-    const creada = await tx.dispute.create({
-      data: {
-        serviceRequestId: id,
-        creadoPor: userId,
-        motivo: datos.descripcion,
-        motivoCategoria: datos.motivo,
-        fotosUrls: datos.fotosUrls ?? [],
-      },
+  // M2 (auditoría Fable 2026-08-15): el check de arriba (findUnique +
+  // condiciones de estado) es solo fast-path — dos peticiones casi
+  // simultáneas (cliente y profesional reportando el mismo problema a
+  // la vez, o un doble tap) pueden pasarlo ambas antes de que la primera
+  // haga el create. La garantía real es el índice único parcial
+  // `disputes_abierta_unico` (WHERE estado IN abierta/en_revision/
+  // en_resolucion); mismo patrón que CierreHoras (ver
+  // completeServiceRequest).
+  let dispute;
+  try {
+    dispute = await prisma.$transaction(async (tx) => {
+      const creada = await tx.dispute.create({
+        data: {
+          serviceRequestId: id,
+          creadoPor: userId,
+          motivo: datos.descripcion,
+          motivoCategoria: datos.motivo,
+          fotosUrls: datos.fotosUrls ?? [],
+        },
+      });
+      await tx.serviceRequest.update({ where: { id }, data: { estado: 'disputada' } });
+      return creada;
     });
-    await tx.serviceRequest.update({ where: { id }, data: { estado: 'disputada' } });
-    return creada;
-  });
+  } catch (err: any) {
+    if (err?.code === 'P2002') {
+      return res.status(409).json({ error: 'Ya existe una reclamación abierta para este trabajo', code: 'DISPUTE_ALREADY_OPEN' });
+    }
+    throw err;
+  }
 
   // Igual que en createServiceRequest: las capturas adjuntas se subieron
   // antes de que existiera la reclamación, así que se clasifican aquí

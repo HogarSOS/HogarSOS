@@ -62,6 +62,15 @@ describe('agregarPagos', () => {
       expect.objectContaining({ estado: 'liberado' })
     );
   });
+
+  // M1 (auditoría Fable 2026-08-15): antes de este fix, 'capturado' caía
+  // al 'reembolsado' del final de la cadena, con los importes en 0 —
+  // justo lo contrario de lo que pasó (el cliente SÍ pagó).
+  it('trata "capturado" como "retenido" (cliente ya cobrado, transferencia al profesional a medias), no como "reembolsado"', () => {
+    expect(agregarPagos([pago({ estado: 'capturado' })])).toEqual(
+      expect.objectContaining({ estado: 'retenido', montoTotal: 105, montoProfesional: 95 })
+    );
+  });
 });
 
 describe('calcularPagoPendienteDeAutorizar', () => {

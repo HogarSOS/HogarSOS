@@ -168,7 +168,14 @@ export function agregarPagos(
   const pagosConfirmados = pagos.filter((p) => p.estado !== 'pendiente');
   if (pagosConfirmados.length === 0) return null;
 
-  const estado = pagosConfirmados.some((p) => p.estado === 'retenido')
+  // M1 (auditoría Fable 2026-08-15): 'capturado' (cliente ya cobrado,
+  // transferencia al profesional atascada a medias — ver comentario en
+  // completeServiceRequest) no estaba contemplado aquí, así que un pago
+  // en ese estado caía al 'reembolsado' del final con importes en 0, el
+  // extremo opuesto de lo que en realidad pasó. Se trata igual que
+  // 'retenido': el trabajo sigue "en curso" desde la perspectiva del
+  // cliente/profesional, la liberación se reintenta sola (o vía admin).
+  const estado = pagosConfirmados.some((p) => p.estado === 'retenido' || p.estado === 'capturado')
     ? 'retenido'
     : pagosConfirmados.some((p) => p.estado === 'liberado')
       ? 'liberado'
@@ -176,7 +183,9 @@ export function agregarPagos(
         ? 'fallido'
         : 'reembolsado';
 
-  const relevantes = pagosConfirmados.filter((p) => p.estado === 'retenido' || p.estado === 'liberado');
+  const relevantes = pagosConfirmados.filter(
+    (p) => p.estado === 'retenido' || p.estado === 'capturado' || p.estado === 'liberado'
+  );
   const sumar = (clave: 'montoBase' | 'montoTotal' | 'comisionPlataforma' | 'montoProfesional') =>
     Number(relevantes.reduce((acc, p) => acc + Number(p[clave]), 0).toFixed(2));
 
