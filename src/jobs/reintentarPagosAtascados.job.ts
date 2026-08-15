@@ -1,5 +1,5 @@
 import { prisma } from '../config/prisma';
-import { reintentarLiberacion } from '../services/payment.service';
+import { reintentarLiberacion, ESTADOS_DISPUTA_BLOQUEANTE } from '../services/payment.service';
 import { TareaProgramada } from './scheduler';
 
 /**
@@ -62,6 +62,13 @@ export async function reintentarPagosAtascados(): Promise<string> {
         { estado: 'retenido', serviceRequest: { estado: 'completada' } },
       ],
       createdAt: { lt: new Date(ahora - GRACIA_PRIMER_REINTENTO_MS) },
+      // P2 #7: exclusión temprana, solo por eficiencia — evita gastar una
+      // llamada a Stripe (y ensuciar `fallos` con algo ya sabido) en un
+      // pago que heartbeat() iba a rechazar de todas formas. La
+      // protección real sigue siendo heartbeat(), no esta consulta: si
+      // la disputa llega justo después de esta lectura, heartbeat() la
+      // atrapa igual antes de la siguiente llamada mutante a Stripe.
+      AND: [{ OR: [{ stripeDisputeStatus: null }, { stripeDisputeStatus: { notIn: [...ESTADOS_DISPUTA_BLOQUEANTE] } }] }],
     },
     orderBy: { createdAt: 'asc' },
     take: 50,

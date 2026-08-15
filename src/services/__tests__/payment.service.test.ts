@@ -7,6 +7,9 @@ jest.mock('../../config/prisma', () => ({
       updateMany: jest.fn(),
       count: jest.fn(),
       findUniqueOrThrow: jest.fn(),
+      // P2 #7: heartbeat() la usa para distinguir lease_perdido de
+      // disputa_activa cuando el UPDATE guardado afecta 0 filas.
+      findUnique: jest.fn(),
     },
     serviceRequest: { findUnique: jest.fn() },
     professional: { findUnique: jest.fn(), update: jest.fn() },
@@ -1133,6 +1136,103 @@ describe('listarPagosAtascados', () => {
     // profesional puede venir null (ver interfaz PagoAtascado) — no debe reventar.
     expect(atascados[1].profesionalNombre).toBeNull();
   });
+
+  /**
+   * P2 #7: el hallazgo central — un contracargo sobre un pago YA
+   * liberado antes no aparecía nunca en esta cola. El WHERE real lo
+   * decide Postgres, no este archivo (el mock de findMany no evalúa
+   * condiciones) — lo que sí se puede probar aquí es que la consulta
+   * INCLUYE la condición correcta, y que el mapeo de cada fila deriva
+   * `enDisputa` correctamente a partir del estado nativo de Stripe.
+   */
+  describe('P2 #7 — disputas de Stripe', () => {
+    function filaConDisputa(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'pago-d',
+        serviceRequestId: 'sr-d',
+        estado: 'liberado',
+        montoProfesional: 95,
+        capturadoProfesional: 95,
+        capturadoAt: new Date('2026-08-04T09:00:00Z'),
+        createdAt: new Date('2026-08-03T09:00:00Z'),
+        intentosLiberacion: 0,
+        ultimoErrorLiberacion: null,
+        stripeDisputeId: 'dp_1',
+        stripeDisputeStatus: 'needs_response',
+        stripeDisputeMonto: 45,
+        serviceRequest: {
+          estado: 'completada',
+          categoria: { nombre: 'Aire acondicionado' },
+          cliente: { nombre: 'Ana Sánchez' },
+          profesional: { user: { nombre: 'José Fernández' } },
+        },
+        ...overrides,
+      };
+    }
+
+    it('el WHERE incluye la condición de disputa bloqueante, sin importar estado', async () => {
+      mockPrisma.payment.findMany.mockResolvedValue([]);
+
+      await listarPagosAtascados();
+
+      const { where } = mockPrisma.payment.findMany.mock.calls[0][0];
+      expect(where.OR).toContainEqual({
+        stripeDisputeStatus: {
+          in: ['needs_response', 'under_review', 'warning_needs_response', 'warning_under_review', 'lost'],
+        },
+      });
+    });
+
+    it('Payment liberado + disputa activa aparece marcado (enDisputa=true) aunque estado sea "liberado"', async () => {
+      mockPrisma.payment.findMany.mockResolvedValue([filaConDisputa()]);
+
+      const [atascado] = await listarPagosAtascados();
+
+      expect(atascado.estado).toBe('liberado');
+      expect(atascado.enDisputa).toBe(true);
+      expect(atascado.disputaEstado).toBe('needs_response');
+      expect(atascado.disputaMonto).toBe(45);
+      expect(atascado.disputaId).toBe('dp_1');
+    });
+
+    it('Payment liberado + "lost" también aparece marcado (no hay recuperación automática)', async () => {
+      mockPrisma.payment.findMany.mockResolvedValue([filaConDisputa({ stripeDisputeStatus: 'lost' })]);
+
+      const [atascado] = await listarPagosAtascados();
+
+      expect(atascado.enDisputa).toBe(true);
+      expect(atascado.disputaEstado).toBe('lost');
+    });
+
+    it('"won" no se marca como incidencia activa (enDisputa=false) aunque la fila llegara incluida', async () => {
+      mockPrisma.payment.findMany.mockResolvedValue([filaConDisputa({ stripeDisputeStatus: 'won' })]);
+
+      const [atascado] = await listarPagosAtascados();
+
+      expect(atascado.enDisputa).toBe(false);
+    });
+
+    it('"warning_closed" no se marca como incidencia activa', async () => {
+      mockPrisma.payment.findMany.mockResolvedValue([filaConDisputa({ stripeDisputeStatus: 'warning_closed' })]);
+
+      const [atascado] = await listarPagosAtascados();
+
+      expect(atascado.enDisputa).toBe(false);
+    });
+
+    it('sin disputa (columnas null): enDisputa false, campos de disputa null', async () => {
+      mockPrisma.payment.findMany.mockResolvedValue([
+        filaConDisputa({ stripeDisputeId: null, stripeDisputeStatus: null, stripeDisputeMonto: null }),
+      ]);
+
+      const [atascado] = await listarPagosAtascados();
+
+      expect(atascado.enDisputa).toBe(false);
+      expect(atascado.disputaEstado).toBeNull();
+      expect(atascado.disputaMonto).toBeNull();
+      expect(atascado.disputaId).toBeNull();
+    });
+  });
 });
 
 describe('reintentarLiberacion', () => {
@@ -1672,6 +1772,112 @@ describe('refundPayment', () => {
 
       expect(mockStripe.refunds.create).toHaveBeenCalledTimes(1);
       expect(mockStripe.refunds.create).toHaveBeenCalledWith(expect.anything(), { idempotencyKey: 'ref_pago-1' });
+    });
+
+    /**
+     * P2 #7: el guard de disputa vive DENTRO de heartbeat() — cuando el
+     * UPDATE guardado afecta 0 filas, una lectura de más (findUnique)
+     * distingue "perdí el lease" de "hay una disputa bloqueante". Estos
+     * tests simulan exactamente eso: updateMany devuelve count:0 (igual
+     * que un lease perdido) y findUnique decide cuál de los dos fue.
+     */
+    describe('P2 #7 — guard de disputa Stripe', () => {
+      it('disputa activa (needs_response) bloquea la captura: nunca llama a paymentIntents.capture', async () => {
+        mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+        mockPrisma.payment.count.mockResolvedValue(1);
+        mockPrisma.payment.findMany.mockResolvedValue([filaBase()]); // 'retenido', sin capturar aún
+        // FASE1b (write-ahead del plan) SÍ encuentra el token — la
+        // disputa bloquea en el heartbeat de justo antes de capture(),
+        // no antes.
+        mockPrisma.payment.updateMany
+          .mockResolvedValueOnce({ count: 1 }) // FASE1b write-ahead
+          .mockResolvedValueOnce({ count: 0 }); // heartbeat antes de capture()
+        mockPrisma.payment.findUnique.mockResolvedValue({ stripeDisputeStatus: 'needs_response' });
+
+        await expect(releasePayments('sr-1', 100)).rejects.toThrow('PAGO_EN_DISPUTA');
+
+        expect(mockStripe.paymentIntents.capture).not.toHaveBeenCalled();
+      });
+
+      it('disputa activa bloquea la transferencia: nunca llama a transfers.create', async () => {
+        mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+        mockPrisma.payment.count.mockResolvedValue(1);
+        mockPrisma.payment.findMany.mockResolvedValue([
+          filaBase({ estado: 'capturado', capturadoBase: 100, capturadoTotal: 105, capturadoProfesional: 95, stripeChargeId: 'ch_1' }),
+        ]);
+        mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 }); // heartbeat antes de transfers.create()
+        mockPrisma.payment.findUnique.mockResolvedValue({ stripeDisputeStatus: 'under_review' });
+
+        await expect(releasePayments('sr-1', 100)).rejects.toThrow('PAGO_EN_DISPUTA');
+
+        expect(mockStripe.transfers.create).not.toHaveBeenCalled();
+      });
+
+      it('disputa activa bloquea el refund: nunca llama a refunds.create ni a paymentIntents.cancel', async () => {
+        mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+        mockPrisma.payment.count.mockResolvedValue(1);
+        mockPrisma.payment.findMany.mockResolvedValue([filaBase({ estado: 'capturado' })]);
+        mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 }); // heartbeat antes de refunds.create()
+        mockPrisma.payment.findUnique.mockResolvedValue({ stripeDisputeStatus: 'warning_under_review' });
+
+        await expect(refundPayment('sr-1')).rejects.toThrow('PAGO_EN_DISPUTA');
+
+        expect(mockStripe.refunds.create).not.toHaveBeenCalled();
+        expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
+      });
+
+      // 'lost' bloquea igual que un estado abierto — no es seguro
+      // reanudar movimientos solo porque la disputa ya "cerró" en el
+      // sentido de Stripe: el dinero se perdió de forma permanente.
+      it('disputa "lost" sigue bloqueando (no libera el guard solo por estar cerrada)', async () => {
+        mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+        mockPrisma.payment.count.mockResolvedValue(1);
+        mockPrisma.payment.findMany.mockResolvedValue([filaBase()]);
+        mockPrisma.payment.updateMany
+          .mockResolvedValueOnce({ count: 1 }) // FASE1b write-ahead
+          .mockResolvedValueOnce({ count: 0 }); // heartbeat antes de capture()
+        mockPrisma.payment.findUnique.mockResolvedValue({ stripeDisputeStatus: 'lost' });
+
+        await expect(releasePayments('sr-1', 100)).rejects.toThrow('PAGO_EN_DISPUTA');
+
+        expect(mockStripe.paymentIntents.capture).not.toHaveBeenCalled();
+      });
+
+      // Sin disputa (columna null): count:0 solo puede significar lease
+      // perdido — comportamiento YA existente, confirmado sin regresión
+      // ahora que heartbeat() hace una lectura de más en este camino.
+      it('sin disputa, count:0 en el heartbeat sigue significando LIBERACION_YA_EN_CURSO', async () => {
+        mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+        mockPrisma.payment.count.mockResolvedValue(1);
+        mockPrisma.payment.findMany.mockResolvedValue([filaBase()]);
+        mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+        mockPrisma.payment.findUnique.mockResolvedValue({ stripeDisputeStatus: null });
+
+        await expect(releasePayments('sr-1', 100)).rejects.toThrow('LIBERACION_YA_EN_CURSO');
+
+        expect(mockStripe.paymentIntents.capture).not.toHaveBeenCalled();
+      });
+
+      // 'won'/'warning_closed' liberan el guard: con el heartbeat en su
+      // camino feliz (count:1, como cualquier otro caso sin bloqueo), la
+      // liberación procede con normalidad — probado explícitamente con
+      // el estado de disputa ya resuelto presente en la fila.
+      it.each(['won', 'warning_closed'])(
+        'disputa resuelta (%s) no bloquea: la liberación procede con normalidad',
+        async (estadoResuelto) => {
+          mockPrisma.$queryRaw.mockResolvedValue([{ id: 'pago-1', intentosLiberacion: 1 }]);
+          mockPrisma.payment.count.mockResolvedValue(1);
+          mockPrisma.payment.findMany.mockResolvedValue([filaBase({ stripeDisputeStatus: estadoResuelto })]);
+          mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_1', latest_charge: 'ch_1' });
+          mockStripe.transfers.create.mockResolvedValue({ id: 'tr_1' });
+          mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+
+          const resultados = await releasePayments('sr-1', 100);
+
+          expect(resultados).toHaveLength(1);
+          expect(mockStripe.paymentIntents.capture).toHaveBeenCalledTimes(1);
+        }
+      );
     });
   });
 });

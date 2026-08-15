@@ -282,6 +282,44 @@ model Payment {
   // hace falta reconstruir la cadena desde el dashboard de Stripe.
   intentosAutorizacion  Int          @default(0) @map("intentos_autorizacion")
 
+  // --- Contracargo de Stripe (P2 #7, auditoría 2026-08-14) ---
+  //
+  // Antes de esto, charge.dispute.created solo escribía un texto en
+  // ultimoErrorLiberacion — un campo que releasePayments pone a NULL en
+  // cuanto la liberación tiene éxito, y que listarPagosAtascados solo
+  // muestra para estado 'capturado'/'retenido'. Un contracargo sobre un
+  // pago ya liberado quedaba invisible para siempre, y nada impedía que
+  // el job automático siguiera transfiriendo dinero a un pago con una
+  // disputa ya abierta. Estas columnas son independientes de
+  // ultimoErrorLiberacion a propósito: nada en el camino de éxito de
+  // releasePayments las toca, así que sobreviven a la liberación.
+  //
+  // Vocabulario nativo de Stripe (Dispute.Status del SDK instalado),
+  // sin enum propio: 'needs_response' | 'under_review' |
+  // 'warning_needs_response' | 'warning_under_review' |
+  // 'warning_closed' | 'won' | 'lost'. Bloquean captura/transferencia/
+  // reintento/refund todos menos 'won' y 'warning_closed' — 'lost'
+  // bloquea igual que los estados abiertos, porque significa que el
+  // dinero ya se perdió de forma permanente, no que sea seguro
+  // reanudar movimientos (ver heartbeat()).
+  stripeDisputeId             String?   @unique @map("stripe_dispute_id")
+  stripeDisputeStatus         String?   @map("stripe_dispute_status")
+  stripeDisputeMonto          Decimal?  @map("stripe_dispute_monto")
+  // event.created de Stripe (no la hora local) del último evento
+  // charge.dispute.* aplicado — guarda de recencia para que un evento
+  // duplicado o entregado fuera de orden nunca sobrescriba uno más
+  // nuevo ya aplicado. Ver procesarEventoDisputa en payment.controller.ts.
+  stripeDisputeUltimoEventoEn DateTime? @map("stripe_dispute_ultimo_evento_en")
+  // event.id de Stripe (revisión adversarial final, P2 #7): event.created
+  // solo tiene precisión de segundo — dos eventos DISTINTOS (ej.
+  // charge.dispute.created seguido casi al instante de un .updated)
+  // pueden compartir el mismo segundo. Sin este desempate, el segundo
+  // evento se descartaba como si fuera un duplicado del primero, aunque
+  // trajera información nueva. Con event.id, solo una redelivery EXACTA
+  // del mismo evento se ignora — un evento distinto en el mismo segundo
+  // se sigue aplicando.
+  stripeDisputeUltimoEventoId String?   @map("stripe_dispute_ultimo_evento_id")
+
   serviceRequest        ServiceRequest @relation(fields: [serviceRequestId], references: [id])
   presupuesto           Presupuesto    @relation(fields: [presupuestoId], references: [id])
   ampliacion            Ampliacion?    @relation(fields: [ampliacionId], references: [id])

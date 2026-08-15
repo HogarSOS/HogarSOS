@@ -103,6 +103,10 @@ export async function listStuckPayments(_req: Request, res: Response) {
         .reduce((acc, p) => acc + p.montoProfesional, 0)
         .toFixed(2)
     ),
+    // P2 #7: cuántas de estas filas son contracargos de Stripe (no
+    // fallos técnicos de liberación) — para que el admin distinga de
+    // un vistazo sin tener que abrir cada fila.
+    disputasActivas: atascados.filter((p) => p.enDisputa).length,
     pagos: atascados,
   });
 }

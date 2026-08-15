@@ -255,6 +255,92 @@ export async function getPaymentsSummary(req: Request, res: Response) {
   });
 }
 
+/** Resultado de intentar aplicar un evento charge.dispute.* — ver procesarEventoDisputa. */
+type ResultadoEventoDisputa = 'aplicado' | 'duplicado' | 'payment_no_encontrado';
+
+/**
+ * Revisión adversarial final (Hallazgo 2): cuando el evento no se puede
+ * asociar a ningún Payment, no hay ninguna fila donde guardar "ya se
+ * avisó de este evento" — a diferencia del camino 'aplicado', que se
+ * apoya en stripeDisputeUltimoEventoId. Sin este Set, cada redelivery
+ * de Stripe del mismo webhook (reintento tras timeout, red caída, etc.)
+ * duplicaría el correo a soporte. Un Set en memoria (no una tabla) es
+ * suficiente: el volumen de contracargos reales es bajísimo, así que no
+ * hay riesgo práctico de crecimiento descontrolado, y no sobrevivir a
+ * un reinicio del proceso solo implica, en el peor caso, un correo
+ * repetido tras un despliegue — no una alerta perdida.
+ */
+const eventosSinPaymentYaAlertados = new Set<string>();
+
+/**
+ * P2 #7: procesa cualquier evento charge.dispute.* (created/updated/closed)
+ * — misma función para los tres, la única diferencia entre ellos es qué
+ * aviso adicional dispara cada caso del switch. Escritura idempotente y
+ * segura ante desorden de entrega: solo se aplica si `event.created` es
+ * más reciente que el último evento de disputa ya aplicado a esta fila
+ * (o si es el primero).
+ *
+ * Revisión adversarial final: `event.created` de Stripe solo tiene
+ * precisión de SEGUNDO — dos eventos DISTINTOS (ej. `.created` seguido
+ * casi al instante de un `.updated`) pueden compartir el mismo segundo.
+ * Comparar solo por `event.created` con `<` descartaba el segundo evento
+ * como si fuera un duplicado del primero, aunque trajera información
+ * nueva. El desempate real es `event.id` (identidad del evento de
+ * Stripe, no de la disputa): se aplica si el evento entrante es más
+ * reciente, O si comparte segundo con el último aplicado pero es un
+ * `event.id` DISTINTO — solo una redelivery EXACTA del mismo evento
+ * (mismo segundo + mismo id) se ignora.
+ *
+ * Devuelve 'aplicado'/'duplicado'/'payment_no_encontrado' en vez de un
+ * booleano: un `count:0` puede significar dos cosas muy distintas que
+ * un simple `true/false` colapsaba — "ya se aplicó este mismo evento
+ * antes" (correcto callar) o "no hay ningún Payment con ese
+ * payment_intent" (un fallo de reconciliación real que el llamador
+ * debe alertar, no silenciar).
+ */
+async function procesarEventoDisputa(
+  event: { id: string; created: number },
+  disputa: { id: string; status: string; amount: number; payment_intent?: string }
+): Promise<ResultadoEventoDisputa> {
+  if (!disputa.payment_intent) return 'payment_no_encontrado';
+
+  const eventoEn = new Date(event.created * 1000);
+  const montoNumerico = Number((disputa.amount / 100).toFixed(2));
+
+  const { count } = await prisma.payment.updateMany({
+    where: {
+      stripePaymentIntentId: disputa.payment_intent,
+      OR: [
+        { stripeDisputeUltimoEventoEn: null },
+        { stripeDisputeUltimoEventoEn: { lt: eventoEn } },
+        {
+          stripeDisputeUltimoEventoEn: eventoEn,
+          OR: [{ stripeDisputeUltimoEventoId: null }, { stripeDisputeUltimoEventoId: { not: event.id } }],
+        },
+      ],
+    },
+    data: {
+      stripeDisputeId: disputa.id,
+      stripeDisputeStatus: disputa.status,
+      stripeDisputeMonto: montoNumerico,
+      stripeDisputeUltimoEventoEn: eventoEn,
+      stripeDisputeUltimoEventoId: event.id,
+    },
+  });
+  if (count > 0) return 'aplicado';
+
+  // count===0: o es un duplicado genuino de un evento ya aplicado, o no
+  // existe ningún Payment con ese payment_intent en absoluto — una
+  // lectura de más, solo en el camino de fallo, distingue cuál de los
+  // dos fue (mismo patrón que heartbeat() distingue lease_perdido de
+  // disputa_activa).
+  const existe = await prisma.payment.findFirst({
+    where: { stripePaymentIntentId: disputa.payment_intent },
+    select: { id: true },
+  });
+  return existe ? 'duplicado' : 'payment_no_encontrado';
+}
+
 /**
  * Webhook de Stripe. No lleva JWT propio — Stripe autentica la petición
  * con una firma (stripe-signature) verificada contra STRIPE_WEBHOOK_SECRET.
@@ -363,10 +449,60 @@ export async function stripeWebhook(req: Request, res: Response) {
         id: string;
         amount: number;
         currency: string;
+        status: string;
         reason?: string;
         payment_intent?: string;
         evidence_details?: { due_by?: number };
       };
+
+      const resultado = await procesarEventoDisputa(event, disputa).catch((e) => {
+        console.error(`[stripeWebhook] No se pudo registrar la disputa ${disputa.id}:`, e);
+        return 'duplicado' as ResultadoEventoDisputa; // fallo inesperado: no reintentar el aviso a ciegas
+      });
+
+      // Evento repetido (reintento de Stripe del mismo webhook) o
+      // atrasado: ya se aplicó antes, no hay nada nuevo que avisar —
+      // evita reenviar el correo a soporte en cada reintento.
+      if (resultado === 'duplicado') break;
+
+      // Revisión adversarial final: un contracargo real cuyo
+      // payment_intent no coincide con NINGÚN Payment (webhook mal
+      // configurado, cuenta de Stripe equivocada, metadata corrupta, o
+      // directamente sin payment_intent en el evento) es precisamente
+      // el fallo de reconciliación financiera que este endpoint existe
+      // para no dejar pasar en silencio — nunca se debe tratar igual
+      // que un duplicado.
+      if (resultado === 'payment_no_encontrado') {
+        // Redelivery exacta del mismo evento (mismo event.id): ya se
+        // avisó de este fallo de reconciliación, no hay Payment donde
+        // apoyarse para deducirlo — ver comentario de
+        // eventosSinPaymentYaAlertados arriba.
+        if (eventosSinPaymentYaAlertados.has(event.id)) break;
+        eventosSinPaymentYaAlertados.add(event.id);
+
+        console.error(
+          `[stripeWebhook] ⚠️ CONTRACARGO ${disputa.id} SIN Payment local asociado ` +
+          `(PaymentIntent: ${disputa.payment_intent ?? 'no incluido en el evento'}). ` +
+          `Fallo de reconciliación financiera — revisar manualmente en el dashboard de Stripe.`
+        );
+        const destinatarioSinAsociar = process.env.SMTP_USER;
+        if (destinatarioSinAsociar) {
+          enviarEmail(
+            destinatarioSinAsociar,
+            `⚠️ Contracargo de Stripe SIN pago asociado en Hogar SOS`,
+            `<p>Se ha abierto un contracargo en Stripe que no se pudo asociar a ningún pago registrado en Hogar SOS.</p>
+             <ul>
+               <li><strong>Dispute ID:</strong> ${disputa.id}</li>
+               <li><strong>PaymentIntent:</strong> ${disputa.payment_intent ?? 'no incluido en el evento'}</li>
+             </ul>
+             <p>Esto es un fallo de reconciliación, no un contracargo ya gestionado — revisar manualmente
+                desde el dashboard de Stripe → Payments → Disputes.</p>`
+          ).catch((e) => console.error(`[stripeWebhook] No se pudo avisar por correo del contracargo sin asociar ${disputa.id}:`, e));
+        } else {
+          console.error('[stripeWebhook] SMTP_USER sin definir: el aviso de contracargo sin asociar solo queda en el log.');
+        }
+        break;
+      }
 
       const importe = (disputa.amount / 100).toFixed(2);
       const limite = disputa.evidence_details?.due_by
@@ -379,17 +515,6 @@ export async function stripeWebhook(req: Request, res: Response) {
         `(motivo: ${disputa.reason ?? 'no indicado'}, PaymentIntent: ${disputa.payment_intent ?? 'desconocido'}). ` +
         `Plazo para aportar pruebas: ${limite}. Responder desde el dashboard de Stripe.`
       );
-
-      // El pago afectado se marca para que no pase desapercibido en el
-      // Centro de Pagos ni en la cola de admin.
-      if (disputa.payment_intent) {
-        await prisma.payment
-          .updateMany({
-            where: { stripePaymentIntentId: disputa.payment_intent },
-            data: { ultimoErrorLiberacion: `CONTRACARGO ${disputa.id} (${importe} EUR)` },
-          })
-          .catch((e) => console.error(`[stripeWebhook] No se pudo marcar el pago del contracargo ${disputa.id}:`, e));
-      }
 
       // Aviso por correo a soporte. "Fire and forget" con captura: un
       // fallo de SMTP no debe hacer que devolvamos 500 y que Stripe
@@ -407,11 +532,67 @@ export async function stripeWebhook(req: Request, res: Response) {
              <li><strong>Plazo para aportar pruebas:</strong> ${limite}</li>
            </ul>
            <p>Stripe ya ha retirado el importe más la comisión de disputa del saldo de la plataforma.
-              Si no se responde antes del plazo, la disputa se pierde automáticamente.</p>
+              Si no se responde antes del plazo, la disputa se pierde automáticamente. Mientras la
+              disputa siga abierta, HogarSOS no capturará, transferirá ni reembolsará este pago
+              automáticamente.</p>
            <p>Responder desde el dashboard de Stripe → Payments → Disputes.</p>`
         ).catch((e) => console.error(`[stripeWebhook] No se pudo avisar por correo del contracargo ${disputa.id}:`, e));
       } else {
         console.error('[stripeWebhook] SMTP_USER sin definir: el aviso de contracargo solo queda en el log.');
+      }
+      break;
+    }
+
+    // Cambios de estado mientras la disputa sigue abierta (evidencia
+    // enviada, pasa a revisión, etc.) — solo actualiza el registro, sin
+    // aviso propio: no es tan accionable como la apertura o el cierre,
+    // y un correo por cada cambio intermedio generaría ruido.
+    case 'charge.dispute.updated': {
+      const disputa = event.data.object as { id: string; amount: number; status: string; payment_intent?: string };
+      // Alcance de esta ronda: solo se corrige el aviso de .created (ver
+      // arriba). .updated nunca tuvo aviso propio (cambios intermedios,
+      // no accionables) — se mantiene así, solo se adapta al tipo de
+      // retorno nuevo.
+      await procesarEventoDisputa(event, disputa).catch((e) =>
+        console.error(`[stripeWebhook] No se pudo actualizar la disputa ${disputa.id}:`, e)
+      );
+      break;
+    }
+
+    // Resultado final: 'won' (Stripe devuelve el importe retirado,
+    // libera el bloqueo de movimientos), 'lost' (el dinero se pierde de
+    // forma permanente, sigue bloqueado, requiere revisión manual) o
+    // 'warning_closed' (una consulta que nunca llegó a retirar fondos
+    // se cerró sin escalar, libera el bloqueo). Ver ESTADOS_DISPUTA_BLOQUEANTE
+    // en payment.service.ts para qué estados siguen bloqueando después de esto.
+    case 'charge.dispute.closed': {
+      const disputa = event.data.object as { id: string; amount: number; currency: string; status: string; payment_intent?: string };
+
+      // Mismo alcance que .updated: esta ronda solo corrige el aviso de
+      // .created — aquí solo se adapta al tipo de retorno nuevo, sin
+      // añadir el aviso específico de "sin Payment asociado" (fuera de
+      // lo pedido para .closed).
+      const resultadoCierre = await procesarEventoDisputa(event, disputa).catch((e) => {
+        console.error(`[stripeWebhook] No se pudo cerrar la disputa ${disputa.id}:`, e);
+        return 'duplicado' as ResultadoEventoDisputa;
+      });
+      if (resultadoCierre !== 'aplicado') break;
+
+      const importe = (disputa.amount / 100).toFixed(2);
+      const resultado = disputa.status === 'won' ? 'GANADA' : disputa.status === 'lost' ? 'PERDIDA' : disputa.status.toUpperCase();
+      console.error(`[stripeWebhook] Disputa ${disputa.id} cerrada: ${resultado} (${importe} ${disputa.currency.toUpperCase()}).`);
+
+      const destinatarioCierre = process.env.SMTP_USER;
+      if (destinatarioCierre) {
+        enviarEmail(
+          destinatarioCierre,
+          `Disputa ${resultado.toLowerCase()} — ${importe} € en Hogar SOS`,
+          `<p>La disputa ${disputa.id} se ha cerrado: <strong>${resultado}</strong>.</p>
+           <ul><li><strong>Importe:</strong> ${importe} ${disputa.currency.toUpperCase()}</li></ul>
+           ${resultado === 'PERDIDA'
+             ? '<p>El importe queda perdido de forma permanente — no hay recuperación automática de fondos. Requiere revisión manual (posible seguimiento con el profesional).</p>'
+             : '<p>Sin acción pendiente — Stripe gestiona la devolución del importe retirado automáticamente.</p>'}`
+        ).catch((e) => console.error(`[stripeWebhook] No se pudo avisar por correo del cierre de la disputa ${disputa.id}:`, e));
       }
       break;
     }

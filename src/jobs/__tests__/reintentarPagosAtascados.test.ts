@@ -4,6 +4,15 @@ jest.mock('../../config/prisma', () => ({
 
 jest.mock('../../services/payment.service', () => ({
   reintentarLiberacion: jest.fn(),
+  // P2 #7: el job importa la misma lista que usa heartbeat() para no
+  // duplicarla — el mock tiene que ofrecer el mismo valor real.
+  ESTADOS_DISPUTA_BLOQUEANTE: [
+    'needs_response',
+    'under_review',
+    'warning_needs_response',
+    'warning_under_review',
+    'lost',
+  ],
 }));
 
 import { prisma } from '../../config/prisma';
@@ -146,5 +155,51 @@ describe('reintentarPagosAtascados', () => {
       { estado: 'capturado' },
       { estado: 'retenido', serviceRequest: { estado: 'completada' } },
     ]);
+  });
+
+  /**
+   * P2 #7: exclusión temprana, solo por eficiencia — evita gastar una
+   * llamada a Stripe en un pago que heartbeat() iba a rechazar de todas
+   * formas. Se comprueba el WHERE que de verdad se manda a Prisma
+   * (`findMany` está mockeado sin más, así que esto no prueba que
+   * Postgres filtre bien — prueba que el job CONSTRUYE la condición
+   * correcta, que es lo único que este archivo puede verificar).
+   */
+  it('el WHERE de candidatos excluye pagos con disputa bloqueante', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([]);
+
+    await reintentarPagosAtascados();
+
+    const { where } = mockPrisma.payment.findMany.mock.calls[0][0];
+    expect(where.AND).toEqual([
+      {
+        OR: [
+          { stripeDisputeStatus: null },
+          {
+            stripeDisputeStatus: {
+              notIn: ['needs_response', 'under_review', 'warning_needs_response', 'warning_under_review', 'lost'],
+            },
+          },
+        ],
+      },
+    ]);
+  });
+
+  /**
+   * Si la disputa llega justo entre la selección del job y la ejecución
+   * real, la exclusión temprana ya no puede evitarlo (el candidato ya
+   * se seleccionó) — heartbeat() es quien lo bloquea de verdad. Desde
+   * el punto de vista del job, esto se ve como reintentarLiberacion()
+   * rechazando con PAGO_EN_DISPUTA, exactamente igual que cualquier
+   * otro fallo real: se cuenta en `fallos`, no se omite en silencio.
+   */
+  it('si la disputa llega entre selección y ejecución, el job registra el rechazo del heartbeat como fallo real', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pago({ serviceRequestId: 'sr-1' })]);
+    mockReintentar.mockRejectedValueOnce(new Error('PAGO_EN_DISPUTA'));
+
+    const resumen = await reintentarPagosAtascados();
+
+    expect(resumen).toContain('Fallos:');
+    expect(resumen).toContain('sr-1: PAGO_EN_DISPUTA');
   });
 });

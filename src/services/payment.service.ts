@@ -123,6 +123,28 @@ const ESTADOS_LIBERABLES = ['retenido', 'capturado'] as const;
  */
 const ESTADOS_REEMBOLSABLES = ['retenido', 'capturado', 'liberado'] as const;
 
+/**
+ * Vocabulario nativo de `Dispute.Status` del SDK de Stripe instalado
+ * (node_modules/stripe/types/Disputes.d.ts) — sin enum propio, P2 #7.
+ * Bloquean cualquier movimiento de dinero (captura, transferencia,
+ * cancelación, refund) todos los estados abiertos MÁS 'lost': una
+ * disputa perdida significa que el dinero ya se perdió de forma
+ * permanente, no que sea seguro reanudar movimientos — solo 'won' y
+ * 'warning_closed' liberan el guard (ver heartbeat()).
+ *
+ * Exportada para que reintentarPagosAtascados.job.ts filtre los mismos
+ * candidatos sin duplicar la lista — heartbeat() sigue siendo la
+ * protección real (ver más abajo), esto es solo una exclusión temprana
+ * para no gastar una llamada a Stripe en un pago que ya sabemos bloqueado.
+ */
+export const ESTADOS_DISPUTA_BLOQUEANTE = [
+  'needs_response',
+  'under_review',
+  'warning_needs_response',
+  'warning_under_review',
+  'lost',
+] as const;
+
 /** Redondeo a céntimos en el dominio decimal, para no arrastrar el error binario de coma flotante entre pasos. */
 function redondear2(n: number): number {
   return Number(n.toFixed(2));
@@ -492,13 +514,51 @@ async function liberarFilas(filas: FilaReclamada[]): Promise<void> {
  * captura/transferencia tarda su tiempo) pero sigue avanzando y llamando
  * a este heartbeat en cada paso NUNCA pierde el lease de verdad — solo
  * lo pierde una ejecución que de verdad dejó de avanzar.
+ *
+ * P2 #7: el mismo UPDATE exige además que no haya una disputa de Stripe
+ * bloqueante — es el único punto de todo el archivo por el que pasan
+ * las cuatro llamadas mutantes (captura, transferencia, cancelación,
+ * refund), así que extenderlo aquí protege a las cuatro sin duplicar
+ * la comprobación en cada una. Si el UPDATE afecta 0 filas puede ser
+ * por dos motivos distintos — lease perdido, o disputa activa — y el
+ * llamador necesita distinguirlos para lanzar el error correcto; una
+ * única lectura adicional, solo en el camino de fallo, decide cuál fue.
  */
-async function heartbeat(paymentId: string, token: number): Promise<boolean> {
+type ResultadoHeartbeat = 'ok' | 'lease_perdido' | 'disputa_activa';
+
+async function heartbeat(paymentId: string, token: number): Promise<ResultadoHeartbeat> {
   const { count } = await prisma.payment.updateMany({
-    where: { id: paymentId, intentosLiberacion: token },
+    where: {
+      id: paymentId,
+      intentosLiberacion: token,
+      OR: [
+        { stripeDisputeStatus: null },
+        { stripeDisputeStatus: { notIn: [...ESTADOS_DISPUTA_BLOQUEANTE] } },
+      ],
+    },
     data: { liberacionEnCursoAt: new Date() },
   });
-  return count > 0;
+  if (count > 0) return 'ok';
+
+  const actual = await prisma.payment.findUnique({
+    where: { id: paymentId },
+    select: { stripeDisputeStatus: true },
+  });
+  if (actual?.stripeDisputeStatus && (ESTADOS_DISPUTA_BLOQUEANTE as readonly string[]).includes(actual.stripeDisputeStatus)) {
+    return 'disputa_activa';
+  }
+  return 'lease_perdido';
+}
+
+/**
+ * Punto único para los cuatro llamadores de heartbeat() (captura,
+ * transferencia, cancelación, refund) — así ninguno repite el if/else
+ * que traduce el resultado al error correcto (P2 #7).
+ */
+async function exigirHeartbeat(paymentId: string, token: number): Promise<void> {
+  const resultado = await heartbeat(paymentId, token);
+  if (resultado === 'disputa_activa') throw new Error('PAGO_EN_DISPUTA');
+  if (resultado === 'lease_perdido') throw new Error('LIBERACION_YA_EN_CURSO');
 }
 
 /**
@@ -645,13 +705,11 @@ async function capturarConIdempotencia(
   // de abajo y para la escritura fenced del final.
   const token = pago.intentosLiberacion;
 
-  // Heartbeat: comprueba Y renueva el lease justo antes de la llamada
-  // mutante a Stripe. Si esta ejecución ya no es la propietaria (el
-  // lease caducó y otra lo reclamó mientras tanto), aborta AQUÍ — nunca
-  // llega a llamar a capture().
-  if (!(await heartbeat(pago.id, token))) {
-    throw new Error('LIBERACION_YA_EN_CURSO');
-  }
+  // Heartbeat: comprueba Y renueva el lease (y la ausencia de disputa
+  // bloqueante, P2 #7) justo antes de la llamada mutante a Stripe. Si
+  // esta ejecución ya no es la propietaria, o hay una disputa activa,
+  // aborta AQUÍ — nunca llega a llamar a capture().
+  await exigirHeartbeat(pago.id, token);
 
   let intentCapturado: Stripe.PaymentIntent;
   try {
@@ -718,11 +776,10 @@ async function transferirConIdempotencia(
   }
 
   if (!transferId) {
-    // Heartbeat: comprueba Y renueva el lease justo antes de la llamada
-    // mutante a Stripe — ver capturarConIdempotencia para el porqué.
-    if (!(await heartbeat(pago.id, token))) {
-      throw new Error('LIBERACION_YA_EN_CURSO');
-    }
+    // Heartbeat: comprueba Y renueva el lease y la ausencia de disputa
+    // bloqueante justo antes de la llamada mutante a Stripe — ver
+    // capturarConIdempotencia para el porqué.
+    await exigirHeartbeat(pago.id, token);
 
     const transfer = await stripe.transfers.create(
       {
@@ -962,9 +1019,7 @@ async function ejecutarLiberacion(ids: string[], serviceRequestId: string, baseF
       const tokenCancelar = paso.pago.intentosLiberacion;
       // Heartbeat antes de la llamada mutante a Stripe — ver
       // capturarConIdempotencia para el porqué.
-      if (!(await heartbeat(paso.pago.id, tokenCancelar))) {
-        throw new Error('LIBERACION_YA_EN_CURSO');
-      }
+      await exigirHeartbeat(paso.pago.id, tokenCancelar);
 
       const cancelado = await stripe.paymentIntents.cancel(paso.pago.stripePaymentIntentId!, undefined, {
         idempotencyKey: `cnl_${paso.pago.id}`,
@@ -1097,13 +1152,14 @@ async function ejecutarReembolso(ids: string[], serviceRequestId: string): Promi
     // desde el findMany de arriba, nunca se relee).
     const token = pago.intentosLiberacion;
 
-    // Heartbeat: comprueba Y renueva el lease justo antes de la llamada
-    // mutante a Stripe — ver capturarConIdempotencia para el porqué. Si
-    // esta ejecución ya no es la propietaria, aborta AQUÍ, antes de
-    // llamar a Stripe.
-    if (!(await heartbeat(pago.id, token))) {
-      throw new Error('LIBERACION_YA_EN_CURSO');
-    }
+    // Heartbeat: comprueba Y renueva el lease y la ausencia de disputa
+    // bloqueante justo antes de la llamada mutante a Stripe — ver
+    // capturarConIdempotencia para el porqué. Una disputa activa
+    // bloquea también el refund (P2 #7): Stripe ya retiró el importe
+    // disputado del balance de la plataforma al abrir la disputa, así
+    // que un refund manual sobre el mismo cargo mientras sigue abierta
+    // arriesga reclamar/perder el mismo dinero dos veces.
+    await exigirHeartbeat(pago.id, token);
 
     let stripeResultadoId: string | undefined;
     if (pago.estado === 'capturado' || pago.estado === 'liberado') {
@@ -1155,16 +1211,29 @@ export interface PagoAtascado {
   ultimoError: string | null;
   /** El dinero ya salió de la tarjeta del cliente pero no ha llegado al profesional — máxima prioridad. */
   dineroRetenidoEnPlataforma: boolean;
+  /** P2 #7: hay una disputa de Stripe bloqueante (abierta o `lost`) sobre este pago, sin importar `estado`. */
+  enDisputa: boolean;
+  /** Vocabulario nativo de Stripe (`needs_response`, `under_review`, `lost`...) — null si no hay disputa. */
+  disputaEstado: string | null;
+  disputaMonto: number | null;
+  /** Para el enlace "ver en Stripe" del admin — nunca se resuelve nada desde aquí, solo dashboard.stripe.com/disputes/{id}. */
+  disputaId: string | null;
 }
 
 /**
- * Cola de pagos que necesitan atención (auditoría B2). Dos categorías,
- * ambas invisibles antes de esto:
+ * Cola de pagos que necesitan atención (auditoría B2, ampliada en P2 #7).
+ * Tres categorías, todas invisibles antes de esto:
  *
  * - estado 'capturado': el dinero salió del cliente y NO ha llegado al
  *   profesional. Es dinero real parado en la cuenta de la plataforma.
  * - estado 'retenido' con la solicitud ya 'completada': el trabajo se
  *   dio por terminado pero la liberación nunca se completó.
+ * - disputa de Stripe bloqueante (P2 #7): sin importar `estado` — un
+ *   contracargo sobre un pago YA liberado es exactamente el caso que
+ *   antes quedaba invisible para siempre, porque `estado` por sí solo
+ *   nunca lo delataba. 'won'/'warning_closed' quedan fuera a propósito
+ *   (ya resueltos, sin nada pendiente); 'lost' se queda dentro para
+ *   siempre — no hay recuperación automática de esa pérdida.
  *
  * Ordenados por antigüedad: lo que más tiempo lleva atascado primero.
  */
@@ -1174,6 +1243,7 @@ export async function listarPagosAtascados(): Promise<PagoAtascado[]> {
       OR: [
         { estado: 'capturado' },
         { estado: 'retenido', serviceRequest: { estado: 'completada' } },
+        { stripeDisputeStatus: { in: [...ESTADOS_DISPUTA_BLOQUEANTE] } },
       ],
     },
     orderBy: { createdAt: 'asc' },
@@ -1207,6 +1277,10 @@ export async function listarPagosAtascados(): Promise<PagoAtascado[]> {
     intentosLiberacion: p.intentosLiberacion,
     ultimoError: p.ultimoErrorLiberacion,
     dineroRetenidoEnPlataforma: p.estado === 'capturado',
+    enDisputa: p.stripeDisputeStatus != null && (ESTADOS_DISPUTA_BLOQUEANTE as readonly string[]).includes(p.stripeDisputeStatus),
+    disputaEstado: p.stripeDisputeStatus,
+    disputaMonto: p.stripeDisputeMonto != null ? Number(p.stripeDisputeMonto) : null,
+    disputaId: p.stripeDisputeId,
   }));
 }
 
