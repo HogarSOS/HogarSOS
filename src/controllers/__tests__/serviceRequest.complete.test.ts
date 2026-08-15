@@ -49,7 +49,7 @@ function fakeReq(params: Record<string, string>, userId: string, body: Record<st
 describe('completeServiceRequest', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockPrisma.payment.findFirst.mockResolvedValue({ id: 'pago-1', estado: 'retenido' });
+    mockPrisma.payment.findMany.mockResolvedValue([{ ampliacionId: null }]);
     mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 1 });
     mockReleasePayments.mockResolvedValue([{ estado: 'liberado' }]);
     mockDiagnosticarPagoSinConfirmar.mockResolvedValue('nunca_autorizado');
@@ -87,6 +87,9 @@ describe('completeServiceRequest', () => {
         ampliaciones: [{ id: 'ampl-1', montoAdicional: 50, estado: 'aceptado' }],
       }],
     });
+    // La ampliación aceptada tiene su propia autorización ya confirmada
+    // (si no, A2 la bloquea — ver el test siguiente).
+    mockPrisma.payment.findMany.mockResolvedValue([{ ampliacionId: null }, { ampliacionId: 'ampl-1' }]);
 
     const res = fakeRes();
     await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
@@ -95,6 +98,36 @@ describe('completeServiceRequest', () => {
       expect.objectContaining({ data: expect.objectContaining({ estado: 'completada', precioFinal: 250 }) })
     );
     expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 250);
+  });
+
+  // A2 (auditoría Fable 2026-08-15): aceptar una ampliación no autoriza
+  // su pago por sí solo (responderAmpliacion, ver ampliacion.controller.ts)
+  // — sin este bloqueo, precioFinal sumaba el montoAdicional igualmente y
+  // releasePayments capturaba de menos en silencio, sin que ninguna cola
+  // de admin lo detectara.
+  it('"cerrado": devuelve 409 si hay una ampliación aceptada cuyo pago todavía no está autorizado', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'aceptada',
+      presupuestos: [{
+        id: 'pres-1',
+        tipo: 'cerrado',
+        monto: 200,
+        ampliaciones: [{ id: 'ampl-1', montoAdicional: 50, estado: 'aceptado' }],
+      }],
+    });
+    // Solo el pago base está confirmado — el de la ampliación no.
+    mockPrisma.payment.findMany.mockResolvedValue([{ ampliacionId: null }]);
+
+    const res = fakeRes();
+    await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'AMPLIACION_SIN_PAGO_CONFIRMADO' }));
+    expect(mockPrisma.serviceRequest.updateMany).not.toHaveBeenCalled();
+    expect(mockReleasePayments).not.toHaveBeenCalled();
   });
 
   // A1 (auditoría Fable 2026-08-15): el update a 'completada' está
@@ -336,7 +369,7 @@ describe('completeServiceRequest', () => {
   });
 
   it('devuelve 409 si el cliente aún no ha autorizado ningún pago', async () => {
-    mockPrisma.payment.findFirst.mockResolvedValue(null);
+    mockPrisma.payment.findMany.mockResolvedValue([]);
     mockPrisma.serviceRequest.findUnique.mockResolvedValue({
       id: 'sr-1', clienteId: 'cliente-1', profesionalId: 'pro-1', estado: 'aceptada',
       presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180, ampliaciones: [] }],

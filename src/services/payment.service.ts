@@ -989,6 +989,26 @@ async function ejecutarLiberacion(ids: string[], serviceRequestId: string, baseF
     restanteBase = redondear2(restanteBase - baseAConsumir);
   }
 
+  // A2 (auditoría Fable 2026-08-15): si tras recorrer TODAS las
+  // autorizaciones sigue quedando base por cubrir, antes esto se
+  // ignoraba en silencio — se capturaba lo que había y el profesional
+  // cobraba menos de lo que precioFinal dice, sin log ni registro. Dos
+  // vías reales: por_horas sin tope superior (horasReales >
+  // horasEstimadas + ampliaciones autorizadas) y "cerrado" con una
+  // ampliación aceptada cuya autorización nunca se confirmó (esto
+  // último ya se bloquea antes de llegar aquí en completeServiceRequest,
+  // pero el log queda como red de seguridad para cualquier otro camino
+  // que llegue a esta función). No se aborta la liberación — el dinero
+  // que SÍ hay que capturar/transferir de las autorizaciones existentes
+  // sigue siendo correcto y no puede quedar retenido esperando una
+  // autorización que quizá no llegue nunca.
+  const deficitBase = restanteBase > 0.01 ? restanteBase : 0;
+  if (deficitBase > 0) {
+    console.error(
+      `[ejecutarLiberacion] LIBERACION_INCOMPLETA_FALTA_AUTORIZACION serviceRequestId=${serviceRequestId} baseFinal=${baseFinal} baseSinCubrir=${deficitBase} — el profesional cobrará menos de lo que refleja precioFinal, no hay autorización suficiente para cubrir la diferencia`
+    );
+  }
+
   // ---------- FASE 1b: CONGELAR EL PLAN EN BD ANTES DE TOCAR STRIPE ----------
   //
   // Write-ahead: si el proceso muere justo después de capturar, el

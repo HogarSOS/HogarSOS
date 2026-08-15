@@ -928,10 +928,11 @@ export async function completeServiceRequest(req: Request, res: Response) {
   // incluirlo aquí, un trabajo con la liberación a medio terminar
   // respondería "el cliente aún no ha autorizado el pago", que es falso
   // y justo lo contrario de lo que pasa.
-  const pagoExistente = await prisma.payment.findFirst({
+  const pagosConfirmados = await prisma.payment.findMany({
     where: { serviceRequestId: id, estado: { in: ['retenido', 'capturado'] } },
+    select: { ampliacionId: true },
   });
-  if (!pagoExistente) {
+  if (pagosConfirmados.length === 0) {
     return res.status(409).json({
       error: 'El cliente aún no ha autorizado el pago de este servicio', code: 'PAYMENT_NOT_AUTHORIZED',
     });
@@ -1000,6 +1001,22 @@ export async function completeServiceRequest(req: Request, res: Response) {
   // tiene su propia autorización de Stripe retenida aparte (ver
   // createPaymentIntent), y releasePayments necesita conocer la suma
   // total para no dejarlas fuera y cancelarlas sin cobrar.
+  //
+  // A2 (auditoría Fable 2026-08-15): aceptar una ampliación (ver
+  // responderAmpliacion) NO autoriza su pago por sí solo — es un paso
+  // aparte que el cliente puede no haber completado todavía. Sin este
+  // check, precioFinal sumaba montoAdicional igualmente y
+  // releasePayments capturaba de menos en silencio (infra-cobro del
+  // profesional, invisible para cualquier cola de admin).
+  const ampliacionSinPago = presupuesto.ampliaciones.find(
+    (a) => !pagosConfirmados.some((p) => p.ampliacionId === a.id)
+  );
+  if (ampliacionSinPago) {
+    return res.status(409).json({
+      error: 'Hay una ampliación aceptada cuyo pago todavía no está autorizado', code: 'AMPLIACION_SIN_PAGO_CONFIRMADO',
+    });
+  }
+
   const montoAmpliaciones = presupuesto.ampliaciones.reduce(
     (acc, a) => acc + Number(a.montoAdicional ?? 0),
     0

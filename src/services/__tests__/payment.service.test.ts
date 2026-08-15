@@ -530,6 +530,38 @@ describe('releasePayments', () => {
     expect(mockStripe.paymentIntents.cancel).not.toHaveBeenCalled();
   });
 
+  // A2 (auditoría Fable 2026-08-15): antes de este fix, si la base final
+  // pedida excedía lo realmente autorizado (por_horas sin tope, o una
+  // ampliación aceptada sin autorizar), el déficit se ignoraba del todo
+  // — ni error, ni log, ni registro. Ahora al menos queda un log
+  // greppable en Render con el importe exacto sin cubrir, aunque la
+  // liberación de lo que SÍ está autorizado siga adelante con
+  // normalidad (no tiene sentido bloquear el dinero que sí se puede
+  // cobrar esperando una autorización que quizá no llegue nunca).
+  it('si la base final pedida excede lo realmente autorizado, libera lo que hay y registra el déficit con un log, sin fallar', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([pagoRetenido()]); // base autorizada: 100
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue(solicitudConProfesional);
+    mockStripe.paymentIntents.capture.mockResolvedValue({ id: 'pi_123', latest_charge: 'ch_456' });
+    mockStripe.transfers.create.mockResolvedValue({ id: 'tr_789' });
+    mockPrisma.payment.update.mockResolvedValue({ estado: 'liberado' });
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    // Se piden 150 de base pero solo hay 100 autorizados — déficit de 50.
+    await releasePayments('sr-1', 150);
+
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('LIBERACION_INCOMPLETA_FALTA_AUTORIZACION')
+    );
+    expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('baseSinCubrir=50'));
+    // Lo que SÍ está autorizado se captura y transfiere entero, sin bloquear.
+    expect(mockStripe.paymentIntents.capture).toHaveBeenCalledWith('pi_123', undefined, {
+      idempotencyKey: 'cap_pago-1',
+    });
+    expect(mockStripe.transfers.create).toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
+  });
+
   it('cancela sin cobrar las autorizaciones que sobran una vez cubierta la base final', async () => {
     const pagoInicial = pagoRetenido({ id: 'pago-1', stripePaymentIntentId: 'pi_inicial', montoBase: 100, montoTotal: 105, montoProfesional: 95 });
     const pagoAmpliacion = pagoRetenido({
