@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { z } from 'zod';
+import { UserRole } from '@prisma/client';
 import { firebaseAuth } from '../config/firebase';
 import { prisma } from '../config/prisma';
 import { enviarEmail } from '../services/email.service';
@@ -34,6 +35,20 @@ const refreshSchema = z.object({
   refreshToken: z.string().min(1),
 });
 
+/**
+ * Construye la respuesta de tokens de un registro — usada tanto en el
+ * camino de creación normal como en los dos caminos idempotentes de
+ * abajo (P2 #6), para no repetir tres veces la misma forma de payload.
+ */
+function respuestaTokensRegistro(usuario: { id: string; nombre: string; role: UserRole; sessionVersion: number }) {
+  const payload = { userId: usuario.id, role: usuario.role };
+  return {
+    accessToken: generateAccessToken(payload),
+    refreshToken: generateRefreshToken({ ...payload, sessionVersion: usuario.sessionVersion }),
+    usuario: { id: usuario.id, nombre: usuario.nombre, role: usuario.role },
+  };
+}
+
 export async function register(req: Request, res: Response) {
   const parsed = registerSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -65,10 +80,7 @@ export async function register(req: Request, res: Response) {
 
   // ÚNICO punto de todo el backend que decide "ya existe": busca por
   // firebaseUid (el mismo usuario de Firebase intentando registrarse
-  // dos veces), por email o por teléfono ya usados por OTRA cuenta. Si
-  // esto devuelve un 409, hay una fila real en tu base de datos ahora
-  // mismo que choca — no hay otra ruta de código que produzca este
-  // mensaje. Log explícito para que quede constancia en el servidor.
+  // dos veces), por email o por teléfono ya usados por OTRA cuenta.
   const condicionesExistente: Array<{ firebaseUid: string } | { email: string } | { telefono: string }> = [
     { firebaseUid: decoded.uid },
   ];
@@ -77,6 +89,29 @@ export async function register(req: Request, res: Response) {
 
   const existente = await prisma.user.findFirst({ where: { OR: condicionesExistente } });
   if (existente) {
+    // P2 #6: si coincide por firebaseUid, es la MISMA identidad de
+    // Firebase reintentando /register — lo más probable es que un
+    // intento anterior ya creó esta fila y la respuesta se perdió (red,
+    // cold start de Render, fallo al guardar localmente...) antes de
+    // llegar al cliente. Tratarlo como un 409 dejaría al usuario sin
+    // cuenta utilizable: Firebase ya existe, Postgres ya existe, pero
+    // no tiene forma de entrar. Éxito idempotente: no se crea nada
+    // nuevo, se reemiten los mismos tokens que un registro normal.
+    if (existente.firebaseUid === decoded.uid) {
+      // Mismo control que ya hace login(): una cuenta desactivada no
+      // puede recibir tokens nuevos por ninguna vía, ni siquiera la de
+      // reintento idempotente — sin esto, un reintento de /register
+      // tras la desactivación se saltaría por completo ese control.
+      if (!existente.activo) {
+        return res.status(403).json({ error: 'Esta cuenta ha sido desactivada', code: 'AUTH_ACCOUNT_DISABLED' });
+      }
+      console.log(`[auth.register] Reintento idempotente: firebaseUid=${decoded.uid} ya tiene fila (id=${existente.id}) — se reemiten tokens sin crear nada nuevo.`);
+      return res.status(200).json(respuestaTokensRegistro(existente));
+    }
+
+    // Coincide por email/teléfono pero con OTRO firebaseUid: es una
+    // identidad de Firebase distinta intentando usar un contacto ya
+    // registrado por otra cuenta — conflicto real, no un reintento.
     console.log(
       `[auth.register] 409: ya existe fila en Postgres para email=${email} telefono=${telefonoVerificado} ` +
       `(id=${existente.id}, creado=${existente.createdAt.toISOString()}, firebaseUid=${existente.firebaseUid})`
@@ -118,20 +153,33 @@ export async function register(req: Request, res: Response) {
 
       return usuario;
     });
-  } catch (e) {
+  } catch (e: any) {
+    // P2 #6: carrera de dos /register simultáneos con el MISMO
+    // firebaseUid — el findFirst de arriba pudo no ver todavía la fila
+    // que el otro request está a punto de confirmar. El perdedor choca
+    // aquí contra UNIQUE(firebase_uid), la garantía final en BD. Un
+    // único intento de relectura: si la fila que ganó la carrera es
+    // justo esta misma identidad, se resuelve con el mismo éxito
+    // idempotente de arriba. Si no corresponde (ej. chocó por email con
+    // OTRA identidad) o no aparece, se propaga el error tal cual — sin
+    // más reintentos.
+    if (e?.code === 'P2002') {
+      const ganador = await prisma.user.findUnique({ where: { firebaseUid: decoded.uid } });
+      if (ganador) {
+        if (!ganador.activo) {
+          return res.status(403).json({ error: 'Esta cuenta ha sido desactivada', code: 'AUTH_ACCOUNT_DISABLED' });
+        }
+        console.log(`[auth.register] P2002 en create resuelto por relectura: firebaseUid=${decoded.uid} ya existe (id=${ganador.id}).`);
+        return res.status(200).json(respuestaTokensRegistro(ganador));
+      }
+    }
     console.error('[auth.register] Fallo al crear usuario/profesional en la transacción:', e);
     throw e; // lo captura asyncHandler → errorHandler global, no queda colgado
   }
 
   console.log(`[auth.register] Usuario creado correctamente: id=${nuevoUsuario.id}, email=${nuevoUsuario.email}, role=${nuevoUsuario.role}`);
 
-  const payload = { userId: nuevoUsuario.id, role: nuevoUsuario.role };
-
-  return res.status(201).json({
-    accessToken: generateAccessToken(payload),
-    refreshToken: generateRefreshToken({ ...payload, sessionVersion: nuevoUsuario.sessionVersion }),
-    usuario: { id: nuevoUsuario.id, nombre: nuevoUsuario.nombre, role: nuevoUsuario.role },
-  });
+  return res.status(201).json(respuestaTokensRegistro(nuevoUsuario));
 }
 
 export async function login(req: Request, res: Response) {

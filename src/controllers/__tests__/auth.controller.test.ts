@@ -113,9 +113,12 @@ describe('register', () => {
     expect(mockTx.professional.create).not.toHaveBeenCalled();
   });
 
-  it('devuelve 409 sin tocar la transacción si ya existe email/teléfono/firebaseUid', async () => {
-    mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-3', email: 'existente@example.com' });
-    mockPrisma.user.findFirst.mockResolvedValue({ id: 'user-3', email: 'existente@example.com', createdAt: new Date(), firebaseUid: 'fb-uid-3' });
+  // P2 #6, caso 4: OTRA identidad de Firebase (firebaseUid distinto)
+  // intentando usar un email ya registrado por otra cuenta — conflicto
+  // real, no un reintento de la misma persona.
+  it('devuelve 409 sin tocar la transacción si el email/teléfono ya existe bajo OTRO firebaseUid', async () => {
+    mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-nuevo', email: 'existente@example.com' });
+    mockPrisma.user.findFirst.mockResolvedValue({ id: 'user-3', email: 'existente@example.com', createdAt: new Date(), firebaseUid: 'fb-uid-3-original' });
     const res = fakeRes();
 
     await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Existente', role: 'cliente' }), res);
@@ -144,6 +147,199 @@ describe('register', () => {
 
     expect(res.status).toHaveBeenCalledWith(400);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'AUTH_FIREBASE_TOKEN_NO_CONTACT' }));
+  });
+
+  describe('P2 #6 — idempotencia por firebaseUid', () => {
+    // Caso central: la respuesta de un registro anterior se perdió,
+    // pero Postgres ya tiene la fila — un reintento con el MISMO
+    // firebaseUid debe recuperar la cuenta, no chocar contra un 409.
+    it('mismo firebaseUid ya existente → éxito idempotente (200), sin crear nada nuevo', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-existente', email: 'ya-registrado@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue({
+        id: 'user-existente', email: 'ya-registrado@example.com', nombre: 'Ya Registrado', role: 'cliente',
+        firebaseUid: 'fb-uid-existente', sessionVersion: 2, activo: true, createdAt: new Date(),
+      });
+      const res = fakeRes();
+
+      await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Ya Registrado', role: 'cliente' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ accessToken: 'fake-access-token', refreshToken: 'fake-refresh-token', usuario: expect.objectContaining({ id: 'user-existente' }) })
+      );
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+      expect(mockTx.user.create).not.toHaveBeenCalled();
+      expect(mockTx.professional.create).not.toHaveBeenCalled();
+    });
+
+    // El match por firebaseUid manda por encima de cualquier otra
+    // comparación — aunque el email decodificado del token actual no
+    // coincida textualmente con el guardado (ej. el usuario lo cambió
+    // en Firebase), sigue siendo la MISMA identidad.
+    it('mismo firebaseUid con email decodificado distinto al guardado → sigue siendo éxito idempotente', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-existente', email: 'email-nuevo@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue({
+        id: 'user-existente', email: 'email-viejo@example.com', nombre: 'Ya Registrado', role: 'cliente',
+        firebaseUid: 'fb-uid-existente', sessionVersion: 0, activo: true, createdAt: new Date(),
+      });
+      const res = fakeRes();
+
+      await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Ya Registrado', role: 'cliente' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('el reintento idempotente usa la sessionVersion ACTUAL de la fila, no 0', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-existente', email: 'ya-registrado@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue({
+        id: 'user-existente', email: 'ya-registrado@example.com', nombre: 'Ya Registrado', role: 'cliente',
+        firebaseUid: 'fb-uid-existente', sessionVersion: 3, activo: true, createdAt: new Date(),
+      });
+      const res = fakeRes();
+
+      await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Ya Registrado', role: 'cliente' }), res);
+
+      expect(mockGenerateRefreshToken).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-existente', sessionVersion: 3 })
+      );
+    });
+
+    // Carrera: dos /register simultáneos con el mismo firebaseUid — el
+    // findFirst de ambos no vio todavía la fila del otro. El perdedor
+    // choca contra UNIQUE(firebase_uid) en el create.
+    it('P2002 en create por firebaseUid → relee y resuelve con el mismo éxito idempotente', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-carrera', email: 'carrera@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue(null); // no lo vio venir
+      const p2002: any = new Error('Unique constraint failed on the fields: (`firebase_uid`)');
+      p2002.code = 'P2002';
+      mockPrisma.$transaction.mockRejectedValueOnce(p2002);
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'user-ganador', email: 'carrera@example.com', nombre: 'Ganador', role: 'cliente',
+        firebaseUid: 'fb-uid-carrera', sessionVersion: 0, activo: true,
+      });
+      const res = fakeRes();
+
+      await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Perdedor', role: 'cliente' }), res);
+
+      expect(mockPrisma.user.findUnique).toHaveBeenCalledWith({ where: { firebaseUid: 'fb-uid-carrera' } });
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ usuario: expect.objectContaining({ id: 'user-ganador' }) }));
+      expect(mockTx.professional.create).not.toHaveBeenCalled(); // nunca llegó a ejecutar el segundo paso de la transacción del perdedor
+    });
+
+    // Si la relectura no encuentra nada con ESTE firebaseUid (el P2002
+    // fue por otra causa, ej. email/teléfono chocando con OTRA
+    // identidad), no hay nada seguro que devolver — se propaga tal cual.
+    it('P2002 sin fila recuperable para este firebaseUid → propaga el error, sin más reintentos', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-sin-suerte', email: 'sin-suerte@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue(null);
+      const p2002: any = new Error('Unique constraint failed on the fields: (`email`)');
+      p2002.code = 'P2002';
+      mockPrisma.$transaction.mockRejectedValueOnce(p2002);
+      mockPrisma.user.findUnique.mockResolvedValue(null); // no existe fila con ESTE firebaseUid
+      const res = fakeRes();
+
+      await expect(
+        register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Sin Suerte', role: 'cliente' }), res)
+      ).rejects.toBe(p2002);
+
+      expect(mockPrisma.user.findUnique).toHaveBeenCalledTimes(1); // un único intento de relectura, sin bucle
+    });
+
+    it('un error de la transacción que NO es P2002 se propaga sin intentar relectura', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-db-caida', email: 'db-caida@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue(null);
+      const errorConexion: any = new Error('Conexión a la base de datos perdida');
+      errorConexion.code = 'P1001';
+      mockPrisma.$transaction.mockRejectedValueOnce(errorConexion);
+      const res = fakeRes();
+
+      await expect(
+        register(fakeReq({ firebaseIdToken: 'tok', nombre: 'DB Caída', role: 'cliente' }), res)
+      ).rejects.toBe(errorConexion);
+
+      expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  // Regresión encontrada en la revisión adversarial de P2 #6: el camino
+  // idempotente puede devolver tokens para un User existente, así que
+  // necesita el MISMO control de activo que ya tiene login() — sin él,
+  // un reintento de /register tras una desactivación se lo saltaría.
+  describe('P2 #6 — AUTH_ACCOUNT_DISABLED en los caminos idempotentes', () => {
+    it('findFirst idempotente + activo=true → 200 normal', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-activo', email: 'activo@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue({
+        id: 'user-activo', email: 'activo@example.com', nombre: 'Activo', role: 'cliente',
+        firebaseUid: 'fb-uid-activo', sessionVersion: 0, activo: true, createdAt: new Date(),
+      });
+      const res = fakeRes();
+
+      await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Activo', role: 'cliente' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ accessToken: 'fake-access-token' }));
+    });
+
+    it('findFirst idempotente + activo=false → 403 AUTH_ACCOUNT_DISABLED, sin tokens', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-desactivado', email: 'desactivado@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue({
+        id: 'user-desactivado', email: 'desactivado@example.com', nombre: 'Desactivado', role: 'cliente',
+        firebaseUid: 'fb-uid-desactivado', sessionVersion: 0, activo: false, createdAt: new Date(),
+      });
+      const res = fakeRes();
+      mockGenerateRefreshToken.mockClear();
+
+      await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Desactivado', role: 'cliente' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'AUTH_ACCOUNT_DISABLED' }));
+      expect(res.json).not.toHaveBeenCalledWith(expect.objectContaining({ accessToken: expect.anything() }));
+      expect(mockGenerateRefreshToken).not.toHaveBeenCalled();
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+      expect(mockTx.user.create).not.toHaveBeenCalled();
+      expect(mockTx.professional.create).not.toHaveBeenCalled();
+    });
+
+    it('carrera P2002 recuperada + activo=true → 200 normal', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-carrera-activo', email: 'carrera-activo@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue(null);
+      const p2002: any = new Error('Unique constraint failed on the fields: (`firebase_uid`)');
+      p2002.code = 'P2002';
+      mockPrisma.$transaction.mockRejectedValueOnce(p2002);
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'user-ganador-activo', email: 'carrera-activo@example.com', nombre: 'Ganador', role: 'cliente',
+        firebaseUid: 'fb-uid-carrera-activo', sessionVersion: 0, activo: true,
+      });
+      const res = fakeRes();
+
+      await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Perdedor', role: 'cliente' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ usuario: expect.objectContaining({ id: 'user-ganador-activo' }) }));
+    });
+
+    it('carrera P2002 recuperada + activo=false → 403 AUTH_ACCOUNT_DISABLED, sin tokens', async () => {
+      mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-carrera-desactivado', email: 'carrera-desactivado@example.com' });
+      mockPrisma.user.findFirst.mockResolvedValue(null);
+      const p2002: any = new Error('Unique constraint failed on the fields: (`firebase_uid`)');
+      p2002.code = 'P2002';
+      mockPrisma.$transaction.mockRejectedValueOnce(p2002);
+      mockPrisma.user.findUnique.mockResolvedValue({
+        id: 'user-ganador-desactivado', email: 'carrera-desactivado@example.com', nombre: 'Ganador', role: 'cliente',
+        firebaseUid: 'fb-uid-carrera-desactivado', sessionVersion: 0, activo: false,
+      });
+      const res = fakeRes();
+      mockGenerateRefreshToken.mockClear();
+
+      await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Perdedor', role: 'cliente' }), res);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'AUTH_ACCOUNT_DISABLED' }));
+      expect(mockGenerateRefreshToken).not.toHaveBeenCalled();
+      expect(mockTx.professional.create).not.toHaveBeenCalled();
+    });
   });
 });
 
