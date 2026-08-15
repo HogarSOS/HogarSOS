@@ -1006,10 +1006,20 @@ export async function completeServiceRequest(req: Request, res: Response) {
   );
   const precioFinal = Number(presupuesto.monto) + montoAmpliaciones;
 
-  await prisma.serviceRequest.update({
-    where: { id },
+  // updateMany condicionado al estado ya comprobado arriba (no un
+  // update plano): entre el findUnique del principio de esta función y
+  // este punto no hay ninguna otra escritura, pero sí puede haberla de
+  // OTRA petición concurrente (p.ej. el cliente cancelando desde otro
+  // dispositivo justo aquí) — sin esto, esta escritura resucitaría una
+  // solicitud ya cancelada/reembolsada a 'completada' (auditoría Fable
+  // 2026-08-15, hallazgo A1).
+  const { count: completadaCount } = await prisma.serviceRequest.updateMany({
+    where: { id, estado: { in: ['aceptada', 'en_progreso'] } },
     data: { estado: 'completada', precioFinal, completadaAt: new Date() },
   });
+  if (completadaCount === 0) {
+    return res.status(409).json({ error: 'La solicitud no está en un estado válido para completarse', code: 'REQUEST_INVALID_STATE_COMPLETE' });
+  }
 
   enviarNotificacion(solicitud.clienteId, 'solicitud_completada', {}, { solicitudId: id }).catch((e) =>
     console.error(`[completeServiceRequest] Error al notificar al cliente de ${id}:`, e)
@@ -1133,20 +1143,42 @@ export async function responderCierreHoras(req: Request, res: Response) {
     });
   }
 
-  const { count } = await prisma.cierreHoras.updateMany({
-    where: { id: cierreId, estado: 'pendiente' },
-    data: { estado: 'aceptado', resueltaAt: new Date() },
-  });
-  if (count === 0) {
-    return res.status(409).json({ error: 'Este cierre ya no está pendiente de respuesta', code: 'HOURS_CLOSURE_NOT_PENDING' });
-  }
-
   const precioFinal = Number(presupuesto.tarifaHora) * Number(cierre.horasReales);
 
-  await prisma.serviceRequest.update({
-    where: { id },
-    data: { estado: 'completada', precioFinal, completadaAt: new Date() },
+  // Las dos escrituras (cierre -> 'aceptado' y solicitud -> 'completada')
+  // van en una sola transacción: si la solicitud ya no está en un estado
+  // válido (p.ej. el cliente la canceló desde otro dispositivo, o quedó
+  // 'disputada' entre medias), la BD revierte también el cambio del
+  // cierre, en vez de dejarlo "aceptado" para siempre sin que la
+  // solicitud llegue a completarse ni el pago se libere. Antes de esto,
+  // responderCierreHoras ni siquiera comprobaba solicitud.estado, así
+  // que podía completar y liberar el pago de una solicitud 'disputada',
+  // saltándose el bloqueo que sí tiene completeServiceRequest (auditoría
+  // Fable 2026-08-15, hallazgo A1).
+  const resultado = await prisma.$transaction(async (tx) => {
+    const cierreUpdate = await tx.cierreHoras.updateMany({
+      where: { id: cierreId, estado: 'pendiente' },
+      data: { estado: 'aceptado', resueltaAt: new Date() },
+    });
+    if (cierreUpdate.count === 0) {
+      return { ok: false as const, code: 'HOURS_CLOSURE_NOT_PENDING' as const };
+    }
+    const solicitudUpdate = await tx.serviceRequest.updateMany({
+      where: { id, estado: { in: ['aceptada', 'en_progreso'] } },
+      data: { estado: 'completada', precioFinal, completadaAt: new Date() },
+    });
+    if (solicitudUpdate.count === 0) {
+      return { ok: false as const, code: 'REQUEST_INVALID_STATE_COMPLETE' as const };
+    }
+    return { ok: true as const };
   });
+
+  if (!resultado.ok) {
+    const mensaje = resultado.code === 'HOURS_CLOSURE_NOT_PENDING'
+      ? 'Este cierre ya no está pendiente de respuesta'
+      : 'La solicitud no está en un estado válido para confirmar las horas';
+    return res.status(409).json({ error: mensaje, code: resultado.code });
+  }
 
   if (solicitud.profesionalId) {
     enviarNotificacion(solicitud.profesionalId, 'cierre_horas_aceptado', {}, { solicitudId: id }).catch((e) =>

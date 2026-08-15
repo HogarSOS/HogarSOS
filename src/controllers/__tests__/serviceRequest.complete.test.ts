@@ -1,12 +1,18 @@
 import { Request, Response } from 'express';
 
-jest.mock('../../config/prisma', () => ({
-  prisma: {
-    serviceRequest: { findUnique: jest.fn(), update: jest.fn() },
+jest.mock('../../config/prisma', () => {
+  const prismaMock: any = {
+    serviceRequest: { findUnique: jest.fn(), updateMany: jest.fn() },
     payment: { findFirst: jest.fn(), findMany: jest.fn() },
     cierreHoras: { findFirst: jest.fn(), create: jest.fn(), findUnique: jest.fn(), updateMany: jest.fn() },
-  },
-}));
+  };
+  // $transaction ejecuta el callback pasándole el propio mock como `tx`
+  // — así las llamadas hechas "dentro" de la transacción (A1) siguen
+  // siendo visibles como mockPrisma.cierreHoras.updateMany /
+  // mockPrisma.serviceRequest.updateMany en los tests, sin duplicar mocks.
+  prismaMock.$transaction = jest.fn((fn: any) => fn(prismaMock));
+  return { prisma: prismaMock };
+});
 
 jest.mock('../../services/payment.service', () => ({
   releasePayments: jest.fn(),
@@ -44,6 +50,7 @@ describe('completeServiceRequest', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockPrisma.payment.findFirst.mockResolvedValue({ id: 'pago-1', estado: 'retenido' });
+    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 1 });
     mockReleasePayments.mockResolvedValue([{ estado: 'liberado' }]);
     mockDiagnosticarPagoSinConfirmar.mockResolvedValue('nunca_autorizado');
   });
@@ -60,7 +67,7 @@ describe('completeServiceRequest', () => {
     const res = fakeRes();
     await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
 
-    expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+    expect(mockPrisma.serviceRequest.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ estado: 'completada', precioFinal: 180 }) })
     );
     expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 180);
@@ -84,10 +91,35 @@ describe('completeServiceRequest', () => {
     const res = fakeRes();
     await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
 
-    expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+    expect(mockPrisma.serviceRequest.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ estado: 'completada', precioFinal: 250 }) })
     );
     expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 250);
+  });
+
+  // A1 (auditoría Fable 2026-08-15): el update a 'completada' está
+  // condicionado al estado real en el momento de la escritura, no al
+  // que tenía la solicitud cuando se leyó al principio de la función.
+  // Este test simula la carrera: entre el findUnique y este punto, otra
+  // petición (p.ej. una cancelación desde otro dispositivo) ya movió la
+  // solicitud fuera de 'aceptada'/'en_progreso' — el updateMany
+  // condicionado no encuentra fila que actualizar (count: 0).
+  it('"cerrado": si la solicitud dejó de estar en un estado válido justo antes de escribir (carrera con una cancelación concurrente), devuelve 409 y no libera el pago', async () => {
+    mockPrisma.serviceRequest.findUnique.mockResolvedValue({
+      id: 'sr-1',
+      clienteId: 'cliente-1',
+      profesionalId: 'pro-1',
+      estado: 'aceptada',
+      presupuestos: [{ id: 'pres-1', tipo: 'cerrado', monto: 180, ampliaciones: [] }],
+    });
+    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 0 });
+
+    const res = fakeRes();
+    await completeServiceRequest(fakeReq({ id: 'sr-1' }, 'pro-1'), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'REQUEST_INVALID_STATE_COMPLETE' }));
+    expect(mockReleasePayments).not.toHaveBeenCalled();
   });
 
   // P1 (auditoría 2026-08-14): PAGO_NO_AUTORIZADO_TODAVIA agrupaba dos
@@ -180,7 +212,7 @@ describe('completeServiceRequest', () => {
     expect(mockPrisma.cierreHoras.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ serviceRequestId: 'sr-1', horasReales: 3.5 }) })
     );
-    expect(mockPrisma.serviceRequest.update).not.toHaveBeenCalled();
+    expect(mockPrisma.serviceRequest.updateMany).not.toHaveBeenCalled();
     expect(mockReleasePayments).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(202);
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
@@ -250,7 +282,7 @@ describe('completeServiceRequest', () => {
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({ code: 'HOURS_CLOSURE_ALREADY_PENDING' })
     );
-    expect(mockPrisma.serviceRequest.update).not.toHaveBeenCalled();
+    expect(mockPrisma.serviceRequest.updateMany).not.toHaveBeenCalled();
     expect(mockReleasePayments).not.toHaveBeenCalled();
   });
 
@@ -398,6 +430,7 @@ describe('responderCierreHoras', () => {
       id: 'cierre-1', serviceRequestId: 'sr-1', horasReales: 3.5, estado: 'pendiente',
     });
     mockPrisma.cierreHoras.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 1 });
     mockReleasePayments.mockResolvedValue([{ estado: 'liberado' }]);
     mockDiagnosticarPagoSinConfirmar.mockResolvedValue('nunca_autorizado');
   });
@@ -406,7 +439,7 @@ describe('responderCierreHoras', () => {
     const res = fakeRes();
     await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar' }), res);
 
-    expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+    expect(mockPrisma.serviceRequest.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ estado: 'completada', precioFinal: 87.5 }) })
     );
     expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 87.5);
@@ -422,7 +455,7 @@ describe('responderCierreHoras', () => {
     const res = fakeRes();
     await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'rechazar' }), res);
 
-    expect(mockPrisma.serviceRequest.update).not.toHaveBeenCalled();
+    expect(mockPrisma.serviceRequest.updateMany).not.toHaveBeenCalled();
     expect(mockReleasePayments).not.toHaveBeenCalled();
     expect(mockEnviarNotificacion).toHaveBeenCalledWith(
       'pro-1',
@@ -474,6 +507,26 @@ describe('responderCierreHoras', () => {
     expect(res.status).toHaveBeenCalledWith(409);
   });
 
+  // A1 (auditoría Fable 2026-08-15): antes de este fix, aceptar un cierre
+  // marcaba el CierreHoras como 'aceptado' y luego escribía 'completada'
+  // en la solicitud sin comprobar su estado real — funcionaba incluso
+  // sobre una solicitud 'disputada' o ya cancelada por otro canal,
+  // saltándose el bloqueo que sí tiene completeServiceRequest. Ahora
+  // ambas escrituras van en una transacción: si la solicitud ya no está
+  // en un estado válido cuando se intenta el segundo update, la
+  // transacción entera se revierte (el cierre NO queda 'aceptado' a
+  // medias).
+  it('si la solicitud ya no está en un estado válido cuando se intenta completar (p.ej. quedó "disputada" entre medias), la transacción se revierte y no libera el pago', async () => {
+    mockPrisma.serviceRequest.updateMany.mockResolvedValue({ count: 0 });
+
+    const res = fakeRes();
+    await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'cliente-1', { accion: 'aceptar' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'REQUEST_INVALID_STATE_COMPLETE' }));
+    expect(mockReleasePayments).not.toHaveBeenCalled();
+  });
+
   it('devuelve 403 si quien responde no es el cliente dueño', async () => {
     const res = fakeRes();
     await responderCierreHoras(fakeReq({ id: 'sr-1', cierreId: 'cierre-1' }, 'otro-usuario', { accion: 'aceptar' }), res);
@@ -518,7 +571,7 @@ describe('responderCierreHoras', () => {
 
       expect(mockPrisma.cierreHoras.updateMany).toHaveBeenCalled();
       // G) cálculo final: 50€/h × 10h = 500€.
-      expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+      expect(mockPrisma.serviceRequest.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ precioFinal: 500 }) })
       );
       expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 500);
@@ -535,7 +588,7 @@ describe('responderCierreHoras', () => {
 
       expect(mockPrisma.cierreHoras.updateMany).toHaveBeenCalled();
       // G) cálculo final: 50€/h × 7h = 350€.
-      expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+      expect(mockPrisma.serviceRequest.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ precioFinal: 350 }) })
       );
       expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 350);
@@ -560,7 +613,7 @@ describe('responderCierreHoras', () => {
       );
       // El cierre sigue pendiente — nada de esto se ejecutó todavía.
       expect(mockPrisma.cierreHoras.updateMany).not.toHaveBeenCalled();
-      expect(mockPrisma.serviceRequest.update).not.toHaveBeenCalled();
+      expect(mockPrisma.serviceRequest.updateMany).not.toHaveBeenCalled();
       expect(mockReleasePayments).not.toHaveBeenCalled();
     });
 
@@ -577,7 +630,7 @@ describe('responderCierreHoras', () => {
 
       expect(mockPrisma.cierreHoras.updateMany).toHaveBeenCalled();
       // G) cálculo final: 50€/h × 1h = 50€ — nunca los 500€ autorizados.
-      expect(mockPrisma.serviceRequest.update).toHaveBeenCalledWith(
+      expect(mockPrisma.serviceRequest.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ data: expect.objectContaining({ precioFinal: 50 }) })
       );
       expect(mockReleasePayments).toHaveBeenCalledWith('sr-1', 50);
