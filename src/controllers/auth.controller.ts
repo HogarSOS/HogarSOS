@@ -129,7 +129,7 @@ export async function register(req: Request, res: Response) {
 
   return res.status(201).json({
     accessToken: generateAccessToken(payload),
-    refreshToken: generateRefreshToken(payload),
+    refreshToken: generateRefreshToken({ ...payload, sessionVersion: nuevoUsuario.sessionVersion }),
     usuario: { id: nuevoUsuario.id, nombre: nuevoUsuario.nombre, role: nuevoUsuario.role },
   });
 }
@@ -163,7 +163,7 @@ export async function login(req: Request, res: Response) {
 
   return res.json({
     accessToken: generateAccessToken(payload),
-    refreshToken: generateRefreshToken(payload),
+    refreshToken: generateRefreshToken({ ...payload, sessionVersion: usuario.sessionVersion }),
     usuario: { id: usuario.id, nombre: usuario.nombre, role: usuario.role },
   });
 }
@@ -298,6 +298,19 @@ export async function refreshToken(req: Request, res: Response) {
       return res.status(403).json({ error: 'Usuario no válido', code: 'AUTH_USER_INVALID' });
     }
 
+    // P2 #4: un refresh token emitido antes de un logout lleva la
+    // versión de sesión de ese momento — si no coincide con la actual,
+    // la sesión fue cerrada y el token ya no sirve. `?? 0` es
+    // deliberado: un refresh token emitido ANTES de que existiera este
+    // campo (todo el parque de sesiones reales en el momento de
+    // desplegar este cambio) no lo lleva, y debe seguir funcionando con
+    // normalidad hasta el primer logout real de ese usuario — sin este
+    // fallback, el despliegue desconectaría de golpe a todos los
+    // usuarios con sesión activa en ese instante.
+    if ((payload.sessionVersion ?? 0) !== usuario.sessionVersion) {
+      return res.status(401).json({ error: 'Refresh token inválido o expirado', code: 'AUTH_REFRESH_TOKEN_INVALID' });
+    }
+
     return res.json({
       accessToken: generateAccessToken({ userId: usuario.id, role: usuario.role }),
     });
@@ -305,4 +318,23 @@ export async function refreshToken(req: Request, res: Response) {
     console.error('[auth.refreshToken] Refresh token inválido o expirado:', e);
     return res.status(401).json({ error: 'Refresh token inválido o expirado', code: 'AUTH_REFRESH_TOKEN_INVALID' });
   }
+}
+
+/**
+ * Revoca todas las sesiones del usuario (todo-o-nada, P2 #4): el
+ * access token vigente sigue funcionando hasta que expire solo (máx.
+ * 15 min, decisión de producto — no se comprueba por petición), pero
+ * cualquier refresh token ya emitido deja de servir en el siguiente
+ * /refresh porque su sessionVersion queda desfasada. `increment`
+ * atómico a propósito: dos logouts casi simultáneos (doble tap, dos
+ * pestañas) dan el mismo resultado final sin importar el orden, sin
+ * necesitar un findUnique+update separado.
+ */
+export async function logout(req: Request, res: Response) {
+  await prisma.user.update({
+    where: { id: req.user!.userId },
+    data: { sessionVersion: { increment: 1 } },
+  });
+
+  return res.json({ success: true });
 }

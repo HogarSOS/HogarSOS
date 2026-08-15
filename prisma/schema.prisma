@@ -35,6 +35,13 @@ model User {
   valoracionMedia          Decimal          @default(0.00) @map("valoracion_media")
   totalValoraciones        Int              @default(0) @map("total_valoraciones")
   activo                   Boolean          @default(true)
+  // Contador de revocación de sesión: se incrementa en cada logout.
+  // /api/auth/refresh compara la versión embebida en el refresh token
+  // contra este valor — si no coinciden, el token es de una sesión ya
+  // cerrada. Todo-o-nada por diseño (cierra sesión en todos los
+  // dispositivos a la vez, no uno concreto) — decisión de producto
+  // P2 #4, 2026-08-15.
+  sessionVersion           Int              @default(0) @map("session_version")
   createdAt                DateTime         @default(now()) @map("created_at")
   updatedAt                DateTime         @updatedAt @map("updated_at")
   professional             Professional?

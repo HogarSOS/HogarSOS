@@ -32,13 +32,14 @@ jest.mock('../../services/token.service', () => ({
 import { prisma } from '../../config/prisma';
 import { firebaseAuth } from '../../config/firebase';
 import { enviarEmail } from '../../services/email.service';
-import { verifyRefreshToken } from '../../services/token.service';
-import { register, login, forgotPassword, refreshToken } from '../auth.controller';
+import { generateRefreshToken, verifyRefreshToken } from '../../services/token.service';
+import { register, login, forgotPassword, refreshToken, logout } from '../auth.controller';
 
 const mockPrisma = prisma as any;
 const mockFirebaseAuth = firebaseAuth as any;
 const mockEnviarEmail = enviarEmail as jest.Mock;
 const mockVerifyRefreshToken = verifyRefreshToken as jest.Mock;
+const mockGenerateRefreshToken = generateRefreshToken as jest.Mock;
 
 function fakeRes(): Response {
   const res: any = {};
@@ -49,6 +50,10 @@ function fakeRes(): Response {
 
 function fakeReq(body: Record<string, unknown>): Request {
   return { body } as unknown as Request;
+}
+
+function fakeAuthedReq(userId: string): Request {
+  return { user: { userId, role: 'cliente' } } as unknown as Request;
 }
 
 beforeEach(() => jest.clearAllMocks());
@@ -72,6 +77,23 @@ describe('register', () => {
     expect(res.status).toHaveBeenCalledWith(201);
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({ accessToken: 'fake-access-token', refreshToken: 'fake-refresh-token' })
+    );
+  });
+
+  // P2 #4: un usuario recién creado nace en sessionVersion 0 (el
+  // default de la columna) — el refresh token que se le emite debe
+  // llevar ese valor explícitamente, no depender del fallback `?? 0`
+  // de /refresh para funcionar desde el primer login.
+  it('el refresh token emitido incluye sessionVersion 0 para un usuario recién creado', async () => {
+    mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-5', email: 'nuevo@example.com' });
+    mockPrisma.user.findFirst.mockResolvedValue(null);
+    mockTx.user.create.mockResolvedValue({ id: 'user-5', email: 'nuevo@example.com', nombre: 'Nuevo', role: 'cliente', sessionVersion: 0 });
+    const res = fakeRes();
+
+    await register(fakeReq({ firebaseIdToken: 'tok', nombre: 'Nuevo', role: 'cliente' }), res);
+
+    expect(mockGenerateRefreshToken).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'user-5', sessionVersion: 0 })
     );
   });
 
@@ -157,6 +179,22 @@ describe('login', () => {
     expect(res.status).toHaveBeenCalledWith(403);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'AUTH_ACCOUNT_DISABLED' }));
   });
+
+  // P2 #4: si el usuario ya cerró sesión antes (sessionVersion > 0), el
+  // siguiente login debe emitir un refresh token con esa versión ACTUAL,
+  // no con 0 — de lo contrario el token recién emitido sería inválido
+  // en su propio primer /refresh.
+  it('incluye la sessionVersion ACTUAL del usuario en el refresh token, no siempre 0', async () => {
+    mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-1' });
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', nombre: 'Ana', role: 'cliente', activo: true, sessionVersion: 3 });
+    const res = fakeRes();
+
+    await login(fakeReq({ firebaseIdToken: 'tok' }), res);
+
+    expect(mockGenerateRefreshToken).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'user-1', sessionVersion: 3 })
+    );
+  });
 });
 
 describe('forgotPassword', () => {
@@ -228,13 +266,42 @@ describe('forgotPassword', () => {
 
 describe('refreshToken', () => {
   it('emite un nuevo access token si el usuario sigue existiendo y activo', async () => {
-    mockVerifyRefreshToken.mockReturnValue({ userId: 'user-1', role: 'cliente' });
-    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'cliente', activo: true });
+    mockVerifyRefreshToken.mockReturnValue({ userId: 'user-1', role: 'cliente', sessionVersion: 0 });
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'cliente', activo: true, sessionVersion: 0 });
     const res = fakeRes();
 
     await refreshToken(fakeReq({ refreshToken: 'valid-refresh' }), res);
 
     expect(res.json).toHaveBeenCalledWith({ accessToken: 'fake-access-token' });
+  });
+
+  // P2 #4 — caso crítico de compatibilidad con el despliegue: un
+  // refresh token emitido ANTES de este cambio no lleva sessionVersion
+  // en absoluto (decoded.sessionVersion === undefined). Sin el
+  // fallback `?? 0` en el controlador, esto desconectaría de golpe a
+  // todo el que tuviera sesión activa en el momento de desplegar.
+  it('un refresh token sin sessionVersion (emitido antes de este cambio) sigue funcionando si el usuario está en versión 0', async () => {
+    mockVerifyRefreshToken.mockReturnValue({ userId: 'user-1', role: 'cliente' }); // sin sessionVersion, como un token pre-migración
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'cliente', activo: true, sessionVersion: 0 });
+    const res = fakeRes();
+
+    await refreshToken(fakeReq({ refreshToken: 'valid-refresh-viejo' }), res);
+
+    expect(res.json).toHaveBeenCalledWith({ accessToken: 'fake-access-token' });
+  });
+
+  // P2 #4: el caso que motiva todo el feature — tras un logout,
+  // sessionVersion del usuario sube y el refresh token viejo (que
+  // lleva la versión anterior) debe dejar de servir.
+  it('devuelve 401 si el sessionVersion del token no coincide con el actual del usuario (sesión ya cerrada)', async () => {
+    mockVerifyRefreshToken.mockReturnValue({ userId: 'user-1', role: 'cliente', sessionVersion: 0 });
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-1', role: 'cliente', activo: true, sessionVersion: 1 });
+    const res = fakeRes();
+
+    await refreshToken(fakeReq({ refreshToken: 'valid-refresh-pero-revocado' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'AUTH_REFRESH_TOKEN_INVALID' }));
   });
 
   // Este es justo el caso que motivó revalidar activo en refresh (ver
@@ -281,5 +348,77 @@ describe('refreshToken', () => {
 
     expect(res.status).toHaveBeenCalledWith(400);
     expect(mockVerifyRefreshToken).not.toHaveBeenCalled();
+  });
+});
+
+describe('logout', () => {
+  it('incrementa atómicamente sessionVersion del usuario autenticado', async () => {
+    mockPrisma.user.update.mockResolvedValue({ id: 'user-1', sessionVersion: 1 });
+    const res = fakeRes();
+
+    await logout(fakeAuthedReq('user-1'), res);
+
+    expect(mockPrisma.user.update).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      data: { sessionVersion: { increment: 1 } },
+    });
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  // Doble tap / dos pestañas: cada llamada debe completarse sin error,
+  // sin depender de leer y comparar un valor previo (por eso `increment`
+  // atómico y no un findUnique+update).
+  it('es idempotente en el sentido de que no falla si se llama dos veces seguidas', async () => {
+    mockPrisma.user.update.mockResolvedValueOnce({ id: 'user-1', sessionVersion: 1 });
+    mockPrisma.user.update.mockResolvedValueOnce({ id: 'user-1', sessionVersion: 2 });
+    const res1 = fakeRes();
+    const res2 = fakeRes();
+
+    await logout(fakeAuthedReq('user-1'), res1);
+    await logout(fakeAuthedReq('user-1'), res2);
+
+    expect(mockPrisma.user.update).toHaveBeenCalledTimes(2);
+    expect(res1.json).toHaveBeenCalledWith({ success: true });
+    expect(res2.json).toHaveBeenCalledWith({ success: true });
+  });
+});
+
+describe('login → logout → refresh (flujo real de revocación)', () => {
+  // Extremo a extremo dentro del alcance de estos tests unitarios: la
+  // versión que login emite hoy es la que /refresh comparará después
+  // de un logout — este test encadena las tres funciones reales (no
+  // solo la comparación aislada) para confirmar que el contrato entre
+  // ellas es consistente.
+  it('un refresh token emitido en login deja de servir tras logout, y uno emitido en un login POSTERIOR sí funciona', async () => {
+    // 1) login inicial: usuario en sessionVersion 0
+    mockFirebaseAuth.verifyIdToken.mockResolvedValue({ uid: 'fb-uid-9' });
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-9', nombre: 'Cara', role: 'cliente', activo: true, sessionVersion: 0 });
+    const resLogin1 = fakeRes();
+    await login(fakeReq({ firebaseIdToken: 'tok' }), resLogin1);
+    const tokenViejo = mockGenerateRefreshToken.mock.calls[mockGenerateRefreshToken.mock.calls.length - 1][0];
+    expect(tokenViejo.sessionVersion).toBe(0);
+
+    // 2) logout: sube a sessionVersion 1
+    mockPrisma.user.update.mockResolvedValue({ id: 'user-9', sessionVersion: 1 });
+    await logout(fakeAuthedReq('user-9'), fakeRes());
+
+    // 3) refresh con el token viejo (sessionVersion 0) contra el usuario ya en versión 1 → 401
+    mockVerifyRefreshToken.mockReturnValue({ userId: 'user-9', role: 'cliente', sessionVersion: tokenViejo.sessionVersion });
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-9', role: 'cliente', activo: true, sessionVersion: 1 });
+    const resRefresh = fakeRes();
+    await refreshToken(fakeReq({ refreshToken: 'token-viejo' }), resRefresh);
+    expect(resRefresh.status).toHaveBeenCalledWith(401);
+
+    // 4) login de nuevo (segundo dispositivo, o el mismo tras el logout): emite versión 1, y ESE sí funciona
+    mockPrisma.user.findUnique.mockResolvedValue({ id: 'user-9', nombre: 'Cara', role: 'cliente', activo: true, sessionVersion: 1 });
+    const resLogin2 = fakeRes();
+    await login(fakeReq({ firebaseIdToken: 'tok' }), resLogin2);
+    const tokenNuevo = mockGenerateRefreshToken.mock.calls[mockGenerateRefreshToken.mock.calls.length - 1][0];
+    expect(tokenNuevo.sessionVersion).toBe(1);
+
+    mockVerifyRefreshToken.mockReturnValue({ userId: 'user-9', role: 'cliente', sessionVersion: tokenNuevo.sessionVersion });
+    const resRefresh2 = fakeRes();
+    await refreshToken(fakeReq({ refreshToken: 'token-nuevo' }), resRefresh2);
+    expect(resRefresh2.json).toHaveBeenCalledWith({ accessToken: 'fake-access-token' });
   });
 });

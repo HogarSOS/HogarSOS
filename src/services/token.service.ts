@@ -13,6 +13,10 @@ console.log('========================================');
 interface TokenPayload {
   userId: string;
   role: UserRole;
+  // Solo se usa (y se firma) en el refresh token — ver
+  // generateRefreshToken. El access token no lo lleva a propósito:
+  // nada lo comprueba por petición, solo /api/auth/refresh (P2 #4).
+  sessionVersion?: number;
 }
 
 const JWT_SECRET = process.env.JWT_SECRET as string;
@@ -67,5 +71,6 @@ export function verifyRefreshToken(token: string): TokenPayload {
   return {
     userId: decoded.userId,
     role: decoded.role,
+    sessionVersion: decoded.sessionVersion,
   };
 }
