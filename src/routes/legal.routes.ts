@@ -111,71 +111,25 @@ router.get('/privacidad', (_req, res) => {
 
 /**
  * Página de inicio pública en la raíz del dominio (hogarsos.es) — antes
- * era el texto plano "Hogar SOS API funcionando" (ver index.ts), nada
- * presentable si alguien visita el dominio directamente. Sencilla a
- * propósito: logo + qué es la app + enlaces legales, no una web de
- * marketing elaborada. El icono SVG reproduce (simplificado) la misma
- * geometría de HogarSosMark (lib/theme/brand_mark.dart): casa blanca +
- * punto coral de acento sobre fondo con degradado de marca.
- */
-/**
- * Portada reducida a "Próximamente" a propósito — la versión anterior
- * (categorías, cómo funciona, modelo de comisión) se queda comentada
- * más abajo por si se quiere recuperar más adelante, pero mientras el
- * producto no esté público no tiene sentido explicarle el
- * funcionamiento a cualquiera que visite el dominio. /privacidad y
- * /terminos siguen igual: no revelan nada del modelo de negocio y
- * hacen falta para las tiendas de apps.
+ * era el texto plano "Hogar SOS API funcionando" (ver index.ts). El
+ * icono SVG reproduce (simplificado) la misma geometría de
+ * HogarSosMark (lib/theme/brand_mark.dart): casa blanca + punto coral
+ * de acento sobre fondo con degradado de marca.
+ *
+ * Restaurada la portada real (auditoría de dominio hogarsos.es para la
+ * revisión de Google Pay, 2026-08-15): "Corporate website" y "Customer
+ * support URL" en la consola de Google Pay & Wallet apuntan a este
+ * dominio, y un "Próximamente" sin contenido no sirve para que Google
+ * verifique la presencia web del negocio. La versión "Próximamente"
+ * (activa entre el 30/07 y el 15/08 mientras el producto no era
+ * público) se deja comentada más abajo por si hiciera falta
+ * reactivarla. /privacidad y /terminos no cambian.
  */
 export function paginaInicio(): string {
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
   ${cabeza(
-    'Hogar SOS — Próximamente',
-    'Hogar SOS está en camino. Muy pronto.',
-    '/'
-  )}
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; color: #1a1a2e; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: linear-gradient(160deg, #EEF0FD, #ffffff); }
-    .logo { display: flex; flex-direction: column; align-items: center; gap: 22px; text-align: center; }
-    .logo .marca { display: flex; align-items: center; gap: 10px; }
-    .logo .marca span { font-size: 24px; font-weight: 800; }
-    .logo .marca span b { color: #FF6A4D; }
-    .proximamente { font-size: 15px; letter-spacing: 2px; text-transform: uppercase; color: #1E8A5A; font-weight: 700; }
-  </style>
-</head>
-<body>
-  <div class="logo">
-    <div class="marca">
-      <svg viewBox="0 0 100 100" width="48" height="48" xmlns="http://www.w3.org/2000/svg">
-        <defs>
-          <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#1E8A5A"/>
-            <stop offset="100%" stop-color="#146B45"/>
-          </linearGradient>
-        </defs>
-        <rect width="100" height="100" rx="22" fill="url(#bg)"/>
-        <polygon points="50,20 80,52 20,52" fill="#fff"/>
-        <rect x="30" y="52" width="40" height="28" rx="6" fill="#fff"/>
-        <circle cx="74" cy="28" r="7" fill="#FF6A4D"/>
-      </svg>
-      <span>Hogar <b>SOS</b></span>
-    </div>
-    <div class="proximamente">Próximamente</div>
-  </div>
-</body>
-</html>`;
-}
-
-/* Versión anterior de la portada, con secciones, categorías y "cómo
- * funciona" — guardada aquí comentada por si se quiere recuperar más
- * adelante en vez de reescribirla desde cero.
-export function _paginaInicioCompleta(): string {
-  return \`<!DOCTYPE html>
-<html lang="es">
-<head>
-  \${cabeza(
     'Hogar SOS — Profesionales de confianza para tu hogar',
     'Hogar SOS conecta a personas que necesitan un servicio a domicilio con profesionales verificados de su zona — electricidad, fontanería, limpieza y mucho más.',
     '/'
@@ -304,7 +258,51 @@ export function _paginaInicioCompleta(): string {
     Hogar SOS · <a href="/privacidad">Política de privacidad</a> · <a href="/terminos">Términos de servicio</a>
   </footer>
 </body>
-</html>\`;
+</html>`;
+}
+
+/* Versión "Próximamente" (activa entre el 30/07 y el 15/08 mientras el
+ * producto no era público) — se deja comentada por si hiciera falta
+ * reactivarla en el futuro.
+export function _paginaInicioProximamente(): string {
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  ${cabeza(
+    'Hogar SOS — Próximamente',
+    'Hogar SOS está en camino. Muy pronto.',
+    '/'
+  )}
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; color: #1a1a2e; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: linear-gradient(160deg, #EEF0FD, #ffffff); }
+    .logo { display: flex; flex-direction: column; align-items: center; gap: 22px; text-align: center; }
+    .logo .marca { display: flex; align-items: center; gap: 10px; }
+    .logo .marca span { font-size: 24px; font-weight: 800; }
+    .logo .marca span b { color: #FF6A4D; }
+    .proximamente { font-size: 15px; letter-spacing: 2px; text-transform: uppercase; color: #1E8A5A; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="logo">
+    <div class="marca">
+      <svg viewBox="0 0 100 100" width="48" height="48" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#1E8A5A"/>
+            <stop offset="100%" stop-color="#146B45"/>
+          </linearGradient>
+        </defs>
+        <rect width="100" height="100" rx="22" fill="url(#bg)"/>
+        <polygon points="50,20 80,52 20,52" fill="#fff"/>
+        <rect x="30" y="52" width="40" height="28" rx="6" fill="#fff"/>
+        <circle cx="74" cy="28" r="7" fill="#FF6A4D"/>
+      </svg>
+      <span>Hogar <b>SOS</b></span>
+    </div>
+    <div class="proximamente">Próximamente</div>
+  </div>
+</body>
+</html>`;
 }
 */
 
