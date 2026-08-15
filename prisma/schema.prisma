@@ -19,6 +19,11 @@ model User {
   nombre                   String
   role                     UserRole         @default(cliente)
   firebaseUid              String?          @unique @map("firebase_uid")
+  // LEGACY (P2 #5, 2026-08-15): reemplazado por UserFcmToken (un token
+  // por instalación/dispositivo, no uno por usuario). Se mantiene sin
+  // escribirse desde el código nuevo, solo como red de seguridad para
+  // un rollback de código — nunca se borra en la migración que añadió
+  // UserFcmToken.
   fcmToken                 String?          @map("fcm_token")
   // Idioma preferido para las notificaciones push — se actualiza solo
   // (sin acción del usuario) desde el dispositivo en cada arranque con
@@ -49,8 +54,33 @@ model User {
   reviewsRecibidas         Review[]         @relation("DestinatarioReview")
   serviceRequestsAsCliente ServiceRequest[] @relation("ClienteRequests")
   archivos                 ArchivoSubido[]
+  fcmTokens                UserFcmToken[]
 
   @@map("users")
+}
+
+/// Un token FCM por instalación/dispositivo (P2 #5, 2026-08-15) —
+/// reemplaza User.fcmToken (un único valor, se pisaba entre
+/// dispositivos sin error visible y podía quedar compartido entre dos
+/// cuentas en un dispositivo reutilizado). La identidad de la fila es
+/// (userId, installationId): el token es mutable dentro de esa fila
+/// (rotación de Firebase = UPDATE en el sitio, nunca una fila nueva).
+/// UNIQUE(token) es la garantía real de que un mismo token físico no
+/// puede quedar vivo bajo dos usuarios a la vez — ver
+/// updateFcmToken en auth.controller.ts.
+model UserFcmToken {
+  id             String   @id @default(uuid())
+  userId         String   @map("user_id")
+  installationId String   @map("installation_id")
+  token          String   @unique
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, installationId])
+  @@index([userId])
+  @@map("user_fcm_tokens")
 }
 
 model ServiceCategory {

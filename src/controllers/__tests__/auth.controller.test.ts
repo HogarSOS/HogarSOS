@@ -1,8 +1,9 @@
 import { Request, Response } from 'express';
 
 const mockTx = {
-  user: { create: jest.fn() },
+  user: { create: jest.fn(), update: jest.fn() },
   professional: { create: jest.fn() },
+  userFcmToken: { deleteMany: jest.fn(), upsert: jest.fn() },
 };
 
 jest.mock('../../config/prisma', () => ({
@@ -33,7 +34,7 @@ import { prisma } from '../../config/prisma';
 import { firebaseAuth } from '../../config/firebase';
 import { enviarEmail } from '../../services/email.service';
 import { generateRefreshToken, verifyRefreshToken } from '../../services/token.service';
-import { register, login, forgotPassword, refreshToken, logout } from '../auth.controller';
+import { register, login, forgotPassword, refreshToken, logout, updateFcmToken } from '../auth.controller';
 
 const mockPrisma = prisma as any;
 const mockFirebaseAuth = firebaseAuth as any;
@@ -54,6 +55,10 @@ function fakeReq(body: Record<string, unknown>): Request {
 
 function fakeAuthedReq(userId: string): Request {
   return { user: { userId, role: 'cliente' } } as unknown as Request;
+}
+
+function fakeAuthedReqConBody(userId: string, body: Record<string, unknown>): Request {
+  return { user: { userId, role: 'cliente' }, body } as unknown as Request;
 }
 
 beforeEach(() => jest.clearAllMocks());
@@ -353,12 +358,11 @@ describe('refreshToken', () => {
 
 describe('logout', () => {
   it('incrementa atómicamente sessionVersion del usuario autenticado', async () => {
-    mockPrisma.user.update.mockResolvedValue({ id: 'user-1', sessionVersion: 1 });
     const res = fakeRes();
 
     await logout(fakeAuthedReq('user-1'), res);
 
-    expect(mockPrisma.user.update).toHaveBeenCalledWith({
+    expect(mockTx.user.update).toHaveBeenCalledWith({
       where: { id: 'user-1' },
       data: { sessionVersion: { increment: 1 } },
     });
@@ -369,17 +373,55 @@ describe('logout', () => {
   // sin depender de leer y comparar un valor previo (por eso `increment`
   // atómico y no un findUnique+update).
   it('es idempotente en el sentido de que no falla si se llama dos veces seguidas', async () => {
-    mockPrisma.user.update.mockResolvedValueOnce({ id: 'user-1', sessionVersion: 1 });
-    mockPrisma.user.update.mockResolvedValueOnce({ id: 'user-1', sessionVersion: 2 });
     const res1 = fakeRes();
     const res2 = fakeRes();
 
     await logout(fakeAuthedReq('user-1'), res1);
     await logout(fakeAuthedReq('user-1'), res2);
 
-    expect(mockPrisma.user.update).toHaveBeenCalledTimes(2);
+    expect(mockTx.user.update).toHaveBeenCalledTimes(2);
     expect(res1.json).toHaveBeenCalledWith({ success: true });
     expect(res2.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  // P2 #5: logout ahora también borra el UserFcmToken de ESTA instalación.
+  it('con installationId: borra SOLO el UserFcmToken de esa instalación', async () => {
+    const res = fakeRes();
+
+    await logout(fakeAuthedReqConBody('user-A', { installationId: 'inst-A' }), res);
+
+    expect(mockTx.userFcmToken.deleteMany).toHaveBeenCalledWith({
+      where: { userId: 'user-A', installationId: 'inst-A' },
+    });
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  it('sin installationId (compatibilidad con cliente antiguo): no falla y no borra ningún UserFcmToken', async () => {
+    const res = fakeRes();
+
+    await logout(fakeAuthedReq('user-1'), res);
+
+    expect(mockTx.userFcmToken.deleteMany).not.toHaveBeenCalled();
+    expect(mockTx.user.update).toHaveBeenCalledWith({
+      where: { id: 'user-1' },
+      data: { sessionVersion: { increment: 1 } },
+    });
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  // El caso que exige el diseño: logout del dispositivo A nunca puede
+  // afectar a los UserFcmToken de otros dispositivos (B, C) del mismo
+  // usuario — el WHERE va por (userId, installationId) de ESTE
+  // dispositivo, nunca por userId solo.
+  it('logout del dispositivo A no puede borrar los tokens de B/C (el WHERE incluye el installationId exacto)', async () => {
+    const res = fakeRes();
+
+    await logout(fakeAuthedReqConBody('user-1', { installationId: 'inst-A' }), res);
+
+    const llamada = mockTx.userFcmToken.deleteMany.mock.calls[0][0];
+    expect(llamada.where).toEqual({ userId: 'user-1', installationId: 'inst-A' });
+    expect(llamada.where.installationId).not.toBe('inst-B');
+    expect(llamada.where.installationId).not.toBe('inst-C');
   });
 });
 
@@ -398,8 +440,9 @@ describe('login → logout → refresh (flujo real de revocación)', () => {
     const tokenViejo = mockGenerateRefreshToken.mock.calls[mockGenerateRefreshToken.mock.calls.length - 1][0];
     expect(tokenViejo.sessionVersion).toBe(0);
 
-    // 2) logout: sube a sessionVersion 1
-    mockPrisma.user.update.mockResolvedValue({ id: 'user-9', sessionVersion: 1 });
+    // 2) logout: sube a sessionVersion 1 (simulado — este test unitario no
+    // comparte estado real de BD entre pasos, el paso 3 fija la nueva
+    // versión a mano en el mock de findUnique)
     await logout(fakeAuthedReq('user-9'), fakeRes());
 
     // 3) refresh con el token viejo (sessionVersion 0) contra el usuario ya en versión 1 → 401
@@ -420,5 +463,188 @@ describe('login → logout → refresh (flujo real de revocación)', () => {
     const resRefresh2 = fakeRes();
     await refreshToken(fakeReq({ refreshToken: 'token-nuevo' }), resRefresh2);
     expect(resRefresh2.json).toHaveBeenCalledWith({ accessToken: 'fake-access-token' });
+  });
+});
+
+describe('updateFcmToken (P2 #5)', () => {
+  it('primera alta: cede cualquier fila con ese token (no debería haber ninguna) y hace upsert de (userId, installationId)', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_A', installationId: 'inst-A' }), res);
+
+    expect(mockTx.userFcmToken.deleteMany).toHaveBeenCalledWith({
+      where: { token: 'TOKEN_A', NOT: { userId: 'user-1', installationId: 'inst-A' } },
+    });
+    expect(mockTx.userFcmToken.upsert).toHaveBeenCalledWith({
+      where: { userId_installationId: { userId: 'user-1', installationId: 'inst-A' } },
+      update: { token: 'TOKEN_A' },
+      create: { userId: 'user-1', installationId: 'inst-A', token: 'TOKEN_A' },
+    });
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  it('mismo user + mismo installationId + mismo token: sigue siendo la misma clave de upsert (una sola fila)', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_A', installationId: 'inst-A' }), res);
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_A', installationId: 'inst-A' }), res);
+
+    expect(mockTx.userFcmToken.upsert).toHaveBeenCalledTimes(2);
+    const [clave1, clave2] = mockTx.userFcmToken.upsert.mock.calls.map((c) => c[0].where.userId_installationId);
+    expect(clave1).toEqual(clave2);
+  });
+
+  // El caso central de la rotación: la clave de upsert es (userId,
+  // installationId), no el token — el token cambia DENTRO de la misma fila.
+  it('rotación del token: mismo (userId, installationId), token nuevo → misma clave, token actualizado', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_VIEJO', installationId: 'inst-A' }), res);
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_NUEVO', installationId: 'inst-A' }), res);
+
+    expect(mockTx.userFcmToken.upsert).toHaveBeenCalledTimes(2);
+    const ultimaLlamada = mockTx.userFcmToken.upsert.mock.calls[1][0];
+    expect(ultimaLlamada.where.userId_installationId).toEqual({ userId: 'user-1', installationId: 'inst-A' });
+    expect(ultimaLlamada.update).toEqual({ token: 'TOKEN_NUEVO' });
+  });
+
+  // El hallazgo central de P2 #5 (dispositivo compartido/reutilizado):
+  // un mismo token físico reclamado por otro (userId, installationId)
+  // debe ceder la fila anterior ANTES de crear/actualizar la nueva —
+  // nunca pueden coexistir ambas.
+  it('mismo token reclamado por otro usuario: cede la fila anterior antes del upsert (nunca coexisten)', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-B', { fcmToken: 'TOKEN_COMPARTIDO', installationId: 'inst-compartida' }), res);
+
+    expect(mockTx.userFcmToken.deleteMany).toHaveBeenCalledWith({
+      where: { token: 'TOKEN_COMPARTIDO', NOT: { userId: 'user-B', installationId: 'inst-compartida' } },
+    });
+    const ordenDeleteMany = mockTx.userFcmToken.deleteMany.mock.invocationCallOrder[0];
+    const ordenUpsert = mockTx.userFcmToken.upsert.mock.invocationCallOrder[0];
+    expect(ordenDeleteMany).toBeLessThan(ordenUpsert);
+  });
+
+  // Fila 'legacy' del backfill de la migración: se trata exactamente
+  // igual que cualquier otro (userId, installationId) — no hay caso
+  // especial en el código, así que se sustituye con el mismo mecanismo
+  // de cesión-por-token en cuanto llega un installationId real.
+  it('fila legacy (installationId="legacy" del backfill): se sustituye igual que cualquier otra al llegar un installationId real', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_MIGRADO', installationId: 'inst-real' }), res);
+
+    expect(mockTx.userFcmToken.deleteMany).toHaveBeenCalledWith({
+      where: { token: 'TOKEN_MIGRADO', NOT: { userId: 'user-1', installationId: 'inst-real' } },
+    });
+  });
+
+  // Compatibilidad con clientes antiguos (transición del despliegue):
+  // sin installationId, el endpoint no debe romperse.
+  it('sin installationId (cliente antiguo): usa "legacy" y no rompe el endpoint', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_CLIENTE_VIEJO' }), res);
+
+    expect(mockTx.userFcmToken.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { userId_installationId: { userId: 'user-1', installationId: 'legacy' } } })
+    );
+    expect(res.status).not.toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+  });
+
+  it('devuelve 400 si falta fcmToken, sin abrir transacción', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { installationId: 'inst-A' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  // Dos instalaciones del mismo usuario no deben interferir entre sí.
+  it('dos instalaciones del mismo usuario producen dos filas independientes (claves distintas)', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_A', installationId: 'inst-A' }), res);
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_B', installationId: 'inst-B' }), res);
+
+    const [clave1, clave2] = mockTx.userFcmToken.upsert.mock.calls.map((c) => c[0].where.userId_installationId);
+    expect(clave1).not.toEqual(clave2);
+    expect(clave1.installationId).toBe('inst-A');
+    expect(clave2.installationId).toBe('inst-B');
+  });
+});
+
+describe('updateFcmToken — retry en P2002 (revisión adversarial P2 #5)', () => {
+  function p2002(): any {
+    const err: any = new Error('Unique constraint failed on the fields: (`token`)');
+    err.code = 'P2002';
+    return err;
+  }
+
+  // Carrera de primera reclamación: dos (userId, installationId) distintos
+  // reclamando el mismo token sin fila previa que ceder. El primer intento
+  // choca con UNIQUE(token) (el ON CONFLICT del upsert solo cubre
+  // (userId, installationId), no token) — el segundo intento, con la fila
+  // ganadora ya visible, cede y upsertea con normalidad.
+  it('P2002 en el primer intento → el segundo intento cede el token y completa con éxito', async () => {
+    const res = fakeRes();
+    (mockPrisma.$transaction as jest.Mock).mockImplementationOnce(() => Promise.reject(p2002()));
+
+    await updateFcmToken(fakeAuthedReqConBody('user-B', { fcmToken: 'TOKEN_COMPARTIDO', installationId: 'inst-B' }), res);
+
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(mockTx.userFcmToken.deleteMany).toHaveBeenCalledWith({
+      where: { token: 'TOKEN_COMPARTIDO', NOT: { userId: 'user-B', installationId: 'inst-B' } },
+    });
+    expect(mockTx.userFcmToken.upsert).toHaveBeenCalledWith({
+      where: { userId_installationId: { userId: 'user-B', installationId: 'inst-B' } },
+      update: { token: 'TOKEN_COMPARTIDO' },
+      create: { userId: 'user-B', installationId: 'inst-B', token: 'TOKEN_COMPARTIDO' },
+    });
+    expect(res.json).toHaveBeenCalledWith({ success: true });
+    expect(res.status).not.toHaveBeenCalledWith(500);
+  });
+
+  // Demuestra a la vez que UNIQUE(token) sigue siendo la garantía final:
+  // el código nunca "resuelve" la colisión ignorándola o forzando un
+  // segundo dueño — si la constraint sigue rechazando incluso en el
+  // reintento, el error sube tal cual, sin un tercer intento silencioso.
+  it('P2002 persistente en ambos intentos → se propaga el error, sin un tercer intento', async () => {
+    const res = fakeRes();
+    const error = p2002();
+    (mockPrisma.$transaction as jest.Mock)
+      .mockImplementationOnce(() => Promise.reject(error))
+      .mockImplementationOnce(() => Promise.reject(error));
+
+    await expect(
+      updateFcmToken(fakeAuthedReqConBody('user-B', { fcmToken: 'TOKEN_COMPARTIDO', installationId: 'inst-B' }), res)
+    ).rejects.toBe(error);
+
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('un error de Prisma que NO es P2002 se propaga de inmediato, sin reintentar', async () => {
+    const res = fakeRes();
+    const error: any = new Error('Conexión a la base de datos perdida');
+    error.code = 'P1001';
+    (mockPrisma.$transaction as jest.Mock).mockImplementationOnce(() => Promise.reject(error));
+
+    await expect(
+      updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_A', installationId: 'inst-A' }), res)
+    ).rejects.toBe(error);
+
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('comportamiento normal (sin colisión) no cambia: una sola transacción, un solo upsert', async () => {
+    const res = fakeRes();
+
+    await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_NORMAL', installationId: 'inst-A' }), res);
+
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(mockTx.userFcmToken.upsert).toHaveBeenCalledTimes(1);
+    expect(res.json).toHaveBeenCalledWith({ success: true });
   });
 });

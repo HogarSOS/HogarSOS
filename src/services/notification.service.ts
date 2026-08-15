@@ -14,28 +14,49 @@ import { construirNotificacion, Idioma, NotificationKey, NotificationParams } fr
  * inválido, se limpia de la BD para no reintentar contra él en el
  * futuro.
  */
+const CODIGOS_TOKEN_INVALIDO = ['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'];
+
+/**
+ * P2 #5: un usuario puede tener varios UserFcmToken (uno por
+ * instalación/dispositivo) — se envía a todos con una sola llamada
+ * multicast, no un token suelto. `sendEachForMulticast` es la API
+ * vigente de firebase-admin (`sendMulticast` está `@deprecated` desde
+ * la propia definición de tipos del paquete instalado).
+ */
 async function despachar(
   userId: string,
   construirMensaje: (idioma: Idioma) => { title: string; body: string },
   data?: Record<string, string>
 ): Promise<void> {
   try {
-    const usuario = await prisma.user.findUnique({ where: { id: userId }, select: { fcmToken: true, idioma: true } });
-    if (!usuario?.fcmToken) return;
+    const [usuario, filas] = await Promise.all([
+      prisma.user.findUnique({ where: { id: userId }, select: { idioma: true } }),
+      prisma.userFcmToken.findMany({ where: { userId }, select: { token: true } }),
+    ]);
+    if (!usuario || filas.length === 0) return; // sendEachForMulticast rechaza un array de tokens vacío
 
-    await admin.messaging().send({
-      token: usuario.fcmToken,
+    const tokens = filas.map((f) => f.token);
+    const respuesta = await admin.messaging().sendEachForMulticast({
+      tokens,
       notification: construirMensaje(usuario.idioma),
       apns: { payload: { aps: { sound: 'default' } } },
       data,
     });
+
+    // Borrado quirúrgico: responses[i] corresponde POSICIONALMENTE a
+    // tokens[i] (garantizado por el tipo de la API) — solo se borra la
+    // fila del token concreto que Firebase rechazó como inválido,
+    // nunca el resto de dispositivos del usuario, y nunca por un error
+    // transitorio (red, cuota) ajeno a la validez del token.
+    const tokensInvalidos = respuesta.responses
+      .map((r, i) => (!r.success && r.error?.code && CODIGOS_TOKEN_INVALIDO.includes(r.error.code) ? tokens[i] : null))
+      .filter((t): t is string => t !== null);
+
+    if (tokensInvalidos.length > 0) {
+      await prisma.userFcmToken.deleteMany({ where: { token: { in: tokensInvalidos } } }).catch(() => {});
+    }
   } catch (e: any) {
     console.error(`[notification.service] Error al notificar a ${userId}:`, e?.message ?? e);
-
-    const codigosTokenInvalido = ['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'];
-    if (codigosTokenInvalido.includes(e?.code)) {
-      await prisma.user.update({ where: { id: userId }, data: { fcmToken: null } }).catch(() => {});
-    }
   }
 }
 

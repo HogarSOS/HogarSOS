@@ -238,14 +238,43 @@ export async function forgotPassword(req: Request, res: Response) {
 
 const fcmTokenSchema = z.object({
   fcmToken: z.string().min(1),
+  // Opcional durante la transición (P2 #5): una app todavía no
+  // actualizada no lo manda. 'legacy' agrupa esas instalaciones bajo
+  // un installationId sintético — en cuanto ESA instalación real
+  // vuelva a llamar con su propio installationId, la lógica de abajo
+  // reclama el token y sustituye la fila legacy sola.
+  installationId: z.string().min(1).optional(),
 });
 
 /**
- * Guarda (o reemplaza) el token FCM del dispositivo actual. Se llama
- * cada vez que la app arranca con sesión activa — no solo al hacer
- * login — porque Firebase puede rotar el token del dispositivo en
- * cualquier momento, y un token viejo sin actualizar es indistinguible
- * de "no llegan notificaciones" para quien usa la app.
+ * Guarda (o reemplaza) el token FCM de la instalación actual — una
+ * fila por (usuario, instalación), no una por usuario (P2 #5: un solo
+ * fcmToken por usuario se pisaba silenciosamente entre dispositivos, y
+ * podía quedar compartido entre dos cuentas en un dispositivo
+ * reutilizado sin reinstalar). Se llama cada vez que la app arranca
+ * con sesión activa — no solo al hacer login — porque Firebase puede
+ * rotar el token en cualquier momento.
+ *
+ * Transacción en dos pasos, la BD (no la lógica de aplicación) es la
+ * garantía final de unicidad vía UNIQUE(token):
+ * 1. Cede el token si pertenece a OTRO par (userId, installationId) —
+ *    cierra el caso de un dispositivo compartido/reutilizado que
+ *    cambia de cuenta sin reinstalar, y el caso legacy de arriba.
+ * 2. Upsert por (userId, installationId) — la identidad de la fila es
+ *    el par, el token es mutable dentro de ella: una rotación de
+ *    Firebase actualiza la MISMA fila, nunca crea una segunda.
+ *
+ * Un solo reintento de la transacción COMPLETA ante P2002 (revisión
+ * adversarial P2 #5): el `upsert` compila a `INSERT ... ON CONFLICT
+ * (user_id, installation_id) DO UPDATE`, cuyo target de conflicto es
+ * ese par — no `token`. Si dos (userId, installationId) DISTINTOS
+ * reclaman el MISMO token a la vez sin que ninguno tenga fila previa
+ * que ceder (caso límite, no el de dispositivo compartido — ese
+ * siempre tiene una fila previa y no pasa por aquí), el perdedor choca
+ * contra UNIQUE(token) con un P2002 no cubierto por ese ON CONFLICT.
+ * Para el reintento, la fila ganadora ya está confirmada y visible, así
+ * que el `deleteMany` la encuentra y la cede por la vía normal — no
+ * hace falta ninguna lógica nueva, solo repetir la operación entera.
  */
 export async function updateFcmToken(req: Request, res: Response) {
   const userId = req.user!.userId;
@@ -254,7 +283,30 @@ export async function updateFcmToken(req: Request, res: Response) {
     return res.status(400).json({ error: 'Falta fcmToken', code: 'AUTH_FCM_TOKEN_MISSING' });
   }
 
-  await prisma.user.update({ where: { id: userId }, data: { fcmToken: parsed.data.fcmToken } });
+  const { fcmToken: token } = parsed.data;
+  const installationId = parsed.data.installationId ?? 'legacy';
+
+  const reclamarToken = () =>
+    prisma.$transaction(async (tx) => {
+      await tx.userFcmToken.deleteMany({
+        where: { token, NOT: { userId, installationId } },
+      });
+      await tx.userFcmToken.upsert({
+        where: { userId_installationId: { userId, installationId } },
+        update: { token },
+        create: { userId, installationId, token },
+      });
+    });
+
+  try {
+    await reclamarToken();
+  } catch (err: any) {
+    if (err?.code !== 'P2002') {
+      throw err;
+    }
+    await reclamarToken(); // único reintento; si vuelve a fallar, se propaga tal cual
+  }
+
   return res.json({ success: true });
 }
 
@@ -320,6 +372,13 @@ export async function refreshToken(req: Request, res: Response) {
   }
 }
 
+const logoutSchema = z.object({
+  // Opcional a propósito (P2 #5, y compatibilidad con clientes que
+  // todavía no lo mandan): sin él, se sigue revocando la sesión entera
+  // vía sessionVersion, simplemente no se borra ningún UserFcmToken.
+  installationId: z.string().min(1).optional(),
+});
+
 /**
  * Revoca todas las sesiones del usuario (todo-o-nada, P2 #4): el
  * access token vigente sigue funcionando hasta que expire solo (máx.
@@ -329,11 +388,31 @@ export async function refreshToken(req: Request, res: Response) {
  * atómico a propósito: dos logouts casi simultáneos (doble tap, dos
  * pestañas) dan el mismo resultado final sin importar el orden, sin
  * necesitar un findUnique+update separado.
+ *
+ * P2 #5: además borra el UserFcmToken de ESTA instalación concreta
+ * (identificada por installationId, no por el usuario) — así el
+ * dispositivo deslogueado deja de recibir push de inmediato, sin
+ * esperar a que otro evento lo reclame. `deleteMany` (no `delete`)
+ * porque es válido que la instalación nunca hubiera registrado push
+ * (permiso denegado, o logout antes de que registrarToken() terminara)
+ * — cero filas afectadas no es un error. El `where` va por
+ * (userId, installationId): nunca puede coincidir con la fila de otro
+ * dispositivo del mismo usuario, tengan el ID que tengan.
  */
 export async function logout(req: Request, res: Response) {
-  await prisma.user.update({
-    where: { id: req.user!.userId },
-    data: { sessionVersion: { increment: 1 } },
+  const userId = req.user!.userId;
+  const parsed = logoutSchema.safeParse(req.body ?? {});
+  const installationId = parsed.success ? parsed.data.installationId : undefined;
+
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({
+      where: { id: userId },
+      data: { sessionVersion: { increment: 1 } },
+    });
+
+    if (installationId) {
+      await tx.userFcmToken.deleteMany({ where: { userId, installationId } });
+    }
   });
 
   return res.json({ success: true });
