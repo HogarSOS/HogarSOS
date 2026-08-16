@@ -464,6 +464,11 @@ export async function listNearbyRequests(req: Request, res: Response) {
       AND sr.created_at > ${noExpiradaDesde}
       AND p.ubicacion_actual IS NOT NULL
       AND ST_DWithin(sr.ubicacion, p.ubicacion_actual, ${RADIO_BUSQUEDA_METROS})
+      -- Ignorada por este profesional (ver ignorarSolicitud,
+      -- postulacion.controller.ts) — desaparece de la lista, a
+      -- diferencia de una candidatura real (po.estado='pendiente'), que
+      -- se queda visible con ya_postulado=true.
+      AND (po.id IS NULL OR po.estado != 'ignorada')
     ORDER BY distancia_metros ASC
     LIMIT 20
   `;
@@ -670,8 +675,20 @@ export async function undoStartServiceRequest(req: Request, res: Response) {
  * distinto de cancelar (que solo cambia el estado). Solo se permite
  * cuando ningún profesional llegó a aceptarla (profesionalId nulo) y
  * sigue en "pendiente" o "cancelada": en ese caso nunca pudo haber
- * pago retenido ni chat real, así que no hay nada que limpiar aparte
- * ni ningún historial de la otra parte que se pierda al borrarla.
+ * pago retenido ni chat real, así que no hay ningún historial de la
+ * otra parte que se pierda al borrarla.
+ *
+ * SÍ puede haber Postulacion en estado 'pendiente' (candidaturas reales
+ * sin resolver) o 'ignorada' (ver ignorarSolicitud, postulacion.controller.ts)
+ * — la FK postulaciones_service_request_id_fkey es ON DELETE RESTRICT a
+ * propósito (auditoría 2026-08-16), así que hay que borrarlas primero,
+ * en la misma transacción. 'aceptada'/'rechazada' nunca coexisten con
+ * profesionalId=null (ambas solo se escriben dentro de la transacción
+ * de selectPostulacion, que fija profesionalId Y el estado a la vez) —
+ * el guard de arriba ya las bloquea antes de llegar aquí, así que
+ * deliberadamente NO se incluyen en este borrado: si alguna vez esa
+ * invariante se rompiera por otro camino, la FK debe seguir frenando el
+ * borrado en vez de perder ese historial en silencio.
  */
 export async function deleteServiceRequest(req: Request, res: Response) {
   const { id } = req.params;
@@ -688,7 +705,12 @@ export async function deleteServiceRequest(req: Request, res: Response) {
     return res.status(409).json({ error: 'Solo se pueden borrar solicitudes que nadie llegó a aceptar', code: 'REQUEST_CANNOT_DELETE_ACCEPTED' });
   }
 
-  await prisma.serviceRequest.delete({ where: { id } });
+  await prisma.$transaction([
+    prisma.postulacion.deleteMany({
+      where: { serviceRequestId: id, estado: { in: ['pendiente', 'ignorada'] } },
+    }),
+    prisma.serviceRequest.delete({ where: { id } }),
+  ]);
   return res.status(204).send();
 }
 

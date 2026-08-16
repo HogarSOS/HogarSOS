@@ -19,7 +19,7 @@ import {
   markChatRead,
 } from '../controllers/serviceRequest.controller';
 import { createDispute } from '../controllers/dispute.controller';
-import { createPostulacion, listPostulaciones, selectPostulacion } from '../controllers/postulacion.controller';
+import { createPostulacion, listPostulaciones, selectPostulacion, ignorarSolicitud } from '../controllers/postulacion.controller';
 import { createPresupuesto, responderPresupuesto } from '../controllers/presupuesto.controller';
 import { crearAmpliacion, responderAmpliacion } from '../controllers/ampliacion.controller';
 
@@ -45,6 +45,7 @@ router.post('/:id/notify-chat', authMiddleware(), asyncHandler(notifyChatMessage
 router.post('/:id/mark-chat-read', authMiddleware(), asyncHandler(markChatRead));
 router.post('/:id/disputes', authMiddleware(['cliente', 'profesional']), asyncHandler(createDispute));
 router.post('/:id/postulaciones', authMiddleware(['profesional']), asyncHandler(createPostulacion));
+router.post('/:id/ignorar', authMiddleware(['profesional']), asyncHandler(ignorarSolicitud));
 router.get('/:id/postulaciones', authMiddleware(['cliente']), asyncHandler(listPostulaciones));
 router.post('/:id/postulaciones/:postulacionId/seleccionar', authMiddleware(['cliente']), asyncHandler(selectPostulacion));
 router.post('/:id/presupuesto', authMiddleware(['profesional']), asyncHandler(createPresupuesto));

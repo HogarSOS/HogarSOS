@@ -685,6 +685,12 @@ enum EstadoPostulacion {
   pendiente
   aceptada
   rechazada
+  // Ignorada por el propio profesional desde "Solicitudes cerca de ti"
+  // (nunca fue una candidatura real) — reutiliza esta tabla en vez de
+  // una nueva porque el @@unique([serviceRequestId, profesionalId]) ya
+  // es exactamente la garantía "una fila por profesional y solicitud"
+  // que hace falta, y listNearbyRequests ya hace el JOIN necesario.
+  ignorada
 }
 
 enum TipoPresupuesto {
