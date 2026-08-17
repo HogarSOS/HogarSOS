@@ -168,8 +168,32 @@ function paginaResetPassword(): string {
       boton.textContent = 'Guardando…';
 
       try {
-        await llamar('resetPassword', { oobCode, newPassword: nueva });
+        const datosReset = await llamar('resetPassword', { oobCode, newPassword: nueva });
         mostrar('exito');
+
+        // A-03 (auditoría adversarial 2026-08-17): hasta aquí el backend
+        // de hogarSOS nunca se enteraba de que la contraseña cambió, así
+        // que una sesión ya abierta con la cuenta comprometida seguía
+        // viva hasta 30 días. Inicia sesión con la contraseña nueva solo
+        // para obtener un idToken y avisar al backend — si esto falla
+        // (red, CSP, lo que sea) no se le muestra ningún error al
+        // usuario: su contraseña YA se guardó correctamente arriba, esto
+        // es un refuerzo de seguridad aparte, no parte del flujo
+        // principal.
+        try {
+          const datosLogin = await llamar('signInWithPassword', {
+            email: datosReset.email,
+            password: nueva,
+            returnSecureToken: true,
+          });
+          await fetch('/api/auth/password-reset-completed', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ idToken: datosLogin.idToken }),
+          });
+        } catch (e) {
+          console.error('No se pudo avisar al backend del cambio de contraseña:', e);
+        }
       } catch (e) {
         boton.disabled = false;
         boton.textContent = 'Guardar nueva contraseña';

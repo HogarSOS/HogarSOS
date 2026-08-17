@@ -284,6 +284,54 @@ export async function forgotPassword(req: Request, res: Response) {
   return res.json({ success: true });
 }
 
+const passwordResetCompletedSchema = z.object({
+  idToken: z.string().min(1),
+});
+
+/**
+ * A-03 (auditoría adversarial 2026-08-17): el canje del oobCode en
+ * `/auth/reset-password` ocurre ÍNTEGRAMENTE en el navegador contra
+ * Identity Toolkit — este backend nunca se enteraba de que una
+ * contraseña cambió. Efecto: si alguien tenía la sesión abierta con la
+ * cuenta comprometida, la conservaba hasta 30 días (la duración del
+ * refresh token) DESPUÉS de que la víctima "recuperara" su cuenta,
+ * porque nada tocaba `sessionVersion`.
+ *
+ * Sin autenticar a propósito — el usuario que llama todavía no tiene
+ * sesión de hogarSOS, solo el idToken que Identity Toolkit le acaba de
+ * dar tras iniciar sesión con la contraseña nueva (ver
+ * passwordReset.routes.ts). La verificación de ese idToken con el Admin
+ * SDK es la única autorización que necesita: nadie puede fabricar un
+ * idToken válido de Firebase para un uid ajeno.
+ */
+export async function passwordResetCompleted(req: Request, res: Response) {
+  const parsed = passwordResetCompletedSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'Datos inválidos', code: 'VALIDATION_INVALID' });
+  }
+
+  let decoded;
+  try {
+    decoded = await firebaseAuth.verifyIdToken(parsed.data.idToken);
+  } catch (e) {
+    console.error('[auth.passwordResetCompleted] Token de Firebase inválido:', e);
+    return res.status(401).json({ error: 'Token de Firebase inválido', code: 'AUTH_FIREBASE_TOKEN_INVALID' });
+  }
+
+  // Igual que en forgotPassword: la respuesta no distingue si había o no
+  // una cuenta de hogarSOS para ese uid, para no dar pie a enumeración.
+  await prisma.user
+    .update({
+      where: { firebaseUid: decoded.uid },
+      data: { sessionVersion: { increment: 1 } },
+    })
+    .catch((e) => {
+      console.error(`[auth.passwordResetCompleted] Sin cuenta de hogarSOS para uid ${decoded.uid}:`, e?.code ?? e);
+    });
+
+  return res.json({ success: true });
+}
+
 const fcmTokenSchema = z.object({
   fcmToken: z.string().min(1),
   // Opcional durante la transición (P2 #5): una app todavía no

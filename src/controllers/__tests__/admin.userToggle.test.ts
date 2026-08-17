@@ -3,6 +3,8 @@ import { Request, Response } from 'express';
 jest.mock('../../config/prisma', () => ({
   prisma: {
     user: { findUnique: jest.fn(), update: jest.fn(), count: jest.fn() },
+    userFcmToken: { deleteMany: jest.fn() },
+    $transaction: jest.fn(),
   },
 }));
 
@@ -99,9 +101,17 @@ describe('getUserForAdmin', () => {
 });
 
 describe('toggleUserActive', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // La mayoría de los tests no necesitan que $transaction haga nada
+    // real, solo que ejecute el callback que le pasa el controlador —
+    // igual que haría Prisma de verdad con el mock de tx de abajo.
+    mockPrisma.$transaction.mockImplementation((cb: any) =>
+      cb({ user: mockPrisma.user, userFcmToken: mockPrisma.userFcmToken })
+    );
+  });
 
-  it('bloquea a un usuario normal activo (activo: true -> false)', async () => {
+  it('bloquea a un usuario normal activo (activo: true -> false) y revoca su sesión y tokens push (A-04)', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(usuarioBase());
     mockPrisma.user.update.mockResolvedValue(usuarioBase({ activo: false }));
     const res = fakeRes();
@@ -110,8 +120,9 @@ describe('toggleUserActive', () => {
 
     expect(mockPrisma.user.update).toHaveBeenCalledWith({
       where: { id: 'user-1' },
-      data: { activo: false },
+      data: { activo: false, sessionVersion: { increment: 1 } },
     });
+    expect(mockPrisma.userFcmToken.deleteMany).toHaveBeenCalledWith({ where: { userId: 'user-1' } });
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ activo: false }));
     expect(mockRegistrarAccionAdmin).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -125,7 +136,7 @@ describe('toggleUserActive', () => {
     );
   });
 
-  it('activa a un usuario bloqueado (activo: false -> true) si no fue una cuenta autoeliminada', async () => {
+  it('activa a un usuario bloqueado (activo: false -> true) sin revocar nada, si no fue una cuenta autoeliminada', async () => {
     mockPrisma.user.findUnique.mockResolvedValue(usuarioBase({ activo: false }));
     mockPrisma.user.update.mockResolvedValue(usuarioBase({ activo: true }));
     const res = fakeRes();
@@ -136,6 +147,7 @@ describe('toggleUserActive', () => {
       where: { id: 'user-1' },
       data: { activo: true },
     });
+    expect(mockPrisma.userFcmToken.deleteMany).not.toHaveBeenCalled();
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ activo: true }));
     expect(mockRegistrarAccionAdmin).toHaveBeenCalledWith(
       expect.objectContaining({ accion: 'activar_usuario', estadoAnterior: 'false', estadoNuevo: 'true' })
@@ -201,7 +213,7 @@ describe('toggleUserActive', () => {
 
     expect(mockPrisma.user.update).toHaveBeenCalledWith({
       where: { id: 'admin-2' },
-      data: { activo: false },
+      data: { activo: false, sessionVersion: { increment: 1 } },
     });
   });
 

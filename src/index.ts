@@ -25,6 +25,7 @@ import { authMiddleware } from './middlewares/auth.middleware';
 import { prisma } from './config/prisma';
 import { TAREAS, iniciarScheduler, detenerScheduler } from './jobs';
 import { validarConfiguracionOAbortar } from './config/validateEnv';
+import { verificarRlsAlArrancar } from './config/verificarRls';
 import { sanitizarUrlParaLog } from './utils/sanitizarUrlParaLog';
 
 dotenv.config();
@@ -267,6 +268,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   } else {
     console.log('[scheduler] Desactivado por SCHEDULER_ENABLED=false');
   }
+
+  void verificarRlsAlArrancar();
 });
 
 /**

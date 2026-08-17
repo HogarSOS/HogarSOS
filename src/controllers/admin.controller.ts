@@ -557,9 +557,27 @@ export async function toggleUserActive(req: Request, res: Response) {
     });
   }
 
-  const actualizado = await prisma.user.update({
-    where: { id },
-    data: { activo: !usuario.activo },
+  // A-04 (auditoría adversarial 2026-08-17): bloquear a alguien desde el
+  // panel solo tocaba `activo`, que corta login/refresh pero deja vivo
+  // hasta 15 min el access token que ya tuviera en la mano y sus tokens
+  // push indefinidamente. Mismo patrón que deleteMe (user.controller.ts)
+  // — sessionVersion fuerza a cerrar sesión de inmediato, y sin tokens
+  // FCM deja de recibir notificaciones. Solo en la rama de bloqueo: al
+  // reactivar no hace falta revocar nada.
+  const actualizado = await prisma.$transaction(async (tx) => {
+    const usuarioActualizado = await tx.user.update({
+      where: { id },
+      data: {
+        activo: !usuario.activo,
+        ...(usuario.activo ? { sessionVersion: { increment: 1 } } : {}),
+      },
+    });
+
+    if (usuario.activo) {
+      await tx.userFcmToken.deleteMany({ where: { userId: id } });
+    }
+
+    return usuarioActualizado;
   });
 
   await registrarAccionAdmin({
