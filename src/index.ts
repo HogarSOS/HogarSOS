@@ -25,6 +25,7 @@ import { authMiddleware } from './middlewares/auth.middleware';
 import { prisma } from './config/prisma';
 import { TAREAS, iniciarScheduler, detenerScheduler } from './jobs';
 import { validarConfiguracionOAbortar } from './config/validateEnv';
+import { iniciarPoolWarmer, detenerPoolWarmer } from './config/poolWarmer';
 import { verificarRlsAlArrancar } from './config/verificarRls';
 import { sanitizarUrlParaLog } from './utils/sanitizarUrlParaLog';
 
@@ -270,6 +271,12 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   }
 
   void verificarRlsAlArrancar();
+
+  // Mantiene las conexiones del pool de Prisma abiertas contra Supabase
+  // — sin esto, la primera ráfaga de usuarios tras ~5 min de calma paga
+  // la reapertura de conexiones (~3× de latencia medidos, ver
+  // config/poolWarmer.ts).
+  iniciarPoolWarmer();
 });
 
 /**
@@ -291,6 +298,7 @@ async function cerrarOrdenadamente(senal: string) {
   console.log(`[shutdown] ${senal} recibido — cerrando ordenadamente...`);
 
   detenerScheduler();
+  detenerPoolWarmer();
 
   // Tope duro: si algo se queda colgado, Render mataría el proceso de
   // todas formas a los ~30s. Mejor salir nosotros antes, de forma
