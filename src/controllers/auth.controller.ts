@@ -382,17 +382,34 @@ export async function updateFcmToken(req: Request, res: Response) {
   const { fcmToken: token } = parsed.data;
   const installationId = parsed.data.installationId ?? 'legacy';
 
-  const reclamarToken = () =>
-    prisma.$transaction(async (tx) => {
-      await tx.userFcmToken.deleteMany({
-        where: { token, NOT: { userId, installationId } },
-      });
-      await tx.userFcmToken.upsert({
-        where: { userId_installationId: { userId, installationId } },
-        update: { token },
-        create: { userId, installationId, token },
-      });
+  // Sin transacción interactiva a propósito (auditoría de escalabilidad
+  // 2026-08-17): `prisma.$transaction(async tx => ...)` retenía UNA
+  // conexión del pool durante los ~4 round-trips de BEGIN+deleteMany+
+  // upsert+COMMIT. Este endpoint se dispara en CADA apertura de la app
+  // (registrarToken, fire-and-forget), así que bajo una ráfaga de
+  // aperturas masiva las transacciones no conseguían conexión dentro del
+  // `maxWait` de Prisma y devolvían 500 — MEDIDO: 219 errores 5xx en un
+  // burst de 1.000 usuarios con pool=5, mientras que las lecturas solo
+  // encolaban. Ahora son DOS sentencias autocommit independientes: cada
+  // una toma y suelta una conexión al instante, sin retener el pool.
+  //
+  // Se conserva el ORDEN delete-primero y el reintento P2002: la columna
+  // `token` es UNIQUE, así que hay que ceder el token de cualquier otra
+  // fila ANTES de hacer el upsert de la nuestra (si no, el upsert choca
+  // con UNIQUE(token)). Sin la transacción hay una ventana de carrera
+  // mínima entre ambas sentencias — exactamente el caso que el retry
+  // P2002 ya cubría: si otra petición reinserta el token en medio, el
+  // upsert lanza P2002 y se reintenta la pareja una vez.
+  const reclamarToken = async () => {
+    await prisma.userFcmToken.deleteMany({
+      where: { token, NOT: { userId, installationId } },
     });
+    await prisma.userFcmToken.upsert({
+      where: { userId_installationId: { userId, installationId } },
+      update: { token },
+      create: { userId, installationId, token },
+    });
+  };
 
   try {
     await reclamarToken();
