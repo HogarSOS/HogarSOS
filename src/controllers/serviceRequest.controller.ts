@@ -409,69 +409,120 @@ export async function getServiceRequestById(req: Request, res: Response) {
  * Lista solicitudes pendientes cerca del profesional autenticado,
  * limitadas a las categorías que ofrece y ordenadas por distancia.
  */
+type FilaNearbyRequest = {
+  estadoVerificacion: string;
+  disponible: boolean;
+  categoriaIds: number[];
+  id: string | null;
+  descripcion: string | null;
+  distanciaMetros: number | null;
+  createdAt: Date | null;
+  urgencia: string | null;
+  clienteNombre: string | null;
+  clienteFotoUrl: string | null;
+  yaPostulado: boolean;
+};
+
 export async function listNearbyRequests(req: Request, res: Response) {
   const profesionalId = req.user!.userId;
 
-  const profesional = await prisma.professional.findUnique({
-    where: { userId: profesionalId },
-    include: { categorias: true },
-  });
+  const noExpiradaDesde = new Date(Date.now() - SOLICITUD_EXPIRA_HORAS * 60 * 60 * 1000);
 
-  if (!profesional) {
+  // Segunda investigación B-01 (2026-08-17): el intento anterior (P0)
+  // fusionaba el findUnique del profesional + este $queryRaw dentro de
+  // un prisma.$transaction — reducía el NÚMERO de adquisiciones de
+  // conexión (2 a 1) pero, al ir envuelto en BEGIN/COMMIT y retener la
+  // misma conexión sin liberarla entre las dos consultas, midió PEOR
+  // bajo carga real (P95 más alto en los 3 niveles, 5 errores 500 reales
+  // a 75 usuarios que antes no existían) — revertido tras confirmarlo
+  // contra producción (ver docs/auditoria/prueba_estres_B01_2026-08-17.md).
+  //
+  // Esta versión no usa $transaction en absoluto: es UNA sola sentencia
+  // $queryRaw autocommit, el mismo patrón de uso de conexión que
+  // assigned/mine y mine (que nunca fallaron, ni antes ni después de
+  // P0) — no solo menos adquisiciones, sino ninguna retención prolongada.
+  //
+  // El CTE `prof` siempre da 0 filas si el profesional no existe (con lo
+  // que toda la consulta da 0 filas → 404), o exactamente 1 fila en
+  // cualquier otro caso — el LEFT JOIN a service_requests solo aporta
+  // filas si `disponible=true` (si no, sr.* queda NULL, igual que el
+  // "no disponible" del código anterior) y ANY() sobre un array de
+  // categorías vacío nunca es cierto (igual que "sin categorías").
+  // Verificado con EXPLAIN ANALYZE y con los 7 casos reales posibles
+  // contra producción antes de escribir esto (ver informe).
+  const filas = await prisma.$queryRaw<FilaNearbyRequest[]>`
+    WITH prof AS (
+      SELECT
+        p.user_id, p.estado_verificacion, p.disponible, p.ubicacion_actual,
+        COALESCE(
+          (SELECT array_agg(pc.category_id) FROM professional_categories pc WHERE pc.professional_id = p.user_id),
+          '{}'
+        ) AS categoria_ids
+      FROM professionals p
+      WHERE p.user_id = ${profesionalId}
+    )
+    SELECT
+      prof.estado_verificacion AS "estadoVerificacion",
+      prof.disponible,
+      prof.categoria_ids AS "categoriaIds",
+      sr.id, sr.descripcion,
+      ST_Distance(sr.ubicacion, prof.ubicacion_actual) AS "distanciaMetros",
+      sr.created_at AS "createdAt", sr.urgencia,
+      u.nombre AS "clienteNombre", u.foto_perfil_url AS "clienteFotoUrl",
+      (po.id IS NOT NULL) AS "yaPostulado"
+    FROM prof
+    LEFT JOIN service_requests sr
+      ON prof.disponible = true
+      AND sr.estado = 'pendiente'
+      AND sr.category_id = ANY(prof.categoria_ids)
+      AND sr.created_at > ${noExpiradaDesde}
+      AND prof.ubicacion_actual IS NOT NULL
+      AND ST_DWithin(sr.ubicacion, prof.ubicacion_actual, ${RADIO_BUSQUEDA_METROS})
+    LEFT JOIN users u ON u.id = sr.cliente_id
+    -- Ignorada por este profesional (ver ignorarSolicitud,
+    -- postulacion.controller.ts) — desaparece de la lista, a diferencia
+    -- de una candidatura real (po.estado='pendiente'), que se queda
+    -- visible con yaPostulado=true.
+    LEFT JOIN postulaciones po ON po.service_request_id = sr.id AND po.profesional_id = ${profesionalId}
+    WHERE (po.id IS NULL OR po.estado != 'ignorada')
+    ORDER BY "distanciaMetros" ASC NULLS LAST
+    LIMIT 20
+  `;
+
+  if (filas.length === 0) {
     return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
 
-  if (REQUIRE_PROFESSIONAL_VERIFICATION && profesional.estadoVerificacion !== 'aprobado') {
+  const estado = filas[0];
+
+  if (REQUIRE_PROFESSIONAL_VERIFICATION && estado.estadoVerificacion !== 'aprobado') {
     return res.status(403).json({ error: 'Tu cuenta aún no ha sido verificada', code: 'ACCOUNT_NOT_VERIFIED' });
   }
 
-  if (!profesional.disponible) {
+  if (!estado.disponible) {
     return res.status(200).json({ solicitudes: [], aviso: 'Estás marcado como no disponible' });
   }
 
-  const categoriaIds = profesional.categorias.map((c) => c.categoryId);
-  if (categoriaIds.length === 0) {
+  if (estado.categoriaIds.length === 0) {
     return res.status(200).json({ solicitudes: [], aviso: 'No tienes categorías configuradas' });
   }
 
-  const noExpiradaDesde = new Date(Date.now() - SOLICITUD_EXPIRA_HORAS * 60 * 60 * 1000);
-
-  // Distancia calculada desde la última ubicación conocida del profesional.
-  // user_id es `text` en la BD (sin @db.Uuid) — sin cast a ::uuid aquí,
-  // igual que en professional.controller.ts (ver comentario allí).
-  const solicitudes = await prisma.$queryRaw<
-    {
-      id: string;
-      descripcion: string;
-      distancia_metros: number;
-      created_at: Date;
-      urgencia: string;
-      cliente_nombre: string;
-      cliente_foto_url: string | null;
-      ya_postulado: boolean;
-    }[]
-  >`
-    SELECT sr.id, sr.descripcion, sr.created_at, sr.urgencia,
-           ST_Distance(sr.ubicacion, p.ubicacion_actual) AS distancia_metros,
-           u.nombre AS cliente_nombre, u.foto_perfil_url AS cliente_foto_url,
-           (po.id IS NOT NULL) AS ya_postulado
-    FROM service_requests sr
-    JOIN professionals p ON p.user_id = ${profesionalId}
-    JOIN users u ON u.id = sr.cliente_id
-    LEFT JOIN postulaciones po ON po.service_request_id = sr.id AND po.profesional_id = ${profesionalId}
-    WHERE sr.estado = 'pendiente'
-      AND sr.category_id = ANY(${categoriaIds})
-      AND sr.created_at > ${noExpiradaDesde}
-      AND p.ubicacion_actual IS NOT NULL
-      AND ST_DWithin(sr.ubicacion, p.ubicacion_actual, ${RADIO_BUSQUEDA_METROS})
-      -- Ignorada por este profesional (ver ignorarSolicitud,
-      -- postulacion.controller.ts) — desaparece de la lista, a
-      -- diferencia de una candidatura real (po.estado='pendiente'), que
-      -- se queda visible con ya_postulado=true.
-      AND (po.id IS NULL OR po.estado != 'ignorada')
-    ORDER BY distancia_metros ASC
-    LIMIT 20
-  `;
+  // La fila "solo de estado" (cuando disponible/categorías pasan el
+  // filtro pero no hay ninguna solicitud real que coincida) trae
+  // id=null — sin este filtro se devolvería una solicitud fantasma con
+  // todos los campos en null.
+  const solicitudes = filas
+    .filter((f) => f.id !== null)
+    .map((f) => ({
+      id: f.id,
+      descripcion: f.descripcion,
+      created_at: f.createdAt,
+      urgencia: f.urgencia,
+      distancia_metros: f.distanciaMetros,
+      cliente_nombre: f.clienteNombre,
+      cliente_foto_url: f.clienteFotoUrl,
+      ya_postulado: f.yaPostulado,
+    }));
 
   return res.json({ solicitudes });
 }
