@@ -72,14 +72,14 @@ export function evaluarReduccionHoras(horasReales: number, horasEstimadas: numbe
 function serializarPresupuesto(p: {
   id: string;
   tipo: string;
-  monto: Prisma.Decimal | null;
-  tarifaHora: Prisma.Decimal | null;
-  horasEstimadas: Prisma.Decimal | null;
+  monto: Prisma.Decimal | string | null;
+  tarifaHora: Prisma.Decimal | string | null;
+  horasEstimadas: Prisma.Decimal | string | null;
   mensaje: string | null;
   incluyeIva: boolean;
   estado: string;
-  createdAt: Date;
-} | undefined) {
+  createdAt: Date | string;
+} | null | undefined) {
   if (!p) return null;
   return {
     id: p.id,
@@ -97,12 +97,12 @@ function serializarPresupuesto(p: {
 /** Misma idea que serializarPresupuesto, para la última Ampliacion de un presupuesto (cualquier estado). */
 function serializarAmpliacion(a: {
   id: string;
-  horasAdicionales: Prisma.Decimal | null;
-  montoAdicional: Prisma.Decimal | null;
+  horasAdicionales: Prisma.Decimal | string | null;
+  montoAdicional: Prisma.Decimal | string | null;
   mensaje: string | null;
   estado: string;
-  createdAt: Date;
-} | undefined) {
+  createdAt: Date | string;
+} | null | undefined) {
   if (!a) return null;
   return {
     id: a.id,
@@ -125,8 +125,8 @@ function serializarAmpliacion(a: {
  * entre el cálculo original y esta serialización.
  */
 function serializarCierreHoras(
-  c: { id: string; horasReales: Prisma.Decimal; estado: string; createdAt: Date } | undefined,
-  horasEstimadas?: Prisma.Decimal | null
+  c: { id: string; horasReales: Prisma.Decimal | string; estado: string; createdAt: Date | string } | null | undefined,
+  horasEstimadas?: Prisma.Decimal | string | null
 ) {
   if (!c) return null;
   const horasRealesNum = Number(c.horasReales);
@@ -154,10 +154,10 @@ function serializarCierreHoras(
 export function agregarPagos(
   pagos: {
     estado: string;
-    montoBase: Prisma.Decimal;
-    montoTotal: Prisma.Decimal;
-    comisionPlataforma: Prisma.Decimal;
-    montoProfesional: Prisma.Decimal;
+    montoBase: Prisma.Decimal | string;
+    montoTotal: Prisma.Decimal | string;
+    comisionPlataforma: Prisma.Decimal | string;
+    montoProfesional: Prisma.Decimal | string;
   }[]
 ) {
   // 'pendiente' (PaymentIntent creado, cliente todavía no confirmó el
@@ -1327,6 +1327,55 @@ export async function responderCierreHoras(req: Request, res: Response) {
   }
 }
 
+/** Fila cruda del `$queryRaw` que fusiona en una sola consulta lo que antes eran
+ * 6 subconsultas de relación de Prisma (`categoria`, `cliente`, `pagos`, `reviews`,
+ * `presupuestos`+`ampliaciones`, `cierresHoras`) para `listMyAssignedRequests` —
+ * ver `docs/auditoria/plan_escalabilidad_500_1000_2026-08-17.md` (Fase 6 de la
+ * revisión de Fable) para la equivalencia verificada byte a byte contra el
+ * camino Prisma original. Los numéricos embebidos en JSON llegan como `string`
+ * (cast `::text` explícito, evita que `0` se pierda por guardas falsy); el
+ * `precioFinal` de nivel superior NO va casteado, así que llega como
+ * `Prisma.Decimal` igual que con Prisma normal.
+ */
+interface FilaAssignedMine {
+  id: string;
+  descripcion: string;
+  estado: string;
+  direccionTexto: string;
+  precioFinal: Prisma.Decimal | null;
+  createdAt: Date;
+  categoria: { nombre: string };
+  cliente: { nombre: string; telefono: string; fotoPerfilUrl: string | null };
+  pagos: {
+    estado: string;
+    montoBase: string;
+    montoTotal: string;
+    comisionPlataforma: string;
+    montoProfesional: string;
+  }[];
+  reviews: { autorId: string }[];
+  presupuesto: {
+    id: string;
+    tipo: string;
+    monto: string | null;
+    tarifaHora: string | null;
+    horasEstimadas: string | null;
+    mensaje: string | null;
+    incluyeIva: boolean;
+    estado: string;
+    createdAt: string;
+    ampliacion: {
+      id: string;
+      horasAdicionales: string | null;
+      montoAdicional: string | null;
+      mensaje: string | null;
+      estado: string;
+      createdAt: string;
+    } | null;
+  } | null;
+  cierreHoras: { id: string; horasReales: string; estado: string; createdAt: string } | null;
+}
+
 /**
  * Lista los trabajos del profesional autenticado: en curso (aceptada/
  * en_progreso) Y completados recientes — antes solo incluía los
@@ -1334,32 +1383,83 @@ export async function responderCierreHoras(req: Request, res: Response) {
  * dejar forma de valorar al cliente. Se limita a los últimos 50
  * completados para no cargar todo el historial de por vida en esta
  * misma lista.
+ *
+ * perf (B-01, 2026-08-17): antes eran 6-7 round-trips de Prisma (findMany
+ * principal + una subconsulta por cada `include` de relación); fusionado en
+ * una sola sentencia `$queryRaw` con LATERAL/json_agg, mismo patrón y misma
+ * validación de equivalencia que `listNearbyRequests` — ver el documento de
+ * auditoría referenciado arriba para el diseño, la revisión adversarial y
+ * el `EXPLAIN ANALYZE`.
  */
 export async function listMyAssignedRequests(req: Request, res: Response) {
   const profesionalId = req.user!.userId;
 
-  const solicitudes = await prisma.serviceRequest.findMany({
-    where: { profesionalId, estado: { in: ['aceptada', 'en_progreso', 'completada'] }, archivadoProfesional: false },
-    include: {
-      categoria: true,
-      cliente: { select: { nombre: true, telefono: true, fotoPerfilUrl: true } },
-      pagos: true,
-      reviews: true,
-      presupuestos: {
-        orderBy: { createdAt: 'desc' },
-        take: 1,
-        include: { ampliaciones: { orderBy: { createdAt: 'desc' }, take: 1 } },
-      },
-      cierresHoras: { orderBy: { createdAt: 'desc' }, take: 1 },
-    },
-    orderBy: { aceptadaAt: 'desc' },
-    take: 50,
-  });
+  const filas = await prisma.$queryRaw<FilaAssignedMine[]>`
+    SELECT
+      sr.id, sr.descripcion, sr.estado, sr.direccion_texto AS "direccionTexto",
+      sr.precio_final AS "precioFinal", sr.created_at AS "createdAt",
+      cat_json.categoria, cli_json.cliente,
+      COALESCE(pagos_json.pagos, '[]'::json) AS pagos,
+      COALESCE(reviews_json.reviews, '[]'::json) AS reviews,
+      presupuesto_json.presupuesto,
+      cierre_json."cierreHoras"
+    FROM service_requests sr
+    CROSS JOIN LATERAL (
+      SELECT json_build_object('nombre', c.nombre) AS categoria
+      FROM service_categories c WHERE c.id = sr.category_id
+    ) cat_json
+    CROSS JOIN LATERAL (
+      SELECT json_build_object('nombre', u.nombre, 'telefono', u.telefono, 'fotoPerfilUrl', u.foto_perfil_url) AS cliente
+      FROM users u WHERE u.id = sr.cliente_id
+    ) cli_json
+    LEFT JOIN LATERAL (
+      SELECT json_agg(json_build_object(
+        'estado', p.estado, 'montoBase', p.monto_base::text, 'montoTotal', p.monto_total::text,
+        'comisionPlataforma', p.comision_plataforma::text, 'montoProfesional', p.monto_profesional::text
+      ) ORDER BY p.created_at, p.id) AS pagos
+      FROM payments p WHERE p.service_request_id = sr.id
+    ) pagos_json ON true
+    LEFT JOIN LATERAL (
+      SELECT json_agg(json_build_object('autorId', r.autor_id) ORDER BY r.created_at, r.id) AS reviews
+      FROM reviews r WHERE r.service_request_id = sr.id
+    ) reviews_json ON true
+    LEFT JOIN LATERAL (
+      SELECT json_build_object(
+        'id', pres.id, 'tipo', pres.tipo, 'monto', pres.monto::text, 'tarifaHora', pres.tarifa_hora::text,
+        'horasEstimadas', pres.horas_estimadas::text, 'mensaje', pres.mensaje, 'incluyeIva', pres.incluye_iva,
+        'estado', pres.estado, 'createdAt', to_char(pres.created_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+        'ampliacion', (
+          SELECT json_build_object(
+            'id', a.id, 'horasAdicionales', a.horas_adicionales::text, 'montoAdicional', a.monto_adicional::text,
+            'mensaje', a.mensaje, 'estado', a.estado,
+            'createdAt', to_char(a.created_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+          )
+          FROM ampliaciones a WHERE a.presupuesto_id = pres.id
+          ORDER BY a.created_at DESC LIMIT 1
+        )
+      ) AS presupuesto
+      FROM presupuestos pres WHERE pres.service_request_id = sr.id
+      ORDER BY pres.created_at DESC LIMIT 1
+    ) presupuesto_json ON true
+    LEFT JOIN LATERAL (
+      SELECT json_build_object(
+        'id', ch.id, 'horasReales', ch.horas_reales::text, 'estado', ch.estado,
+        'createdAt', to_char(ch.created_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+      ) AS "cierreHoras"
+      FROM cierres_horas ch WHERE ch.service_request_id = sr.id
+      ORDER BY ch.created_at DESC LIMIT 1
+    ) cierre_json ON true
+    WHERE sr.profesional_id = ${profesionalId}
+      AND sr.estado IN ('aceptada','en_progreso','completada')
+      AND sr.archivado_profesional = false
+    ORDER BY sr.aceptada_at DESC
+    LIMIT 50
+  `;
 
   return res.json({
-    solicitudes: solicitudes.map((s) => {
-      const presupuesto = s.presupuestos[0];
-      const ampliacion = presupuesto?.ampliaciones[0];
+    solicitudes: filas.map((s) => {
+      const presupuesto = s.presupuesto;
+      const ampliacion = presupuesto?.ampliacion;
       return {
         id: s.id,
         categoria: s.categoria.nombre,
@@ -1372,7 +1472,7 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
         precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
         presupuesto: serializarPresupuesto(presupuesto),
         ampliacion: serializarAmpliacion(ampliacion),
-        cierreHoras: serializarCierreHoras(s.cierresHoras[0], presupuesto?.horasEstimadas),
+        cierreHoras: serializarCierreHoras(s.cierreHoras, presupuesto?.horasEstimadas),
         createdAt: s.createdAt,
         tienePago: s.pagos.length > 0,
         payment: agregarPagos(s.pagos),
@@ -1382,62 +1482,98 @@ export async function listMyAssignedRequests(req: Request, res: Response) {
   });
 }
 
+/** Fila cruda del `$queryRaw` de `listMyServiceRequests` — a diferencia de
+ * `FilaAssignedMine`, esta consulta no necesitó ningún fix de fecha/numeric
+ * (no tiene `to_char` ni numéricos dentro de JSON): el listado del cliente
+ * solo expone booleanos/estados derivados, nunca los montos en sí. Ver el
+ * mismo documento de auditoría que `FilaAssignedMine`.
+ */
+interface FilaMine {
+  id: string;
+  descripcion: string;
+  estado: string;
+  urgencia: string;
+  precioFinal: Prisma.Decimal | null;
+  createdAt: Date;
+  categoriaNombre: string;
+  profesionalNombre: string | null;
+  tienePago: boolean;
+  tieneValoracion: boolean;
+  presupuestoEstado: string | null;
+  ampliacionEstado: string | null;
+  cierreHorasEstado: string | null;
+}
+
 /**
  * Lista las solicitudes del cliente autenticado, más recientes primero
  * (para la pantalla "Mis solicitudes" y para el seguimiento tras crear
  * una). Endpoint nuevo, de solo lectura, no toca ninguna ruta existente.
+ *
+ * perf (B-01, 2026-08-17): mismo cambio que `listMyAssignedRequests` — de
+ * 6-7 round-trips de Prisma a una sola `$queryRaw`. Aquí no hace falta
+ * `json_agg`/LATERAL de relaciones completas porque el listado solo expone
+ * booleanos y estados derivados (`EXISTS`, último estado de cada relación).
  */
 export async function listMyServiceRequests(req: Request, res: Response) {
   const clienteId = req.user!.userId;
 
-  const solicitudes = await prisma.serviceRequest.findMany({
-    where: { clienteId, archivadoCliente: false },
-    include: {
-      categoria: true,
-      pagos: true,
-      reviews: true,
-      profesional: { include: { user: { select: { nombre: true } } } },
-      presupuestos: {
-        orderBy: { createdAt: 'desc' },
-        take: 1,
-        include: { ampliaciones: { orderBy: { createdAt: 'desc' }, take: 1 } },
-      },
-      cierresHoras: { orderBy: { createdAt: 'desc' }, take: 1 },
-    },
-    orderBy: { createdAt: 'desc' },
-    take: 50,
-  });
+  const filas = await prisma.$queryRaw<FilaMine[]>`
+    SELECT
+      sr.id, sr.descripcion, sr.estado, sr.urgencia,
+      sr.precio_final AS "precioFinal", sr.created_at AS "createdAt",
+      cat.nombre AS "categoriaNombre",
+      prof_user.nombre AS "profesionalNombre",
+      EXISTS(SELECT 1 FROM payments p WHERE p.service_request_id = sr.id) AS "tienePago",
+      EXISTS(SELECT 1 FROM reviews r WHERE r.service_request_id = sr.id AND r.autor_id = ${clienteId}) AS "tieneValoracion",
+      presupuesto_estado.estado AS "presupuestoEstado",
+      ampliacion_estado.estado AS "ampliacionEstado",
+      cierre_estado.estado AS "cierreHorasEstado"
+    FROM service_requests sr
+    JOIN service_categories cat ON cat.id = sr.category_id
+    LEFT JOIN professionals prof ON prof.user_id = sr.profesional_id
+    LEFT JOIN users prof_user ON prof_user.id = prof.user_id
+    LEFT JOIN LATERAL (
+      SELECT pres.id, pres.estado FROM presupuestos pres
+      WHERE pres.service_request_id = sr.id ORDER BY pres.created_at DESC LIMIT 1
+    ) presupuesto_estado ON true
+    LEFT JOIN LATERAL (
+      SELECT a.estado FROM ampliaciones a
+      WHERE a.presupuesto_id = presupuesto_estado.id ORDER BY a.created_at DESC LIMIT 1
+    ) ampliacion_estado ON true
+    LEFT JOIN LATERAL (
+      SELECT ch.estado FROM cierres_horas ch
+      WHERE ch.service_request_id = sr.id ORDER BY ch.created_at DESC LIMIT 1
+    ) cierre_estado ON true
+    WHERE sr.cliente_id = ${clienteId} AND sr.archivado_cliente = false
+    ORDER BY sr.created_at DESC
+    LIMIT 50
+  `;
 
   return res.json({
-    solicitudes: solicitudes.map((s) => {
-      const presupuesto = s.presupuestos[0];
-      const ampliacion = presupuesto?.ampliaciones[0];
-      const cierreHoras = s.cierresHoras[0];
-      return {
-        id: s.id,
-        categoria: s.categoria.nombre,
-        descripcion: s.descripcion,
-        profesionalNombre: s.profesional?.user.nombre ?? null,
-        estado: s.estado,
-        urgencia: s.urgencia,
-        precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
-        createdAt: s.createdAt,
-        tienePago: s.pagos.length > 0,
-        // Antes era "¿existe ALGUNA valoración?" — con reviews
-        // bidireccionales eso ya no distingue si fue el cliente o el
-        // profesional quien la dejó. Ahora comprueba específicamente si
-        // el cliente (el dueño de esta lista) ya valoró.
-        tieneValoracion: s.reviews.some((r) => r.autorId === clienteId),
-        // El listado no manda el presupuesto/ampliación/cierreHoras
-        // completos (eso ya vive en el detalle, seguimiento_solicitud_screen)
-        // — solo este booleano, para que la tarjeta de la lista pueda
-        // destacar visualmente "tienes algo pendiente de confirmar" sin
-        // que el cliente tenga que entrar a cada solicitud a comprobarlo.
-        requiereAccion:
-          presupuesto?.estado === 'pendiente' ||
-          ampliacion?.estado === 'pendiente' ||
-          cierreHoras?.estado === 'pendiente',
-      };
-    }),
+    solicitudes: filas.map((s) => ({
+      id: s.id,
+      categoria: s.categoriaNombre,
+      descripcion: s.descripcion,
+      profesionalNombre: s.profesionalNombre ?? null,
+      estado: s.estado,
+      urgencia: s.urgencia,
+      precioFinal: s.precioFinal ? Number(s.precioFinal) : null,
+      createdAt: s.createdAt,
+      tienePago: s.tienePago,
+      // Antes era "¿existe ALGUNA valoración?" — con reviews
+      // bidireccionales eso ya no distingue si fue el cliente o el
+      // profesional quien la dejó. Ahora comprueba específicamente si
+      // el cliente (el dueño de esta lista) ya valoró.
+      tieneValoracion: s.tieneValoracion,
+      // El listado no manda el presupuesto/ampliación/cierreHoras
+      // completos (eso ya vive en el detalle, seguimiento_solicitud_screen)
+      // — solo este booleano, para que la tarjeta de la lista pueda
+      // destacar visualmente "tienes algo pendiente de confirmar" sin
+      // que el cliente tenga que entrar a cada solicitud a comprobarlo.
+      requiereAccion:
+        s.presupuestoEstado === 'pendiente' ||
+        s.ampliacionEstado === 'pendiente' ||
+        s.cierreHorasEstado === 'pendiente',
+    })),
   });
 }
