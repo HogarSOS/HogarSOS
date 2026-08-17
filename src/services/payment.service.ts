@@ -1342,7 +1342,10 @@ export async function reintentarLiberacion(serviceRequestId: string) {
 export interface ResumenPagoHistorial {
   id: string;
   monto: number;
-  fecha: Date;
+  // Date por el camino histórico; string ISO (con sufijo Z, generado por
+  // to_char en SQL) desde la fusión de obtenerResumenPagos — res.json
+  // emite exactamente los mismos bytes con ambos.
+  fecha: Date | string;
   categoria: string;
   descripcion: string;
   nombreCliente: string;
@@ -1380,7 +1383,61 @@ function _sumarImporteEur(items: Stripe.Balance['available']): number {
  * esta función — no hace falta tocar nada de lo de arriba.
  */
 export async function obtenerResumenPagos(userId: string): Promise<ResumenPagos> {
-  const profesional = await prisma.professional.findUnique({ where: { userId } });
+  // Una sola consulta en vez de las 5 idas y vueltas originales
+  // (professional.findUnique + payment.findMany con 3 includes to-one) —
+  // mismo diagnóstico y mismo patrón LATERAL+json_agg que professionals/me
+  // y assigned/mine: cada ida y vuelta a Supabase cuesta ~100ms de red, y
+  // este endpoint era el más lento de todo el burst de apertura (P50 6,8s
+  // bajo ráfaga de 100 usuarios, medido 2026-08-17). Los joins del
+  // historial son todos to-one (payment→solicitud→categoría/cliente): sin
+  // riesgo de multiplicación de filas. Numéricos dentro de JSON como
+  // ::text y fechas con to_char(...Z) — las dos reglas de la revisión v3.
+  const filas = await prisma.$queryRaw<
+    {
+      stripeAccountId: string | null;
+      stripeDetailsSubmitted: boolean;
+      stripeChargesEnabled: boolean;
+      stripePayoutsEnabled: boolean;
+      historial: { id: string; monto: string; fecha: string; categoria: string; descripcion: string; nombreCliente: string }[];
+    }[]
+  >`
+    SELECT
+      p.stripe_account_id        AS "stripeAccountId",
+      p.stripe_details_submitted AS "stripeDetailsSubmitted",
+      p.stripe_charges_enabled   AS "stripeChargesEnabled",
+      p.stripe_payouts_enabled   AS "stripePayoutsEnabled",
+      h.lista                    AS "historial"
+    FROM professionals p
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(json_agg(json_build_object(
+        'id', x.id,
+        'monto', x.monto,
+        'fecha', x.fecha,
+        'categoria', x.categoria,
+        'descripcion', x.descripcion,
+        'nombreCliente', x."nombreCliente"
+      ) ORDER BY x.orden DESC, x.id), '[]'::json) AS lista
+      FROM (
+        SELECT pay.id,
+               pay.monto_profesional::text AS monto,
+               to_char(pay.liberado_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS fecha,
+               pay.liberado_at AS orden,
+               sc.nombre AS categoria,
+               sr.descripcion,
+               u.nombre AS "nombreCliente"
+        FROM payments pay
+        JOIN service_requests sr ON sr.id = pay.service_request_id
+        JOIN service_categories sc ON sc.id = sr.category_id
+        JOIN users u ON u.id = sr.cliente_id
+        WHERE pay.estado = 'liberado' AND sr.profesional_id = p.user_id
+        ORDER BY pay.liberado_at DESC, pay.id
+        LIMIT 50
+      ) x
+    ) h ON TRUE
+    WHERE p.user_id = ${userId}
+  `;
+
+  const profesional = filas[0];
   if (!profesional) throw new Error('PROFESSIONAL_NOT_FOUND');
 
   let estadoCuentaStripe = derivarEstadoCuentaStripe(profesional);
@@ -1405,26 +1462,19 @@ export async function obtenerResumenPagos(userId: string): Promise<ResumenPagos>
     }
   }
 
-  const pagosLiberados = await prisma.payment.findMany({
-    where: { estado: 'liberado', serviceRequest: { profesionalId: userId } },
-    orderBy: { liberadoAt: 'desc' },
-    take: 50,
-    include: { serviceRequest: { include: { categoria: true, cliente: true } } },
-  });
-
   // BUG 005 (QA, 2026-08-03): el historial solo mostraba la categoría
   // ("Electricista") — con varios cobros de la misma categoría no había
   // forma de distinguir uno de otro de un vistazo. El nombre del cliente
   // (ya disponible vía la relación `cliente` de ServiceRequest, no hacía
   // falta ningún dato nuevo) es mucho más identificable que repetir la
   // categoría en cada fila.
-  const historial: ResumenPagoHistorial[] = pagosLiberados.map((p) => ({
+  const historial: ResumenPagoHistorial[] = profesional.historial.map((p) => ({
     id: p.id,
-    monto: Number(p.montoProfesional),
-    fecha: p.liberadoAt!,
-    categoria: p.serviceRequest.categoria.nombre,
-    descripcion: p.serviceRequest.descripcion,
-    nombreCliente: p.serviceRequest.cliente.nombre,
+    monto: Number(p.monto),
+    fecha: p.fecha,
+    categoria: p.categoria,
+    descripcion: p.descripcion,
+    nombreCliente: p.nombreCliente,
   }));
 
   return { estadoCuentaStripe, pendiente, disponible, moneda: 'eur', historial };

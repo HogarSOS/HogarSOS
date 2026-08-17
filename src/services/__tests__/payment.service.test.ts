@@ -1917,26 +1917,33 @@ describe('refundPayment', () => {
   });
 });
 
-describe('obtenerResumenPagos', () => {
+describe('obtenerResumenPagos (fusión SQL 5→1 round-trips)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
-  it('lee Pendiente/Disponible del saldo real de Stripe, no de las filas de Payment', async () => {
-    mockPrisma.professional.findUnique.mockResolvedValue({
+  /** Fila tal como la entrega la consulta fusionada. */
+  function filaResumen(overrides: Record<string, unknown> = {}) {
+    return {
       stripeAccountId: 'acct_1',
       stripeDetailsSubmitted: true,
       stripeChargesEnabled: true,
       stripePayoutsEnabled: true,
-    });
+      historial: [],
+      ...overrides,
+    };
+  }
+
+  it('lee Pendiente/Disponible del saldo real de Stripe, no de las filas de Payment', async () => {
+    mockPrisma.$queryRaw.mockResolvedValue([filaResumen()]);
     mockStripe.balance.retrieve.mockResolvedValue({
       pending: [{ currency: 'eur', amount: 4500 }],
       available: [{ currency: 'eur', amount: 12000 }],
     });
-    mockPrisma.payment.findMany.mockResolvedValue([]);
 
     const resumen = await obtenerResumenPagos('prof-1');
 
+    expect(mockPrisma.$queryRaw).toHaveBeenCalledTimes(1);
     expect(mockStripe.balance.retrieve).toHaveBeenCalledWith({ stripeAccount: 'acct_1' });
     expect(resumen.pendiente).toBe(45);
     expect(resumen.disponible).toBe(120);
@@ -1944,13 +1951,14 @@ describe('obtenerResumenPagos', () => {
   });
 
   it('no consulta Stripe y devuelve 0/0 si el profesional todavía no tiene cuenta Connect', async () => {
-    mockPrisma.professional.findUnique.mockResolvedValue({
-      stripeAccountId: null,
-      stripeDetailsSubmitted: false,
-      stripeChargesEnabled: false,
-      stripePayoutsEnabled: false,
-    });
-    mockPrisma.payment.findMany.mockResolvedValue([]);
+    mockPrisma.$queryRaw.mockResolvedValue([
+      filaResumen({
+        stripeAccountId: null,
+        stripeDetailsSubmitted: false,
+        stripeChargesEnabled: false,
+        stripePayoutsEnabled: false,
+      }),
+    ]);
 
     const resumen = await obtenerResumenPagos('prof-1');
 
@@ -1960,38 +1968,28 @@ describe('obtenerResumenPagos', () => {
     expect(resumen.estadoCuentaStripe).toBe('pendiente');
   });
 
-  it('construye el historial solo con pagos liberados, más reciente primero', async () => {
-    mockPrisma.professional.findUnique.mockResolvedValue({
-      stripeAccountId: 'acct_1',
-      stripeDetailsSubmitted: true,
-      stripeChargesEnabled: true,
-      stripePayoutsEnabled: true,
-    });
-    mockStripe.balance.retrieve.mockResolvedValue({ pending: [], available: [] });
-    mockPrisma.payment.findMany.mockResolvedValue([
-      {
-        id: 'pago-1',
-        montoProfesional: 95,
-        liberadoAt: new Date('2026-08-01T10:00:00Z'),
-        serviceRequest: { categoria: { nombre: 'Fontanería' }, descripcion: 'Fuga en el baño', cliente: { nombre: 'Juan Pérez' } },
-      },
+  it('mapea el historial de la consulta fusionada (monto ::text → number, fecha ISO-Z passthrough)', async () => {
+    mockPrisma.$queryRaw.mockResolvedValue([
+      filaResumen({
+        historial: [
+          // monto llega como string por el ::text del SQL; fecha como
+          // string ISO con Z generada por to_char — regresión explícita
+          // de las dos reglas de la revisión v3.
+          { id: 'pago-1', monto: '95.00', fecha: '2026-08-01T10:00:00.000Z', categoria: 'Fontanería', descripcion: 'Fuga en el baño', nombreCliente: 'Juan Pérez' },
+        ],
+      }),
     ]);
+    mockStripe.balance.retrieve.mockResolvedValue({ pending: [], available: [] });
 
     const resumen = await obtenerResumenPagos('prof-1');
 
-    expect(mockPrisma.payment.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: { estado: 'liberado', serviceRequest: { profesionalId: 'prof-1' } },
-        orderBy: { liberadoAt: 'desc' },
-      })
-    );
     expect(resumen.historial).toEqual([
-      { id: 'pago-1', monto: 95, fecha: new Date('2026-08-01T10:00:00Z'), categoria: 'Fontanería', descripcion: 'Fuga en el baño', nombreCliente: 'Juan Pérez' },
+      { id: 'pago-1', monto: 95, fecha: '2026-08-01T10:00:00.000Z', categoria: 'Fontanería', descripcion: 'Fuga en el baño', nombreCliente: 'Juan Pérez' },
     ]);
   });
 
   it('lanza PROFESSIONAL_NOT_FOUND si no existe el profesional', async () => {
-    mockPrisma.professional.findUnique.mockResolvedValue(null);
+    mockPrisma.$queryRaw.mockResolvedValue([]);
     await expect(obtenerResumenPagos('prof-inexistente')).rejects.toThrow('PROFESSIONAL_NOT_FOUND');
   });
 });
