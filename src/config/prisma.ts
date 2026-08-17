@@ -29,6 +29,19 @@ dotenv.config();
  */
 const CONNECTION_LIMIT_POR_DEFECTO = 10;
 
+// Cuánto espera una petición por una conexión del pool antes de rendirse
+// con P2024 (→ HTTP 500). Por defecto Prisma usa 10s. Bajo un pico de
+// aperturas extremo (miles de usuarios abriendo casi a la vez), con el
+// techo de 15 conexiones de sesión de Supabase el pool se satura y las
+// peticiones que esperan >10s devolvían 500 — MEDIDO: 627 errores 5xx en
+// un burst adversarial de 1.000-en-5s (auditoría 2026-08-17). Subirlo a
+// 25s hace que esas peticiones ESPEREN y acaben sirviéndose (lentas pero
+// sin error) dentro del receiveTimeout de 60s de la app, en vez de
+// cascada de 500 — degradación con gracia ante un pico que excede la
+// capacidad del plan. En carga normal nunca se dispara. Configurable con
+// DB_POOL_TIMEOUT.
+const POOL_TIMEOUT_POR_DEFECTO = 25;
+
 export function urlConPoolAjustado(urlOriginal: string | undefined): string | undefined {
   if (!urlOriginal) return urlOriginal;
   try {
@@ -38,6 +51,13 @@ export function urlConPoolAjustado(urlOriginal: string | undefined): string | un
       ? configurado
       : CONNECTION_LIMIT_POR_DEFECTO;
     url.searchParams.set('connection_limit', String(limite));
+
+    const poolTimeoutConfig = Number(process.env.DB_POOL_TIMEOUT);
+    const poolTimeout = Number.isInteger(poolTimeoutConfig) && poolTimeoutConfig > 0 && poolTimeoutConfig <= 120
+      ? poolTimeoutConfig
+      : POOL_TIMEOUT_POR_DEFECTO;
+    url.searchParams.set('pool_timeout', String(poolTimeout));
+
     return url.toString();
   } catch {
     // URL no parseable — se deja tal cual y que Prisma dé su error real.

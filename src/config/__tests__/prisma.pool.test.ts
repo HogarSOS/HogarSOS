@@ -5,15 +5,26 @@ const URL_BASE = 'postgresql://user:secret@host.example.com:5432/postgres?connec
 describe('urlConPoolAjustado (pool 5→10, auditoría de escalabilidad 2026-08-17)', () => {
   afterEach(() => {
     delete process.env.DB_CONNECTION_LIMIT;
+    delete process.env.DB_POOL_TIMEOUT;
   });
 
-  it('sobreescribe connection_limit a 10 por defecto y conserva el resto de la URL', () => {
+  it('sobreescribe connection_limit a 10 y pool_timeout a 25 por defecto, conservando el resto de la URL', () => {
     const resultado = urlConPoolAjustado(URL_BASE)!;
     const url = new URL(resultado);
     expect(url.searchParams.get('connection_limit')).toBe('10');
-    expect(url.searchParams.get('pool_timeout')).toBe('10');
+    // pool_timeout se sube de 10 a 25 (degradación con gracia bajo ráfaga extrema).
+    expect(url.searchParams.get('pool_timeout')).toBe('25');
     expect(url.hostname).toBe('host.example.com');
     expect(url.password).toBe('secret');
+  });
+
+  it('respeta DB_POOL_TIMEOUT como escape, e ignora valores inválidos', () => {
+    process.env.DB_POOL_TIMEOUT = '40';
+    expect(new URL(urlConPoolAjustado(URL_BASE)!).searchParams.get('pool_timeout')).toBe('40');
+    for (const invalido of ['0', '-1', 'abc', '200']) {
+      process.env.DB_POOL_TIMEOUT = invalido;
+      expect(new URL(urlConPoolAjustado(URL_BASE)!).searchParams.get('pool_timeout')).toBe('25');
+    }
   });
 
   it('añade connection_limit aunque la URL original no lo tuviera', () => {
