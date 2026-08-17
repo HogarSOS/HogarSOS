@@ -55,12 +55,15 @@ const mockPrisma = prisma as any;
 const mockStripe = stripe as any;
 
 describe('calcularDesglose', () => {
-  it('calcula lo que paga el cliente (base+5%) y lo que recibe el profesional (base-5%) con el fallback por defecto', () => {
+  // Comisión definitiva (2026-08-01): cliente 5% / profesional 0% — el
+  // profesional recibe la base íntegra. La expectativa anterior (5%/5%)
+  // era de antes de ese cambio y llevaba fallando desde entonces.
+  it('calcula lo que paga el cliente (base+5%) y lo que recibe el profesional (base íntegra, 0%) con el fallback por defecto', () => {
     const { montoBase, montoTotalCliente, montoProfesional, comisionPlataforma } = calcularDesglose(100);
     expect(montoBase).toBe(100);
     expect(montoTotalCliente).toBe(105);
-    expect(montoProfesional).toBe(95);
-    expect(comisionPlataforma).toBe(10);
+    expect(montoProfesional).toBe(100);
+    expect(comisionPlataforma).toBe(5);
   });
 });
 
