@@ -6,17 +6,105 @@ import { stripe } from '../config/stripe';
 import { REQUIRE_PROFESSIONAL_VERIFICATION } from '../config/featureFlags';
 import { derivarEstadoCuentaStripe, sincronizarEstadoCuentaStripe, intentarAprobacionAutomatica } from '../services/professional.service';
 
+/**
+ * Fila de la consulta fusionada de getProfile. Los numéricos de nivel
+ * superior llegan como Prisma.Decimal (igual que con findUnique); lo que
+ * viaja dentro de JSON llega ya convertido (ver comentarios del SQL).
+ */
+interface FilaPerfilProfesional {
+  estadoVerificacion: string;
+  tipoProfesional: string | null;
+  tarifaBase: Prisma.Decimal;
+  valoracionMedia: Prisma.Decimal;
+  totalTrabajos: number;
+  disponible: boolean;
+  modoDisponibilidad: string;
+  descripcion: string | null;
+  fotoPerfilUrl: string | null;
+  documentoIdentidadUrl: string | null;
+  stripeAccountId: string | null;
+  stripeDetailsSubmitted: boolean;
+  stripeChargesEnabled: boolean;
+  stripePayoutsEnabled: boolean;
+  userNombre: string;
+  userEmail: string | null;
+  userTelefono: string | null;
+  categorias: string[];
+  opiniones: { autor: string; puntuacion: number; comentario: string | null; fecha: string }[];
+}
+
 export async function getProfile(req: Request, res: Response) {
   const userId = req.user!.userId;
 
-  const profesional = await prisma.professional.findUnique({
-    where: { userId },
-    include: {
-      user: { select: { nombre: true, email: true, telefono: true } },
-      categorias: { include: { category: true } },
-    },
-  });
+  // Una sola consulta en vez de las 6 idas y vueltas del
+  // findUnique+includes+findMany originales (profesional, user,
+  // categorias, category, reviews, autor). Mismo diagnóstico y mismo
+  // patrón LATERAL+json_agg que assigned/mine y mine (commit 3de60f9):
+  // cada ida y vuelta a Supabase cuesta ~100ms de red, y este endpoint
+  // se dispara en cada apertura de la app del profesional — era el más
+  // lento de todo el burst de apertura (P50 4,5s bajo ráfaga de 25
+  // usuarios con pool frío, medido 2026-08-17).
+  //
+  // Fechas dentro de JSON: to_char(..., ...'Z') — un timestamp naive
+  // dentro de json_build_object saldría SIN sufijo Z y Dart lo
+  // interpretaría como hora local (bug encontrado y corregido en la
+  // revisión de la fusión v3; el mismo patrón exacto se replica aquí).
+  // Nunca AT TIME ZONE 'UTC': convertiría a timestamptz y to_char lo
+  // renderizaría en la zona de la sesión, no en UTC.
+  const filas = await prisma.$queryRaw<FilaPerfilProfesional[]>`
+    SELECT
+      p.estado_verificacion::text     AS "estadoVerificacion",
+      p.tipo_profesional::text        AS "tipoProfesional",
+      p.tarifa_base                   AS "tarifaBase",
+      p.valoracion_media              AS "valoracionMedia",
+      p.total_trabajos                AS "totalTrabajos",
+      p.disponible                    AS "disponible",
+      p.modo_disponibilidad::text     AS "modoDisponibilidad",
+      p.descripcion                   AS "descripcion",
+      p.foto_perfil_url               AS "fotoPerfilUrl",
+      p.documento_identidad_url       AS "documentoIdentidadUrl",
+      p.stripe_account_id             AS "stripeAccountId",
+      p.stripe_details_submitted      AS "stripeDetailsSubmitted",
+      p.stripe_charges_enabled        AS "stripeChargesEnabled",
+      p.stripe_payouts_enabled        AS "stripePayoutsEnabled",
+      u.nombre                        AS "userNombre",
+      u.email                         AS "userEmail",
+      u.telefono                      AS "userTelefono",
+      -- Reemplaza el include categorias.category: solo se usaba el nombre.
+      cat.nombres                     AS "categorias",
+      -- Reemplaza el findMany de reviews + include autor.
+      op.lista                        AS "opiniones"
+    FROM professionals p
+    JOIN users u ON u.id = p.user_id
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(json_agg(sc.nombre ORDER BY pc.category_id), '[]'::json) AS nombres
+      FROM professional_categories pc
+      JOIN service_categories sc ON sc.id = pc.category_id
+      WHERE pc.professional_id = p.user_id
+    ) cat ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(
+        json_agg(json_build_object(
+          'autor', r."autorNombre",
+          'puntuacion', r.puntuacion,
+          'comentario', r.comentario,
+          'fecha', r.fecha
+        ) ORDER BY r.orden DESC, r.id), '[]'::json) AS lista
+      FROM (
+        SELECT a.nombre AS "autorNombre", r2.puntuacion, r2.comentario, r2.id,
+               r2.created_at AS orden,
+               to_char(r2.created_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS fecha
+        FROM reviews r2
+        JOIN users a ON a.id = r2.autor_id
+        WHERE r2.destinatario_id = p.user_id
+        ORDER BY r2.created_at DESC, r2.id
+        LIMIT 50
+      ) r
+    ) op ON TRUE
+    WHERE p.user_id = ${userId}
+  `;
 
+  const profesional = filas[0];
   if (!profesional) {
     return res.status(404).json({ error: 'Perfil de profesional no encontrado', code: 'PROFESSIONAL_PROFILE_NOT_FOUND' });
   }
@@ -35,20 +123,10 @@ export async function getProfile(req: Request, res: Response) {
     }
   }
 
-  // Reviews recibidas — antes solo se veían desde el perfil PÚBLICO
-  // (getPublicProfile más abajo); el propio profesional no tenía
-  // ninguna forma de ver sus propias opiniones dentro de la app.
-  const reviews = await prisma.review.findMany({
-    where: { destinatarioId: userId },
-    include: { autor: { select: { nombre: true } } },
-    orderBy: { createdAt: 'desc' },
-    take: 50,
-  });
-
   return res.json({
-    nombre: profesional.user.nombre,
-    email: profesional.user.email,
-    telefono: profesional.user.telefono,
+    nombre: profesional.userNombre,
+    email: profesional.userEmail,
+    telefono: profesional.userTelefono,
     estadoVerificacion: profesional.estadoVerificacion,
     tipoProfesional: profesional.tipoProfesional,
     tarifaBase: Number(profesional.tarifaBase),
@@ -63,14 +141,11 @@ export async function getProfile(req: Request, res: Response) {
     // mostrarle "completa tu perfil" para siempre, aunque ya lo hubiera
     // enviado y solo estuviera pendiente de que un admin lo revisara.
     documentoIdentidadUrl: profesional.documentoIdentidadUrl || null,
-    categorias: profesional.categorias.map((c) => c.category.nombre),
+    categorias: profesional.categorias,
     estadoCuentaStripe: derivarEstadoCuentaStripe(profesional),
-    opiniones: reviews.map((r) => ({
-      autor: r.autor.nombre,
-      puntuacion: r.puntuacion,
-      comentario: r.comentario,
-      fecha: r.createdAt,
-    })),
+    // `fecha` ya viene como string ISO con Z desde el SQL — res.json la
+    // emite tal cual, igual que emitía el Date de Prisma (toISOString).
+    opiniones: profesional.opiniones,
   });
 }
 
