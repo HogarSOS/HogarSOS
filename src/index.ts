@@ -136,10 +136,20 @@ app.get('/health', (_req, res) => {
 // 429 y parecer "roto" sin ningún error explícito. 2000 deja margen
 // de sobra para varios testers/pantallas activas a la vez sin dejar
 // de proteger contra abuso.
+// El máximo por IP es configurable por entorno (RATE_LIMIT_MAX) para
+// poder subirlo SOLO en un servicio de staging/carga y medir ráfagas
+// grandes sin el artefacto del cupo, sin tocar nunca el de producción.
+// Sin la variable, o con un valor inválido, se mantiene exactamente el
+// 2000 de siempre — el comportamiento de producción no cambia.
+const rateLimitMax = (() => {
+  const bruto = Number(process.env.RATE_LIMIT_MAX);
+  return Number.isInteger(bruto) && bruto > 0 ? bruto : 2000;
+})();
+
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 2000,
+    max: rateLimitMax,
   })
 );
 
