@@ -667,19 +667,18 @@ describe('login → logout → refresh (flujo real de revocación)', () => {
 });
 
 describe('updateFcmToken (P2 #5) — sin transacción interactiva (fix de pool, 2026-08-17)', () => {
-  it('primera alta: cede cualquier fila con ese token y hace upsert de (userId, installationId)', async () => {
+  it('caso común (sin conflicto de token): SOLO upsert, sin deleteMany (una sentencia, media carga de pool)', async () => {
     const res = fakeRes();
 
     await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_A', installationId: 'inst-A' }), res);
 
-    expect(mockPrisma.userFcmToken.deleteMany).toHaveBeenCalledWith({
-      where: { token: 'TOKEN_A', NOT: { userId: 'user-1', installationId: 'inst-A' } },
-    });
     expect(mockPrisma.userFcmToken.upsert).toHaveBeenCalledWith({
       where: { userId_installationId: { userId: 'user-1', installationId: 'inst-A' } },
       update: { token: 'TOKEN_A' },
       create: { userId: 'user-1', installationId: 'inst-A', token: 'TOKEN_A' },
     });
+    // El deleteMany solo se ejecuta en el caso raro de colisión de token (P2002).
+    expect(mockPrisma.userFcmToken.deleteMany).not.toHaveBeenCalled();
     expect(res.json).toHaveBeenCalledWith({ success: true });
   });
 
@@ -707,20 +706,28 @@ describe('updateFcmToken (P2 #5) — sin transacción interactiva (fix de pool, 
     expect(ultimaLlamada.update).toEqual({ token: 'TOKEN_NUEVO' });
   });
 
-  // El hallazgo central de P2 #5 (dispositivo compartido/reutilizado):
-  // hay que ceder la fila anterior con ese token ANTES del upsert (la
-  // columna token es UNIQUE) — el orden delete-primero se conserva.
-  it('mismo token reclamado por otro usuario: deleteMany ANTES del upsert (orden preservado por UNIQUE(token))', async () => {
+  // El hallazgo central de P2 #5 (dispositivo compartido/reutilizado): un
+  // mismo token físico reclamado por otra (userId, installationId) choca
+  // con UNIQUE(token) → el upsert lanza P2002 → SOLO entonces se cede la
+  // fila anterior (deleteMany) y se reintenta. Limpieza perezosa.
+  it('mismo token reclamado por otro usuario: el upsert P2002 dispara deleteMany + retry (cesión perezosa)', async () => {
     const res = fakeRes();
+    const p2002: any = new Error('Unique constraint failed on the fields: (`token`)');
+    p2002.code = 'P2002';
+    mockPrisma.userFcmToken.upsert.mockRejectedValueOnce(p2002);
 
     await updateFcmToken(fakeAuthedReqConBody('user-B', { fcmToken: 'TOKEN_COMPARTIDO', installationId: 'inst-compartida' }), res);
 
     expect(mockPrisma.userFcmToken.deleteMany).toHaveBeenCalledWith({
       where: { token: 'TOKEN_COMPARTIDO', NOT: { userId: 'user-B', installationId: 'inst-compartida' } },
     });
+    // Orden: primer upsert (falla) → deleteMany → segundo upsert.
+    const ordenUpsert1 = mockPrisma.userFcmToken.upsert.mock.invocationCallOrder[0];
     const ordenDeleteMany = mockPrisma.userFcmToken.deleteMany.mock.invocationCallOrder[0];
-    const ordenUpsert = mockPrisma.userFcmToken.upsert.mock.invocationCallOrder[0];
-    expect(ordenDeleteMany).toBeLessThan(ordenUpsert);
+    const ordenUpsert2 = mockPrisma.userFcmToken.upsert.mock.invocationCallOrder[1];
+    expect(ordenUpsert1).toBeLessThan(ordenDeleteMany);
+    expect(ordenDeleteMany).toBeLessThan(ordenUpsert2);
+    expect(res.json).toHaveBeenCalledWith({ success: true });
   });
 
   it('sin installationId (cliente antiguo): usa "legacy" y no rompe el endpoint', async () => {
@@ -765,18 +772,16 @@ describe('updateFcmToken — retry en P2002 sin transacción (revisión adversar
     return err;
   }
 
-  // Carrera de primera reclamación: el upsert choca con UNIQUE(token)
-  // porque otra fila reinsertó el token entre el deleteMany y el upsert
-  // (la ventana que antes cerraba la transacción). El retry vuelve a
-  // ceder y upsertea con éxito.
-  it('P2002 en el primer intento → el segundo intento cede el token y completa con éxito', async () => {
+  // El upsert choca con UNIQUE(token) (el token estaba en otra fila) → se
+  // cede (deleteMany, UNA vez) y se reintenta el upsert con éxito.
+  it('P2002 en el upsert → deleteMany (una vez) + retry upsert, completa con éxito', async () => {
     const res = fakeRes();
     mockPrisma.userFcmToken.upsert.mockRejectedValueOnce(p2002());
 
     await updateFcmToken(fakeAuthedReqConBody('user-B', { fcmToken: 'TOKEN_COMPARTIDO', installationId: 'inst-B' }), res);
 
-    // deleteMany + upsert se ejecutan dos veces (intento + reintento).
-    expect(mockPrisma.userFcmToken.deleteMany).toHaveBeenCalledTimes(2);
+    // deleteMany solo una vez (la cesión); upsert dos veces (fallo + retry).
+    expect(mockPrisma.userFcmToken.deleteMany).toHaveBeenCalledTimes(1);
     expect(mockPrisma.userFcmToken.upsert).toHaveBeenCalledTimes(2);
     expect(mockPrisma.userFcmToken.upsert).toHaveBeenLastCalledWith({
       where: { userId_installationId: { userId: 'user-B', installationId: 'inst-B' } },
@@ -802,7 +807,7 @@ describe('updateFcmToken — retry en P2002 sin transacción (revisión adversar
     expect(mockPrisma.userFcmToken.upsert).toHaveBeenCalledTimes(2);
   });
 
-  it('un error de Prisma que NO es P2002 se propaga de inmediato, sin reintentar', async () => {
+  it('un error de Prisma que NO es P2002 se propaga de inmediato, sin ceder ni reintentar', async () => {
     const res = fakeRes();
     const error: any = new Error('Conexión a la base de datos perdida');
     error.code = 'P1001';
@@ -813,14 +818,15 @@ describe('updateFcmToken — retry en P2002 sin transacción (revisión adversar
     ).rejects.toBe(error);
 
     expect(mockPrisma.userFcmToken.upsert).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.userFcmToken.deleteMany).not.toHaveBeenCalled();
   });
 
-  it('comportamiento normal (sin colisión): un deleteMany, un upsert, sin reintento', async () => {
+  it('comportamiento normal (sin colisión): SOLO upsert, sin deleteMany ni reintento', async () => {
     const res = fakeRes();
 
     await updateFcmToken(fakeAuthedReqConBody('user-1', { fcmToken: 'TOKEN_NORMAL', installationId: 'inst-A' }), res);
 
-    expect(mockPrisma.userFcmToken.deleteMany).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.userFcmToken.deleteMany).not.toHaveBeenCalled();
     expect(mockPrisma.userFcmToken.upsert).toHaveBeenCalledTimes(1);
     expect(res.json).toHaveBeenCalledWith({ success: true });
   });
