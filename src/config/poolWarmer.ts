@@ -1,4 +1,4 @@
-import { prisma } from './prisma';
+import { prisma, limiteDePool } from './prisma';
 
 /**
  * Mantiene calientes las conexiones físicas del pool de Prisma contra
@@ -25,25 +25,12 @@ import { prisma } from './prisma';
 // por un event loop ocupado.
 const INTERVALO_MS = 240 * 1000;
 
-/**
- * Tamaño real del pool, leído del propio `connection_limit` de
- * DATABASE_URL — si el pool crece por configuración (5→10 en la
- * auditoría de escalabilidad 2026-08-17), el warmer debe calentar TODAS
- * las conexiones, no quedarse en un número escrito a mano que dejaría
- * la mitad del pool pagando la reapertura fría en la primera ráfaga.
- */
-function numConexionesDelPool(): number {
-  try {
-    const limite = new URL(process.env.DATABASE_URL ?? '').searchParams.get('connection_limit');
-    const n = Number(limite);
-    if (Number.isInteger(n) && n > 0 && n <= 50) return n;
-  } catch {
-    // URL ilegible — el fallback de abajo cubre este caso.
-  }
-  return 5;
-}
-
-const NUM_CONEXIONES = numConexionesDelPool();
+// Tamaño real del pool, el mismo que aplica config/prisma.ts — si el
+// pool crece por configuración (5→10 en la auditoría de escalabilidad
+// 2026-08-17), el warmer debe calentar TODAS las conexiones, no quedarse
+// en un número escrito a mano que dejaría la mitad del pool pagando la
+// reapertura fría en la primera ráfaga.
+const NUM_CONEXIONES = limiteDePool();
 
 let temporizador: NodeJS.Timeout | null = null;
 
