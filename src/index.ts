@@ -22,6 +22,7 @@ import { stripeWebhook } from './controllers/payment.controller';
 import { asyncHandler } from './utils/asyncHandler';
 import { servirArchivo } from './controllers/archivo.controller';
 import { authMiddleware } from './middlewares/auth.middleware';
+import { claveRateLimit } from './middlewares/rateLimitKey';
 import { prisma } from './config/prisma';
 import { TAREAS, iniciarScheduler, detenerScheduler } from './jobs';
 import { validarConfiguracionOAbortar } from './config/validateEnv';
@@ -146,10 +147,16 @@ const rateLimitMax = (() => {
   return Number.isInteger(bruto) && bruto > 0 ? bruto : 2000;
 })();
 
+// Endurecimiento pre-lanzamiento nacional (2026-08-18): el cupo pasa a
+// ser POR USUARIO AUTENTICADO (JWT verificado) y por IP solo para el
+// tráfico anónimo — sin esto, el CGNAT de los operadores móviles (cientos
+// de usuarios tras una misma IP pública) agotaba el cupo compartido con
+// tráfico perfectamente legítimo. Ver rateLimitKey.ts para el detalle.
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
     max: rateLimitMax,
+    keyGenerator: (req) => claveRateLimit(req.headers.authorization, req.ip),
   })
 );
 

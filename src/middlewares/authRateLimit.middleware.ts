@@ -37,12 +37,26 @@ export const authRateLimit = rateLimit({
  *
  * El access token es un JWT firmado (`verifyRefreshToken`), no es
  * fuerza-bruteable con reintentos — este límite es contra abuso de
- * recursos, no contra adivinar el token. 60/15min deja margen de sobra
- * para varios dispositivos activos a la vez con reintentos.
+ * recursos, no contra adivinar el token.
+ *
+ * Endurecimiento pre-lanzamiento nacional (2026-08-18): 60/15min se
+ * quedaba corto contra el CGNAT de los operadores móviles — el refresh
+ * se dispara SOLO (cada arranque de la app y cada caducidad del access
+ * token, 15 min), así que ~30 usuarios activos tras la misma IP pública
+ * de operador agotaban el cupo y el login "se rompía" para todos ellos.
+ * 600/15min soporta ~200-300 usuarios tras un mismo NAT y sigue siendo
+ * una fracción del límite global. Configurable por entorno
+ * (REFRESH_RATE_LIMIT_MAX, mismo patrón que RATE_LIMIT_MAX en index.ts)
+ * para poder ajustarlo sin desplegar.
  */
+const refreshMax = (() => {
+  const bruto = Number(process.env.REFRESH_RATE_LIMIT_MAX);
+  return Number.isInteger(bruto) && bruto > 0 ? bruto : 600;
+})();
+
 export const refreshRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 60,
+  max: refreshMax,
   standardHeaders: true,
   legacyHeaders: false,
   handler: (_req, res) => {
