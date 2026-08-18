@@ -516,7 +516,7 @@ export async function stripeWebhook(req: Request, res: Response) {
      * retira del saldo de la plataforma el importe reclamado MÁS ~15 € de
      * comisión de disputa, de forma inmediata y sin preguntar. Como el
      * profesional ya cobró su parte vía transfer, ese dinero sale
-     * íntegramente del bolsillo de HogarSOS — y con una comisión del 5%,
+     * íntegramente del bolsillo de HogarSOS — y con una comisión del 10%,
      * un solo contracargo se come el margen de muchos trabajos.
      *
      * Aquí NO se automatiza ninguna respuesta a propósito: responder a

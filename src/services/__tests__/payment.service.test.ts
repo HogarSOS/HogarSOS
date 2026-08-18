@@ -55,15 +55,34 @@ const mockPrisma = prisma as any;
 const mockStripe = stripe as any;
 
 describe('calcularDesglose', () => {
-  // Comisión definitiva (2026-08-01): cliente 5% / profesional 0% — el
-  // profesional recibe la base íntegra. La expectativa anterior (5%/5%)
-  // era de antes de ese cambio y llevaba fallando desde entonces.
-  it('calcula lo que paga el cliente (base+5%) y lo que recibe el profesional (base íntegra, 0%) con el fallback por defecto', () => {
-    const { montoBase, montoTotalCliente, montoProfesional, comisionPlataforma } = calcularDesglose(100);
-    expect(montoBase).toBe(100);
-    expect(montoTotalCliente).toBe(105);
-    expect(montoProfesional).toBe(100);
-    expect(comisionPlataforma).toBe(5);
+  // Comisión definitiva (2026-08-18, revisión pre-lanzamiento nacional):
+  // cliente 10% / profesional 0% — el profesional recibe la base íntegra,
+  // HogarSOS cobra un 10% de "Gastos de gestión" al cliente. El fallback
+  // del módulo (COMISION_CLIENTE_PORCENTAJE) es 10 cuando la env var no
+  // está definida (caso de CI, sin .env), así que esto valida el mismo
+  // valor que producción fija explícitamente en render.yaml.
+  //
+  // La tabla cubre los importes exigidos por la auditoría del cambio:
+  // para cada base se comprueba que cliente = base × 1.10, profesional =
+  // base íntegra (0%), y comisión HogarSOS = base × 0.10 = cliente − prof.
+  it.each([
+    // base,  clienteEsperado, profEsperado, comisionEsperada
+    [20, 22, 20, 2],
+    [40, 44, 40, 4],
+    [80, 88, 80, 8],
+    [100, 110, 100, 10],
+    [150, 165, 150, 15],
+    [200, 220, 200, 20],
+    [1000, 1100, 1000, 100],
+  ])('base %d € → cliente paga base+10%%, profesional recibe el 100%%, HogarSOS cobra el 10%%', (base, cliente, prof, comision) => {
+    const { montoBase, montoTotalCliente, montoProfesional, comisionPlataforma } = calcularDesglose(base);
+    expect(montoBase).toBe(base);
+    expect(montoTotalCliente).toBe(cliente);
+    expect(montoProfesional).toBe(prof); // 0% profesional: recibe la base íntegra
+    expect(comisionPlataforma).toBe(comision);
+    // Identidad contable: lo que paga el cliente = lo que recibe el
+    // profesional + la comisión de HogarSOS (sin doble comisión).
+    expect(montoTotalCliente).toBe(montoProfesional + comisionPlataforma);
   });
 });
 

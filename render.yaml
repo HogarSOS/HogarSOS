@@ -42,14 +42,16 @@ services:
         value: 15m
       - key: JWT_REFRESH_EXPIRES_IN
         value: 30d
-      # Decisión de producto definitiva: el CLIENTE paga un 5% sobre el
-      # presupuesto ("Gastos de gestión"), el PROFESIONAL no paga nada y
-      # recibe el 100% de lo que cotizó. Declaradas aquí con valor
-      # explícito (no sync:false) a propósito: así el blueprint es la
-      # fuente de verdad y nadie puede dejarlas a 0 sin querer en el
-      # dashboard, que era el riesgo real (plataforma sin ingresos).
+      # Decisión de producto definitiva (2026-08-18, revisión pre-lanzamiento
+      # nacional): el CLIENTE paga un 10% sobre el presupuesto ("Gastos de
+      # gestión"), el PROFESIONAL no paga nada y recibe el 100% de lo que
+      # cotizó. HogarSOS sigue absorbiendo la fee de Stripe por ahora.
+      # Declaradas aquí con valor explícito (no sync:false) a propósito:
+      # así el blueprint es la fuente de verdad y nadie puede dejarlas a 0
+      # sin querer en el dashboard, que era el riesgo real (plataforma sin
+      # ingresos).
       - key: PLATFORM_COMMISSION_CLIENT_PERCENT
-        value: "5"
+        value: "10"
       - key: PLATFORM_COMMISSION_PROFESSIONAL_PERCENT
         value: "0"
       - key: REQUIRE_PROFESSIONAL_VERIFICATION
