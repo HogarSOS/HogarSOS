@@ -27,7 +27,10 @@ declare global {
  * a esos roles únicamente (RBAC a nivel de ruta, complementario al
  * row-level security de PostgreSQL).
  */
-export function authMiddleware(allowedRoles?: JwtPayload['role'][]) {
+export function authMiddleware(
+  allowedRoles?: JwtPayload['role'][],
+  options?: { allowExpired?: boolean },
+) {
   return (req: Request, res: Response, next: NextFunction) => {
     const authHeader = req.headers.authorization;
 
@@ -43,7 +46,19 @@ export function authMiddleware(allowedRoles?: JwtPayload['role'][]) {
       // en concreto es vulnerable a la confusión RS256/HS256 si alguna vez
       // se introduce una clave pública en otro sitio del código. Fijarlo
       // aquí es defensa en profundidad barata (auditoría, hallazgo #2).
-      const payload = jwt.verify(token, process.env.JWT_SECRET as string, { algorithms: ['HS256'] }) as JwtPayload;
+      //
+      // allowExpired (solo /auth/logout): ignora la expiración PERO sigue
+      // verificando la firma HS256 y rechazando tokens de tipo refresh, así
+      // que el token debe ser genuino. Sin esto, un logout con el access
+      // token ya caducado (máx. 15 min) devolvía 401 antes de borrar el
+      // UserFcmToken de ese dispositivo, y el aparato seguía recibiendo push
+      // pese a haber cerrado sesión. Ignorar la expiración es seguro aquí
+      // porque logout solo revoca/limpia (no accede a datos ni escala
+      // privilegios). El resto de rutas mantiene allowExpired=false.
+      const payload = jwt.verify(token, process.env.JWT_SECRET as string, {
+        algorithms: ['HS256'],
+        ignoreExpiration: options?.allowExpired ?? false,
+      }) as JwtPayload;
 
       // Un refresh token (30 días) lleva `type: 'refresh'` y firma con el
       // MISMO secreto que el access token (ver token.service.ts) — sin

@@ -96,4 +96,70 @@ describe('authMiddleware', () => {
     expect(res.status).toHaveBeenCalledWith(401);
     expect(next).not.toHaveBeenCalled();
   });
+
+  // allowExpired (solo /auth/logout): el logout debe poder limpiar el
+  // UserFcmToken de este dispositivo aunque el access token ya haya
+  // caducado (máx. 15 min). Sin esto, authMiddleware devolvía 401 antes
+  // de llegar al handler y el aparato deslogueado seguía recibiendo push.
+  it('devuelve 401 con un token caducado cuando NO se permite expirado (por defecto)', () => {
+    const token = jwt.sign(
+      { userId: 'u1', role: 'cliente' },
+      process.env.JWT_SECRET as string,
+      { expiresIn: '-1s' }
+    );
+    const req = fakeReq(token);
+    const res = fakeRes();
+    const next = jest.fn();
+
+    authMiddleware()(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('allowExpired: deja pasar un token caducado con firma válida y expone req.user', () => {
+    const token = jwt.sign(
+      { userId: 'u1', role: 'cliente' },
+      process.env.JWT_SECRET as string,
+      { expiresIn: '-1s' }
+    );
+    const req = fakeReq(token);
+    const res = fakeRes();
+    const next = jest.fn();
+
+    authMiddleware(undefined, { allowExpired: true })(req, res, next);
+
+    expect(next).toHaveBeenCalled();
+    expect(req.user).toEqual(expect.objectContaining({ userId: 'u1', role: 'cliente' }));
+    expect(res.status).not.toHaveBeenCalled();
+  });
+
+  it('allowExpired NO relaja la verificación de firma: token con otro secreto → 401', () => {
+    const token = jwt.sign({ userId: 'u1', role: 'cliente' }, 'otro-secreto-distinto', {
+      algorithm: 'HS256',
+    });
+    const req = fakeReq(token);
+    const res = fakeRes();
+    const next = jest.fn();
+
+    authMiddleware(undefined, { allowExpired: true })(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('allowExpired sigue rechazando un refresh token usado como access token', () => {
+    const refreshToken = jwt.sign(
+      { userId: 'u1', role: 'cliente', type: 'refresh' },
+      process.env.JWT_SECRET as string
+    );
+    const req = fakeReq(refreshToken);
+    const res = fakeRes();
+    const next = jest.fn();
+
+    authMiddleware(undefined, { allowExpired: true })(req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
 });
