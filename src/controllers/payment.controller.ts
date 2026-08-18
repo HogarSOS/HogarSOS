@@ -371,24 +371,55 @@ export async function stripeWebhook(req: Request, res: Response) {
     // está retenido.
     case 'payment_intent.amount_capturable_updated': {
       const intent = event.data.object as { id: string };
-      // Solo esta transición (pendiente -> retenido) representa que
-      // Stripe confirmó de verdad la autorización — ver comentario del
-      // enum EstadoPago en el schema. `count` en 0 significa que ya se
-      // procesó antes (reintento del webhook) o que la fila no existe;
-      // en ambos casos no hay nada que notificar de nuevo.
-      const { count } = await prisma.payment.updateMany({
-        where: { stripePaymentIntentId: intent.id, estado: 'pendiente' },
+      // Solo esta transición representa que Stripe confirmó de verdad la
+      // autorización — ver comentario del enum EstadoPago en el schema.
+      // Desde 'pendiente' (camino normal) O desde 'fallido': si un
+      // intento anterior del MISMO PaymentIntent fue rechazado (el
+      // webhook payment_failed marcó 'fallido') y el cliente reintenta
+      // en el mismo Payment Sheet con una tarjeta buena, la
+      // autorización real llega con la fila en 'fallido' — sin ese
+      // estado aquí, la fila quedaba 'fallido' para siempre con el
+      // dinero retenido de verdad en Stripe.
+      await prisma.payment.updateMany({
+        where: { stripePaymentIntentId: intent.id, estado: { in: ['pendiente', 'fallido'] } },
         data: { estado: 'retenido' },
       });
-      if (count > 0) {
+      // La notificación se reclama con su PROPIO marcador, no con el
+      // count del cambio de estado de arriba: si el proceso muere entre
+      // el UPDATE y el envío, el reintento del webhook de Stripe ve el
+      // estado ya cambiado (count 0) pero el marcador todavía vacío, y
+      // recupera la notificación perdida. El marcador guarda el id del
+      // intent (ver schema): una redelivery del mismo intent no vuelve a
+      // notificar, pero la reautorización B5 (intent NUEVO en la misma
+      // fila) sí. El updateMany es atómico — con dos procesos backend
+      // procesando el mismo evento a la vez, solo uno consigue count 1.
+      const claim = await prisma.payment.updateMany({
+        where: {
+          stripePaymentIntentId: intent.id,
+          estado: 'retenido',
+          OR: [{ notifAutorizadaPiId: null }, { notifAutorizadaPiId: { not: intent.id } }],
+        },
+        data: { notifAutorizadaPiId: intent.id },
+      });
+      if (claim.count > 0) {
         const pago = await prisma.payment.findUnique({
           where: { stripePaymentIntentId: intent.id },
-          include: { serviceRequest: { select: { profesionalId: true } } },
+          include: { serviceRequest: { select: { clienteId: true, profesionalId: true } } },
         });
-        if (pago?.serviceRequest.profesionalId) {
-          enviarNotificacion(pago.serviceRequest.profesionalId, 'pago_autorizado', {}, {
+        if (pago) {
+          // Ambas partes, cada una con su mensaje: el profesional sabe
+          // que puede empezar (pago_autorizado), y el cliente recibe la
+          // confirmación de que su dinero quedó retenido de verdad —
+          // crítico cuando el 3DS del banco le sacó de la app y el
+          // Payment Sheet nunca llegó a devolverle el resultado.
+          if (pago.serviceRequest.profesionalId) {
+            enviarNotificacion(pago.serviceRequest.profesionalId, 'pago_autorizado', {}, {
+              solicitudId: pago.serviceRequestId,
+            }).catch((e) => console.error(`[stripeWebhook] Error al notificar pago autorizado de ${pago.id}:`, e));
+          }
+          enviarNotificacion(pago.serviceRequest.clienteId, 'pago_confirmado', {}, {
             solicitudId: pago.serviceRequestId,
-          }).catch((e) => console.error(`[stripeWebhook] Error al notificar pago autorizado de ${pago.id}:`, e));
+          }).catch((e) => console.error(`[stripeWebhook] Error al notificar pago confirmado de ${pago.id}:`, e));
         }
       }
       break;
@@ -404,18 +435,70 @@ export async function stripeWebhook(req: Request, res: Response) {
     // fallar o cancelarse ANTES de llegar a confirmarse ('retenido').
     case 'payment_intent.payment_failed': {
       const intent = event.data.object as { id: string };
+      // Inmunidad al desorden de entrega: un payment_failed de un
+      // intento ANTERIOR puede llegar DESPUÉS del
+      // amount_capturable_updated del reintento bueno del mismo
+      // PaymentIntent — sin esta releída, degradaba 'retenido' a
+      // 'fallido' con la autorización viva en Stripe (dinero retenido
+      // invisible: releasePayments nunca capturaría). El estado vivo en
+      // Stripe es la única fuente inmune al orden: si el intent ya no
+      // está fallado de verdad, este evento es obsoleto y se ignora. Si
+      // la releída falla (red), se responde 500 a propósito para que
+      // Stripe reintente el webhook más tarde en vez de decidir a ciegas.
+      let estadoVivo: string;
+      try {
+        estadoVivo = (await stripe.paymentIntents.retrieve(intent.id)).status;
+      } catch (e) {
+        console.error(`[stripeWebhook] No se pudo releer ${intent.id} para payment_failed:`, (e as Error).message);
+        return res.status(500).json({ error: 'Reintento requerido' });
+      }
+      if (estadoVivo === 'requires_capture' || estadoVivo === 'succeeded' || estadoVivo === 'processing') {
+        break; // evento obsoleto: la autorización real ganó después
+      }
       await prisma.payment.updateMany({
         where: { stripePaymentIntentId: intent.id, estado: { in: ['pendiente', 'retenido'] } },
         data: { estado: 'fallido' },
       });
+      // Sin notificación push a propósito: un fallo de pago es casi
+      // siempre síncrono (el cliente está mirando el Payment Sheet, que
+      // ya le muestra el error del banco) — un push encima sería ruido
+      // alarmante durante su propio reintento. El estado queda
+      // consistente en BD y la pantalla de la solicitud lo refleja.
       break;
     }
     case 'payment_intent.canceled': {
-      const intent = event.data.object as { id: string };
-      await prisma.payment.updateMany({
+      const intent = event.data.object as { id: string; cancellation_reason?: string | null };
+      const { count } = await prisma.payment.updateMany({
         where: { stripePaymentIntentId: intent.id, estado: { in: ['pendiente', 'retenido'] } },
         data: { estado: 'reembolsado' },
       });
+      // Caducidad real de la autorización (cancellation_reason la pone
+      // Stripe: 'expired'; 'automatic' por robustez). Antes este evento
+      // era SILENCIOSO y el aviso del job autorizacionesPorCaducar casi
+      // nunca llegaba a dispararse: el webhook gana la carrera, marca
+      // 'reembolsado' y el filtro estado:'retenido' del job excluye la
+      // fila — trabajo hecho, autorización perdida y nadie enterado.
+      // Nuestras propias cancelaciones (cancelar solicitud, resolver
+      // disputa) llegan sin cancellation_reason y siguen en silencio:
+      // esos flujos ya avisan por su cuenta con su propio contexto.
+      // Idempotente por el count de la transición: la redelivery del
+      // mismo evento encuentra la fila ya en 'reembolsado' (count 0).
+      const esCaducidad = intent.cancellation_reason === 'expired' || intent.cancellation_reason === 'automatic';
+      if (count > 0 && esCaducidad) {
+        const pago = await prisma.payment.findUnique({
+          where: { stripePaymentIntentId: intent.id },
+          include: { serviceRequest: { select: { clienteId: true, profesionalId: true } } },
+        });
+        if (pago) {
+          const destinatarios = [pago.serviceRequest.clienteId, pago.serviceRequest.profesionalId]
+            .filter((id): id is string => Boolean(id));
+          for (const userId of destinatarios) {
+            enviarNotificacion(userId, 'autorizacion_caducada', {}, {
+              solicitudId: pago.serviceRequestId,
+            }).catch((e) => console.error(`[stripeWebhook] Error al notificar caducidad de ${pago.id} a ${userId}:`, e));
+          }
+        }
+      }
       break;
     }
     // 'payment_intent.succeeded' se dispara tras la captura manual, que

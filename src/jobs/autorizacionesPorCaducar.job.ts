@@ -104,10 +104,20 @@ export async function revisarAutorizacionesPorCaducar(): Promise<string> {
       const intent = await stripe.paymentIntents.retrieve(pago.stripePaymentIntentId);
 
       if (ESTADOS_STRIPE_CADUCADOS.has(intent.status)) {
-        await prisma.payment.update({
-          where: { id: pago.id },
+        // Condicionado a que la fila SIGA en 'retenido': el webhook
+        // payment_intent.canceled ahora también marca y notifica la
+        // caducidad (era silencioso), y puede ganar esta carrera entre
+        // la lectura del findMany de arriba y este punto. count 0 =
+        // el webhook ya lo hizo — notificar aquí también duplicaría
+        // el aviso a ambas partes.
+        const { count } = await prisma.payment.updateMany({
+          where: { id: pago.id, estado: 'retenido' },
           data: { estado: 'reembolsado' },
         });
+        if (count === 0) {
+          sinCambios++;
+          continue;
+        }
         await notificarAmbasPartes(pago.serviceRequest, 'autorizacion_caducada');
         caducados++;
         console.warn(

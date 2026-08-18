@@ -21,6 +21,7 @@ export type NotificationKey =
   | 'cierre_horas_aceptado'
   | 'reclamacion_abierta'
   | 'pago_autorizado'
+  | 'pago_confirmado'
   | 'autorizacion_por_caducar'
   | 'autorizacion_caducada'
   | 'valoracion_recibida'
@@ -238,6 +239,20 @@ const MENSAJES: Record<NotificationKey, Record<Idioma, Constructor>> = {
     en: () => ({
       title: 'Payment authorized',
       body: "The client has authorized the payment — the amount is held until the job is completed",
+    }),
+  },
+  // Al CLIENTE cuando Stripe confirma de verdad su autorización (el
+  // gemelo de pago_autorizado, que va al profesional). Importa sobre
+  // todo en el caso asíncrono: el 3DS del banco pudo sacarle de la app
+  // (o la cerró a mitad) y sin esto nunca sabría si el pago se completó.
+  pago_confirmado: {
+    es: () => ({
+      title: 'Pago confirmado',
+      body: 'Tu pago se ha autorizado correctamente — el importe queda retenido y solo se cobrará al completar el trabajo',
+    }),
+    en: () => ({
+      title: 'Payment confirmed',
+      body: 'Your payment was authorized — the amount is held and will only be charged when the job is completed',
     }),
   },
   // B5: Stripe solo mantiene un cargo autorizado sin capturar unos 7

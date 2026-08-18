@@ -11,7 +11,12 @@ jest.mock('../../config/prisma', () => ({
 }));
 
 jest.mock('../../config/stripe', () => ({
-  stripe: { webhooks: { constructEvent: jest.fn() } },
+  stripe: {
+    webhooks: { constructEvent: jest.fn() },
+    // payment_failed relee el estado vivo del PaymentIntent para ser
+    // inmune al desorden de entrega de webhooks.
+    paymentIntents: { retrieve: jest.fn() },
+  },
 }));
 
 jest.mock('../../services/notification.service', () => ({
@@ -64,6 +69,7 @@ describe('stripeWebhook — precondiciones de estado (auditoría, hallazgo #6)',
       type: 'payment_intent.payment_failed',
       data: { object: { id: 'pi_1' } },
     });
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_payment_method' });
     mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
 
     await stripeWebhook(fakeReq(), fakeRes());
@@ -72,6 +78,56 @@ describe('stripeWebhook — precondiciones de estado (auditoría, hallazgo #6)',
       where: { stripePaymentIntentId: 'pi_1', estado: { in: ['pendiente', 'retenido'] } },
       data: { estado: 'fallido' },
     });
+  });
+
+  // Desorden real de entrega: el payment_failed de un intento ANTERIOR
+  // llega DESPUÉS del amount_capturable_updated del reintento bueno del
+  // mismo PaymentIntent. La fila ya está 'retenido' — y como 'retenido'
+  // está (correctamente) en el WHERE por otros motivos, la única defensa
+  // es releer el estado vivo en Stripe: si el intent no está fallado de
+  // verdad, el evento es obsoleto y no debe tocar la BD.
+  it('payment_failed obsoleto (el intent vivo ya está requires_capture) no degrada nada', async () => {
+    mockStripe.webhooks.constructEvent.mockReturnValue({
+      type: 'payment_intent.payment_failed',
+      data: { object: { id: 'pi_1' } },
+    });
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_capture' });
+
+    const res = fakeRes();
+    await stripeWebhook(fakeReq(), res);
+
+    expect(mockPrisma.payment.updateMany).not.toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith({ received: true });
+  });
+
+  it('payment_failed responde 500 si no puede releer el intent (para que Stripe reintente, no decidir a ciegas)', async () => {
+    mockStripe.webhooks.constructEvent.mockReturnValue({
+      type: 'payment_intent.payment_failed',
+      data: { object: { id: 'pi_1' } },
+    });
+    mockStripe.paymentIntents.retrieve.mockRejectedValue(new Error('red caída'));
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const res = fakeRes();
+    await stripeWebhook(fakeReq(), res);
+
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(mockPrisma.payment.updateMany).not.toHaveBeenCalled();
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('payment_failed no envía ninguna notificación push (el fallo síncrono ya se ve en el Payment Sheet)', async () => {
+    mockStripe.webhooks.constructEvent.mockReturnValue({
+      type: 'payment_intent.payment_failed',
+      data: { object: { id: 'pi_1' } },
+    });
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'requires_payment_method' });
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+
+    await stripeWebhook(fakeReq(), fakeRes());
+
+    expect(enviarNotificacion).not.toHaveBeenCalled();
   });
 
   it('payment_intent.canceled solo puede degradar una fila "pendiente" o "retenido"', async () => {
@@ -86,6 +142,83 @@ describe('stripeWebhook — precondiciones de estado (auditoría, hallazgo #6)',
     expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
       where: { stripePaymentIntentId: 'pi_1', estado: { in: ['pendiente', 'retenido'] } },
       data: { estado: 'reembolsado' },
+    });
+  });
+
+  // La caducidad de la autorización (cancellation_reason 'expired', lo
+  // pone Stripe al cancelar él solo un cargo autorizado sin capturar)
+  // era un evento SILENCIOSO: el webhook marcaba 'reembolsado' y el
+  // aviso del job autorizacionesPorCaducar ya no encontraba la fila en
+  // 'retenido' — trabajo hecho, autorización perdida, nadie enterado.
+  describe('payment_intent.canceled — caducidad real (cancellation_reason de Stripe)', () => {
+    function eventoCanceled(reason: string | null) {
+      return {
+        type: 'payment_intent.canceled',
+        data: { object: { id: 'pi_1', cancellation_reason: reason } },
+      };
+    }
+
+    it('con reason "expired" y transición real: avisa a cliente Y profesional de la caducidad', async () => {
+      mockStripe.webhooks.constructEvent.mockReturnValue(eventoCanceled('expired'));
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.payment.findUnique.mockResolvedValue({
+        id: 'pago-1',
+        serviceRequestId: 'sr-1',
+        serviceRequest: { clienteId: 'cli-1', profesionalId: 'prof-1' },
+      });
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(enviarNotificacion).toHaveBeenCalledTimes(2);
+      expect(enviarNotificacion).toHaveBeenCalledWith('cli-1', 'autorizacion_caducada', {}, { solicitudId: 'sr-1' });
+      expect(enviarNotificacion).toHaveBeenCalledWith('prof-1', 'autorizacion_caducada', {}, { solicitudId: 'sr-1' });
+    });
+
+    it('redelivery del mismo canceled (la fila ya está "reembolsado", count 0): no re-notifica', async () => {
+      mockStripe.webhooks.constructEvent.mockReturnValue(eventoCanceled('expired'));
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(enviarNotificacion).not.toHaveBeenCalled();
+    });
+
+    it('cancelación nuestra vía API (sin cancellation_reason): actualiza estado pero NO notifica caducidad', async () => {
+      // cancelar solicitud / resolver disputa cancelan el intent sin
+      // reason — esos flujos ya avisan por su cuenta con su contexto.
+      mockStripe.webhooks.constructEvent.mockReturnValue(eventoCanceled(null));
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { estado: 'reembolsado' } })
+      );
+      expect(enviarNotificacion).not.toHaveBeenCalled();
+    });
+
+    it('reason "requested_by_customer": tampoco notifica caducidad', async () => {
+      mockStripe.webhooks.constructEvent.mockReturnValue(eventoCanceled('requested_by_customer'));
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(enviarNotificacion).not.toHaveBeenCalled();
+    });
+
+    it('solicitud sin profesional asignado: solo avisa al cliente, sin romper', async () => {
+      mockStripe.webhooks.constructEvent.mockReturnValue(eventoCanceled('expired'));
+      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.payment.findUnique.mockResolvedValue({
+        id: 'pago-1',
+        serviceRequestId: 'sr-1',
+        serviceRequest: { clienteId: 'cli-1', profesionalId: null },
+      });
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(enviarNotificacion).toHaveBeenCalledTimes(1);
+      expect(enviarNotificacion).toHaveBeenCalledWith('cli-1', 'autorizacion_caducada', {}, { solicitudId: 'sr-1' });
     });
   });
 
@@ -123,43 +256,142 @@ describe('stripeWebhook — precondiciones de estado (auditoría, hallazgo #6)',
   // en ese caso. Solo cuando Stripe confirma la autorización de verdad
   // (amount_capturable_updated) debe subir a 'retenido'.
   describe('payment_intent.amount_capturable_updated', () => {
-    it('sube la fila de "pendiente" a "retenido" y notifica al profesional', async () => {
+    function eventoCapturable(pi = 'pi_1') {
       mockStripe.webhooks.constructEvent.mockReturnValue({
         type: 'payment_intent.amount_capturable_updated',
-        data: { object: { id: 'pi_1' } },
+        data: { object: { id: pi } },
       });
-      mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
-      mockPrisma.payment.findUnique.mockResolvedValue({
-        id: 'pago-1',
-        serviceRequestId: 'sr-1',
-        serviceRequest: { profesionalId: 'prof-1' },
-      });
+    }
+
+    const filaConPartes = {
+      id: 'pago-1',
+      serviceRequestId: 'sr-1',
+      serviceRequest: { clienteId: 'cli-1', profesionalId: 'prof-1' },
+    };
+
+    it('sube la fila a "retenido", reclama la notificación y avisa a profesional Y cliente', async () => {
+      eventoCapturable();
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // cambio de estado
+        .mockResolvedValueOnce({ count: 1 }); // claim de notificación
+      mockPrisma.payment.findUnique.mockResolvedValue(filaConPartes);
 
       await stripeWebhook(fakeReq(), fakeRes());
 
-      expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
-        where: { stripePaymentIntentId: 'pi_1', estado: 'pendiente' },
+      // 'fallido' en el WHERE: un rechazo previo del mismo intent no
+      // debe dejar la fila atascada cuando el reintento bueno autoriza.
+      expect(mockPrisma.payment.updateMany).toHaveBeenNthCalledWith(1, {
+        where: { stripePaymentIntentId: 'pi_1', estado: { in: ['pendiente', 'fallido'] } },
         data: { estado: 'retenido' },
       });
-      expect(enviarNotificacion).toHaveBeenCalledWith(
-        'prof-1',
-        'pago_autorizado',
-        {},
-        { solicitudId: 'sr-1' }
-      );
+      expect(mockPrisma.payment.updateMany).toHaveBeenNthCalledWith(2, {
+        where: {
+          stripePaymentIntentId: 'pi_1',
+          estado: 'retenido',
+          OR: [{ notifAutorizadaPiId: null }, { notifAutorizadaPiId: { not: 'pi_1' } }],
+        },
+        data: { notifAutorizadaPiId: 'pi_1' },
+      });
+      expect(enviarNotificacion).toHaveBeenCalledTimes(2);
+      expect(enviarNotificacion).toHaveBeenCalledWith('prof-1', 'pago_autorizado', {}, { solicitudId: 'sr-1' });
+      expect(enviarNotificacion).toHaveBeenCalledWith('cli-1', 'pago_confirmado', {}, { solicitudId: 'sr-1' });
     });
 
-    it('no notifica dos veces si el webhook se reintenta (la fila ya no está "pendiente")', async () => {
-      mockStripe.webhooks.constructEvent.mockReturnValue({
-        type: 'payment_intent.amount_capturable_updated',
-        data: { object: { id: 'pi_1' } },
-      });
-      mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+    it('webhook duplicado (redelivery de Stripe): el claim no encuentra fila y NO se re-notifica', async () => {
+      eventoCapturable();
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 0 }) // estado: ya estaba 'retenido'
+        .mockResolvedValueOnce({ count: 0 }); // claim: ya notificado por este mismo intent
 
       await stripeWebhook(fakeReq(), fakeRes());
 
       expect(mockPrisma.payment.findUnique).not.toHaveBeenCalled();
       expect(enviarNotificacion).not.toHaveBeenCalled();
+    });
+
+    // EL hueco que motiva el claim separado: el proceso murió DESPUÉS de
+    // escribir 'retenido' pero ANTES de enviar la notificación. Stripe
+    // reintenta (no recibió el 200): el cambio de estado ya no encuentra
+    // fila (count 0) pero el marcador sigue vacío — la notificación se
+    // recupera en vez de perderse para siempre.
+    it('reintento tras morir entre BD y envío: el claim sigue libre y la notificación se recupera', async () => {
+      eventoCapturable();
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 0 }) // estado ya cambiado por el intento que murió
+        .mockResolvedValueOnce({ count: 1 }); // claim todavía sin reclamar
+      mockPrisma.payment.findUnique.mockResolvedValue(filaConPartes);
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(enviarNotificacion).toHaveBeenCalledTimes(2);
+    });
+
+    // Dos procesos backend recibiendo el mismo evento a la vez: el
+    // updateMany del claim es atómico en Postgres — solo uno de los dos
+    // obtiene count 1. Este test es el proceso perdedor.
+    it('proceso concurrente que pierde el claim: no envía nada', async () => {
+      eventoCapturable();
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // este proceso sí vio la transición…
+        .mockResolvedValueOnce({ count: 0 }); // …pero el otro reclamó la notificación primero
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(enviarNotificacion).not.toHaveBeenCalled();
+    });
+
+    // B5: la reautorización reutiliza la MISMA fila con un intent NUEVO.
+    // El marcador guarda el intent viejo — el claim del nuevo (id
+    // distinto) debe ganar y volver a notificar esta segunda
+    // autorización real.
+    it('reautorización B5 (intent nuevo en la misma fila): vuelve a notificar', async () => {
+      eventoCapturable('pi_nuevo_2');
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 1 }); // notifAutorizadaPiId guardaba pi_viejo ≠ pi_nuevo_2
+      mockPrisma.payment.findUnique.mockResolvedValue(filaConPartes);
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(enviarNotificacion).toHaveBeenCalledWith('prof-1', 'pago_autorizado', {}, { solicitudId: 'sr-1' });
+      expect(enviarNotificacion).toHaveBeenCalledWith('cli-1', 'pago_confirmado', {}, { solicitudId: 'sr-1' });
+    });
+
+    it('solicitud sin profesional asignado: solo se notifica al cliente, sin romper', async () => {
+      eventoCapturable();
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 1 });
+      mockPrisma.payment.findUnique.mockResolvedValue({
+        ...filaConPartes,
+        serviceRequest: { clienteId: 'cli-1', profesionalId: null },
+      });
+
+      await stripeWebhook(fakeReq(), fakeRes());
+
+      expect(enviarNotificacion).toHaveBeenCalledTimes(1);
+      expect(enviarNotificacion).toHaveBeenCalledWith('cli-1', 'pago_confirmado', {}, { solicitudId: 'sr-1' });
+    });
+
+    it('el fallo del envío FCM no tumba el webhook (responde 200 igualmente)', async () => {
+      eventoCapturable();
+      mockPrisma.payment.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 1 });
+      mockPrisma.payment.findUnique.mockResolvedValue(filaConPartes);
+      (enviarNotificacion as jest.Mock).mockRejectedValue(new Error('FCM caído'));
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const res = fakeRes();
+      await stripeWebhook(fakeReq(), res);
+      // El catch del fire-and-forget es asíncrono — dejar que el
+      // microtask queue drene antes de comprobar.
+      await new Promise((r) => setImmediate(r));
+
+      expect(res.json).toHaveBeenCalledWith({ received: true });
+
+      consoleErrorSpy.mockRestore();
+      (enviarNotificacion as jest.Mock).mockResolvedValue(undefined);
     });
   });
 

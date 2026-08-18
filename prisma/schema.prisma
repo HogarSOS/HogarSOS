@@ -265,6 +265,16 @@ model Payment {
   // Stripe mantiene un cargo autorizado sin capturar). Evita repetir el
   // aviso en cada pasada de la tarea programada.
   avisoCaducidadEnviadoAt DateTime?    @map("aviso_caducidad_enviado_at")
+  // Idempotencia de la notificación "pago confirmado" (a cliente y
+  // profesional), SEPARADA del cambio de estado pendiente->retenido:
+  // guarda el PaymentIntent por el que ya se notificó. Separarla del
+  // estado cubre el hueco "el proceso murió tras escribir 'retenido'
+  // pero antes de notificar": el reintento del webhook de Stripe ve el
+  // estado ya cambiado (count 0) pero este marcador todavía vacío, y
+  // recupera la notificación perdida. Guarda el id del intent (no un
+  // booleano) porque B5 reautoriza la MISMA fila con un intent nuevo —
+  // esa segunda autorización debe volver a notificarse.
+  notifAutorizadaPiId   String?      @map("notif_autorizada_pi_id")
   // B5 — cuántas veces se ha reautorizado esta misma fila tras una
   // caducidad (0 = autorización original, nunca reautorizada). Mismo
   // patrón que intentosLiberacion: sirve para que la idempotency key de

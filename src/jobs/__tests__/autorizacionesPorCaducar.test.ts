@@ -1,5 +1,5 @@
 jest.mock('../../config/prisma', () => ({
-  prisma: { payment: { findMany: jest.fn(), update: jest.fn() } },
+  prisma: { payment: { findMany: jest.fn(), update: jest.fn(), updateMany: jest.fn() } },
 }));
 
 jest.mock('../../config/stripe', () => ({
@@ -39,6 +39,7 @@ describe('revisarAutorizacionesPorCaducar', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockPrisma.payment.update.mockResolvedValue({});
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 1 });
     jest.spyOn(console, 'warn').mockImplementation(() => {});
   });
 
@@ -89,13 +90,28 @@ describe('revisarAutorizacionesPorCaducar', () => {
 
     const resumen = await revisarAutorizacionesPorCaducar();
 
-    expect(mockPrisma.payment.update).toHaveBeenCalledWith({
-      where: { id: 'pago-1' },
+    expect(mockPrisma.payment.updateMany).toHaveBeenCalledWith({
+      where: { id: 'pago-1', estado: 'retenido' },
       data: { estado: 'reembolsado' },
     });
     expect(mockNotificar).toHaveBeenCalledWith('cli-1', 'autorizacion_caducada', {}, { solicitudId: 'sr-1' });
     expect(mockNotificar).toHaveBeenCalledWith('prof-1', 'autorizacion_caducada', {}, { solicitudId: 'sr-1' });
     expect(resumen).toContain('1 caducada(s)');
+  });
+
+  // Carrera job <-> webhook: payment_intent.canceled ahora también marca
+  // y notifica la caducidad. Si el webhook gana entre el findMany y el
+  // updateMany de aquí, la fila ya no está 'retenido' — el job no debe
+  // duplicar el aviso a ambas partes.
+  it('no notifica si el webhook canceled ya marcó la fila entre la lectura y la escritura', async () => {
+    mockPrisma.payment.findMany.mockResolvedValue([autorizacion({ createdAt: haceDias(6.5) })]);
+    mockStripe.paymentIntents.retrieve.mockResolvedValue({ status: 'canceled' });
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+
+    const resumen = await revisarAutorizacionesPorCaducar();
+
+    expect(mockNotificar).not.toHaveBeenCalled();
+    expect(resumen).toContain('0 caducada(s)');
   });
 
   it('también trata requires_payment_method como caducada (la autorización se perdió igual)', async () => {
